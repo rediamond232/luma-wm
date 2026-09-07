@@ -1,0 +1,7 @@
+terminal = ["kitty", "--class", "wm-smoke-terminal", "-o", "confirm_os_window_close=0"]
+
+[shell]
+enabled = true
+
+[theme]
+radius = 10.0

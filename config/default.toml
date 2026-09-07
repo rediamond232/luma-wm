@@ -1,0 +1,107 @@
+terminal = ["foot"]
+startup = []
+rules = []
+
+[theme]
+background = "#161a22"
+foreground = "#e2e8f0"
+accent = "#89b4fa"
+muted = "#8892a5"
+font = "sans-serif"
+font_size = 13
+gap = 8
+border = 2
+shadow_size = 14
+shadow_opacity = 0.22
+radius = 10.0
+opacity = 0.9399999976158142
+blur = true
+blur_passes = 3
+animation_ms = 140
+reduced_motion = false
+
+[layout]
+mode = "master"
+master_ratio = 0.55
+workspaces = 9
+
+[input]
+layout = "us"
+variant = ""
+options = ""
+repeat_delay = 200
+repeat_rate = 25
+natural_scroll = false
+tap_to_click = true
+pointer_accel = 0.0
+mouse_modifier = "Super"
+
+[bindings]
+"Super+1" = "workspace 1"
+"Super+2" = "workspace 2"
+"Super+3" = "workspace 3"
+"Super+4" = "workspace 4"
+"Super+5" = "workspace 5"
+"Super+6" = "workspace 6"
+"Super+7" = "workspace 7"
+"Super+8" = "workspace 8"
+"Super+9" = "workspace 9"
+"Super+Down" = "focus down"
+"Super+Escape" = "lock"
+"Super+Left" = "focus left"
+"Super+Return" = "terminal"
+"Super+Right" = "focus right"
+"Super+Shift+1" = "send 1"
+"Super+Shift+2" = "send 2"
+"Super+Shift+3" = "send 3"
+"Super+Shift+4" = "send 4"
+"Super+Shift+5" = "send 5"
+"Super+Shift+6" = "send 6"
+"Super+Shift+7" = "send 7"
+"Super+Shift+8" = "send 8"
+"Super+Shift+9" = "send 9"
+"Super+Shift+Down" = "move down"
+"Super+Shift+E" = "quit"
+"Super+Shift+Left" = "move left"
+"Super+Shift+Q" = "close"
+"Super+Shift+R" = "reload"
+"Super+Shift+Right" = "move right"
+"Super+Shift+Up" = "move up"
+"Super+Shift+asciitilde" = "scratchpad send"
+"Super+Shift+space" = "floating"
+"Super+Up" = "focus up"
+"Super+equal" = "ratio 0.05"
+"Super+f" = "fullscreen"
+"Super+grave" = "scratchpad show"
+"Super+m" = "layout monocle"
+"Super+minus" = "ratio -0.05"
+"Super+space" = "launcher"
+"Super+t" = "layout master"
+
+[wallpaper]
+path = ""
+kind = "static"
+fit = "fill"
+fps = 30
+pause_on_battery = true
+
+[wallpaper.outputs]
+
+[outputs]
+
+[shell]
+enabled = true
+position = "top"
+height = 36
+modules = [
+    "workspaces",
+    "title",
+    "audio",
+    "network",
+    "bluetooth",
+    "media",
+    "tray",
+    "battery",
+    "notifications",
+    "clock",
+]

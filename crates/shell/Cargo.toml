@@ -1,0 +1,14 @@
+[package]
+name = "wm-shell"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+wm-core = { path = "../core" }
+serde_json = "1"
+xml-rs = "0.8.29"
+gtk = { package = "gtk4", version = "0.10", features = ["v4_14"] }
+gtk4-layer-shell = "0.7"
+notify = "8"
+async-channel = "2"
+gstreamer = "0.24"
+gst-plugin-gtk4 = { version = "0.14", features = ["static", "waylandegl", "dmabuf"] }
