@@ -15,8 +15,7 @@ development packages available:
 
 The nested development session runs in an X11 window on the current desktop. Its
 private D-Bus and IPC socket keep shell services separate from the host desktop.
-The smoke config uses Kitty. The regular default config uses Foot; change
-`terminal` to an installed terminal before testing on TTY3.
+The shipped configuration uses Kitty, which is installed on the target machine.
 
 To test on real hardware, log in as your normal user on **TTY3**, then run:
 
@@ -26,7 +25,8 @@ cd /home/lev/luma
 ```
 
 The TTY script uses `~/.config/wm/config.toml` when present, otherwise the repository
-default. `WM_CONFIG` overrides either. Logs are in
+default. `WM_CONFIG` overrides either. It performs a locked offline incremental build,
+starts a fresh session log, and prints the final log lines if the compositor exits. Logs are in
 `${XDG_STATE_HOME:-~/.local/state}/wm/session.log`; `./tools/logs.sh` follows them.
 `Super+Shift+E` exits. From another terminal, `./tools/stop.sh` requests exit on the
 TTY session socket. Nested IPC uses `WM_SOCKET=$XDG_RUNTIME_DIR/wm-nested.sock`.
@@ -40,8 +40,8 @@ target/debug/wmctl config-check
 ```
 
 Existing configuration files reload automatically. `Super+Shift+R` explicitly
-reloads. Invalid values retain the last valid configuration. The schema includes
-settings whose implementation is still pending; see [STATUS.md](STATUS.md).
+reloads. Invalid values retain the last valid configuration. See
+[STATUS.md](STATUS.md) for runtime validation coverage and hardware checks.
 
 Physical input settings apply on the TTY backend, including after reload and
 device hotplug. Nested sessions use the host desktop's device settings:
@@ -74,8 +74,10 @@ the highest matching refresh. Unsupported requests log a warning and fall back
 to an advertised default at startup. Reload attempts the requested advertised
 mode; unsupported requests retain the current mode and report an error.
 Removing a mode setting selects the advertised default again. Reload uses a
-direct DRM mode test; automatic cross-output bandwidth recovery is not yet
-implemented. Nested sessions use the host window's size and presentation timing.
+coordinated DRM mode test. If the kernel rejects the first atomic test because of
+cross-output bandwidth or modifier constraints, Smithay submits fallback frames
+for the active CRTCs, retries with implicit modifiers, and restores preferred
+modifiers when possible. Nested sessions use the host window's size and presentation timing.
 Changes to a connected display's advertised mode list trigger re-evaluation.
 The active mode stays available until a replacement is accepted; a late mode
 list also retries initially failed output setup. Physical EDID changes still
@@ -116,13 +118,15 @@ Shadows share the cached decoration shader and need no backdrop capture or
 additional blur pass. They reload live and are omitted in fullscreen.
 New windows fade in over `[theme].animation_ms` (default 140 ms), including their
 border, shadow and backdrop blur. `reduced_motion = true` or `animation_ms = 0`
-disables opening and movement animations. Layout position changes ease from the
-current rendered position to the new target, including when retargeted. Interactive
-pointer/touch grabs, fullscreen and locked/inactive sessions bypass movement.
-Workspace entry and scratchpad restoration replay the fade; outgoing windows
-unmap immediately. Window size changes still configure clients directly; closing
-and outgoing workspace transitions remain pending. Animation timers exist only while visible transitions are active;
-movement, closing and workspace transitions are still pending.
+disables opening, movement, closing and workspace animations. Layout position
+changes ease from the current rendered position to the new target, including when
+retargeted. Interactive pointer/touch grabs, fullscreen and locked/inactive
+sessions bypass movement. Workspace entry and scratchpad restoration replay the
+fade; switching workspaces retains the visible outgoing windows on the GPU and
+crossfades them over the incoming workspace. Window size changes send one final
+configure to the client while the compositor scales the live surface smoothly on
+the GPU. A delayed client commit remains scaled at the final visual size until its
+new buffer arrives. Animation timers exist only while visible transitions are active.
 Hold the configured mouse modifier and drag with the left button to move a
 floating window, or the right button to resize from the nearest corner. Clients
 can also request moves and resizes through their own title bars. Tiled and
@@ -185,13 +189,14 @@ are checked before copying, and only the selected image is converted.
 Pixmap selection accounts for the widget's display scale and refreshes on scale
 changes, while keeping the icon's logical size unchanged.
 Attention icons can replace the base icon while retaining the overlay.
-Application-provided absolute `IconThemePath` directories are cached per item
+Application-provided absolute `IconThemePath` directories are cached and monitored per item
 and searched before the system theme and pixmap fallback. Changing or clearing
 the path updates the icon without modifying the shell's global icon theme. It
 follows item status/property signals without polling and routes
 left/middle/right clicks and both scroll axes to item actions. Scroll input uses
 GTK discrete steps (positive down/right, negative up/left), matching Waybar's
-convention. Each bar owns a host registration that
+convention. Pointer actions include the icon's logical output coordinates,
+including bars anchored at the bottom of an output. Each bar owns a host registration that
 is released when rebuilt or removed. `python3 tools/check-tray.py` verifies the
 watcher registry; `python3 tools/check-tray-ui.py` verifies real icon pixels,
 pointer actions, exact scroll arguments in all four directions, bar reload and
@@ -208,11 +213,12 @@ does not register them globally. Structured tray tooltips show the supplied titl
 and description using the configured colors. Descriptions are limited to eight
 lines/2048 characters; supported XML content becomes plain text, retaining link
 text and image descriptions without loading images. Malformed markup remains
-literal text. Menus also honor their own `IconThemePath` directory list, with bounded absolute
+literal text. Menus also honor and monitor their own `IconThemePath` directory list, with bounded absolute
 paths, per-menu caching and live property updates while open. Custom icons take
 precedence over the system theme and embedded PNG fallback. The global GTK theme
-search path is unchanged. Tooltip images and broader
-application compatibility remain pending.
+search path is unchanged. Named and structured ARGB tooltip images are covered by
+the nested fixture. Images referenced only by paths inside tooltip markup are not
+fetched; broader application compatibility remains pending.
 `python3 tools/check-tray-vlc.py` verifies the installed VLC's actual tray icon,
 exported menu, keyboard Quit action and removal using a separate instance and
 temporary settings on the nested session bus. VLC 3.0.23 passed; this does not
@@ -366,8 +372,16 @@ The capture check also verifies hidden cursors and custom cursor sizing and
 hotspots at 150% output scale.
 Screenshots are upright in output coordinates, with transformed dimensions and
 a normal frame transform. Tests cover all rotations/reflections plus a rotated
-window and custom cursor. The screenshot path uses synchronous GPU readback; DMA-BUF streaming
-and portal integration remain pending. Capture is rejected while locked/inactive,
+window and custom cursor. Portal screenshots and monitor ScreenCast negotiation through
+`xdg-desktop-portal-wlr` work, including opening the returned PipeWire remote and consuming
+damage-paced frames. Shared-memory capture uses synchronous GPU readback. Clients can instead
+allocate a supported modifier on the advertised render node and receive the rendered frame
+directly in a DMA-BUF without CPU mapping. The portal fixture forces DMA-BUF caps through
+GStreamer's GL upload path, verifies two damage-paced PipeWire frames, and downloads only at the
+PNG test sink; ordinary consumers can retain the buffers on the GPU.
+Legacy clients can use version 3 of `zwlr_screencopy_v1`, including region, cursor and
+`copy_with_damage` support.
+Capture is rejected while locked/inactive,
 and locking stops existing sessions. DRM capture and lock isolation still need
 hardware/protocol validation. `check-capture.py` builds a Wayland C client using
 `cc`, `wayland-scanner`, Wayland development files and `wayland-protocols`, then
@@ -381,3 +395,31 @@ are checked before rendering and again before copying pixels.
 The compositor does not currently expose virtual-keyboard or input-method globals
 because trusted-helper authentication is not implemented. Ordinary keyboard
 layouts and repeat settings remain available.
+
+`python3 tools/check-lock-boundaries.py` verifies that a dedicated nested session
+withholds unsupported lock and virtual-input globals and preserves desktop focus
+when an unmapped Wayland client connects. This does not validate DRM locking.
+
+Wayland and XWayland windows retain a GPU image for a closing fade on the X11
+development and DRM backends. The fade follows `animation_ms`, is bypassed by
+`reduced_motion`, and clears on workspace changes. Nested capture checks cover
+fade progression, rounded corners, shadows, blur, stacking, abrupt disconnects,
+X11 `WM_DELETE_WINDOW`, XWayland resize interpolation and mid-resize closing,
+and cleanup; physical DRM validation remains pending.
+
+### Optional Winit development backend
+
+Build the optional backend and select it through the nested-session launcher:
+
+```sh
+cargo build --workspace --features wm-compositor/winit --locked
+WM_NESTED_BACKEND=winit ./tools/run-nested.sh
+```
+
+For the closing/capture checks on a native Wayland host:
+
+```sh
+WM_NESTED_BACKEND=winit WM_CHECK_CLOSING_ONLY=1 WM_CAPTURE_NATIVE_WAYLAND=1 python3 tools/check-capture.py
+```
+
+The native Wayland fixture covers closing and capture behavior without X11 resize/input controls. Build without the optional feature to restore the standard binary configuration.

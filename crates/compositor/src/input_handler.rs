@@ -354,6 +354,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .map(|(w, p)| (w.clone(), p))
             {
                 self.space.raise_element(&window, true);
+                self.raise_above_closing(&window);
                 #[cfg(feature = "xwayland")]
                 if let Some(surface) = window.0.x11_surface() {
                     self.xwm.as_mut().unwrap().raise_window(surface).unwrap();
@@ -699,19 +700,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     self.backend_data.reset_buffers(&output);
                 }
 
-                action => match action {
-                    KeyAction::None
-                    | KeyAction::Quit
-                    | KeyAction::Run(_)
-                    | KeyAction::TogglePreview
-                    | KeyAction::ToggleDecorations => self.process_common_key_action(action),
-
-                    _ => tracing::warn!(
-                        ?action,
-                        output_name,
-                        "Key action unsupported on on output backend.",
-                    ),
-                },
+                action @ (KeyAction::None
+                | KeyAction::Desktop(_)
+                | KeyAction::Quit
+                | KeyAction::Run(_)
+                | KeyAction::TogglePreview
+                | KeyAction::ToggleDecorations) => self.process_common_key_action(action),
+                action => tracing::warn!(
+                    ?action,
+                    output_name,
+                    "Key action unsupported on output backend.",
+                ),
             },
 
             InputEvent::PointerMotionAbsolute { event } => {
@@ -748,6 +747,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let pos = transform
             .transform_point_in(evt.position_transformed(native_size), &native_size.to_f64())
             + output_geo.loc.to_f64();
+        tracing::debug!(raw = ?evt.position(), ?native_size, ?transform, ?pos, "windowed pointer motion");
         let serial = SCOUNTER.next_serial();
 
         let pointer = self.pointer.clone();
@@ -944,15 +944,12 @@ impl AnvilState<UdevData> {
                     self.backend_data.set_debug_flags(debug_flags);
                 }
 
-                action => match action {
-                    KeyAction::None
-                    | KeyAction::Quit
-                    | KeyAction::Run(_)
-                    | KeyAction::TogglePreview
-                    | KeyAction::ToggleDecorations => self.process_common_key_action(action),
-
-                    _ => unreachable!(),
-                },
+                action @ (KeyAction::None
+                | KeyAction::Desktop(_)
+                | KeyAction::Quit
+                | KeyAction::Run(_)
+                | KeyAction::TogglePreview
+                | KeyAction::ToggleDecorations) => self.process_common_key_action(action),
             },
             InputEvent::PointerMotion { event, .. } => self.on_pointer_move::<B>(dh, event),
             InputEvent::PointerMotionAbsolute { event, .. } => {

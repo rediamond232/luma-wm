@@ -30,12 +30,9 @@ use smithay::{
             is_sync_subsurface, with_states, with_surface_tree_upward,
         },
         dmabuf::get_dmabuf,
-        shell::{
-            wlr_layer::{
-                Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
-                WlrLayerShellState,
-            },
-            xdg::XdgToplevelSurfaceData,
+        shell::wlr_layer::{
+            Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
+            WlrLayerShellState,
         },
     },
 };
@@ -87,7 +84,11 @@ impl FullscreenSurface {
 
     pub fn get(&self) -> Option<WindowElement> {
         let mut window = self.0.borrow_mut();
-        if window.as_ref().map(|w| !w.alive()).unwrap_or(false) {
+        if window
+            .as_ref()
+            .map(|w| !w.alive() || w.0.bbox().is_empty())
+            .unwrap_or(false)
+        {
             *window = None;
         }
         window.clone()
@@ -177,6 +178,25 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
 
     fn commit(&mut self, surface: &WlSurface) {
         self.desktop.redraw = true;
+        let assignment = with_states(surface, |states| {
+            match states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .buffer
+            {
+                Some(BufferAssignment::Removed) => -1,
+                Some(BufferAssignment::NewBuffer(_)) => 1,
+                None => 0,
+            }
+        });
+        if assignment < 0 {
+            self.capture_closing_window(surface);
+            self.window_unmapped(surface);
+        }
+        if assignment > 0 && crate::transitions::is_captured(surface) {
+            self.cancel_closing_window(surface);
+        }
         on_commit_buffer_handler::<Self>(surface);
         self.backend_data.early_import(surface);
 
@@ -245,10 +265,26 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
             });
         }
 
+        // A null-buffer commit unmaps the role. Wait for the client's next
+        // bufferless commit before beginning a fresh configure handshake.
+        // Unmapped toplevels remain in xdg-shell even when absent from Space.
+        if assignment == 0 {
+            if let Some(toplevel) = self
+                .xdg_shell_state
+                .toplevel_surfaces()
+                .iter()
+                .find(|toplevel| toplevel.wl_surface() == surface)
+            {
+                if !toplevel.is_initial_configure_sent() {
+                    toplevel.send_configure();
+                }
+            }
+        }
         ensure_initial_configure(surface, &self.space, &mut self.popups)
     }
 
-    fn destroyed(&mut self, _surface: &WlSurface) {
+    fn destroyed(&mut self, surface: &WlSurface) {
+        self.capture_closing_window(surface);
         // Clients may disconnect without committing a null buffer first.
         self.desktop.redraw = true;
     }
@@ -331,28 +367,10 @@ fn ensure_initial_configure(
         |_, _, _| true,
     );
 
-    if let Some(window) = space
+    if space
         .elements()
-        .find(|window| window.wl_surface().map(|s| &*s == surface).unwrap_or(false))
-        .cloned()
+        .any(|window| window.wl_surface().map(|s| &*s == surface).unwrap_or(false))
     {
-        // send the initial configure if relevant
-        #[cfg_attr(not(feature = "xwayland"), allow(irrefutable_let_patterns))]
-        if let Some(toplevel) = window.0.toplevel() {
-            let initial_configure_sent = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .initial_configure_sent
-            });
-            if !initial_configure_sent {
-                toplevel.send_configure();
-            }
-        }
-
         with_states(surface, |states| {
             let mut data = states
                 .data_map

@@ -90,6 +90,7 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
             .cloned();
         if let Some(elem) = maybe {
+            self.capture_closing_element(&elem);
             self.space.unmap_elem(&elem)
         }
         if !window.is_override_redirect() {
@@ -135,9 +136,11 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         else {
             return;
         };
-        self.space.map_element(elem, geometry.loc, false);
-        // TODO: We don't properly handle the order of override-redirect windows here,
-        //       they are always mapped top and then never reordered.
+        // Override-redirect surfaces are menus, tooltips and similar transient
+        // UI. A configure notification must not lower them below managed windows
+        // after they were initially mapped on top.
+        self.space
+            .map_element(elem, geometry.loc, window.is_override_redirect());
     }
 
     fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -336,9 +339,24 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         }
     }
 
-    fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
+    fn new_selection(&mut self, xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
         trace!(?selection, ?mime_types, "Got Selection from X11",);
-        // TODO check, that focused windows is X11 window before doing this
+        let x11_is_focused = self
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .and_then(|focus| match focus {
+                KeyboardFocusTarget::Window(window) => window.x11_surface().cloned(),
+                _ => None,
+            })
+            .is_some_and(|surface| surface.xwm_id() == Some(xwm));
+        if !x11_is_focused {
+            trace!(
+                ?selection,
+                "Ignoring selection from an unfocused X11 client"
+            );
+            return;
+        }
         match selection {
             SelectionTarget::Clipboard => {
                 set_data_device_selection(&self.display_handle, &self.seat, mime_types, ())

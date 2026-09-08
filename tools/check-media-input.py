@@ -63,7 +63,10 @@ def main():
             try:
                 nested.wait_for(socket, lambda s: bool(s["outputs"]), process)
                 wid = subprocess.check_output(["xdotool", "search", "--name", "^" + title + "$"], text=True).strip().splitlines()[-1]
-                subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True, timeout=5)
+                if os.environ.get("WM_CAPTURE_PRIVATE_X11"):
+                    nested.fit_private_host(socket, process, wid)
+                else:
+                    subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True, timeout=5)
                 command = ["env", "GDK_BACKEND=wayland", "WM_NETWORK_TEST_PRIVATE_BUS=1", "WM_MEDIA_TEST_INPUT=1",
                            "WM_TEST_HOST_DISPLAY=" + os.environ["DISPLAY"], "WM_TEST_HOST_WINDOW=" + wid,
                            "WM_MEDIA_TEST_RECEIPT=" + str(receipt), binary,

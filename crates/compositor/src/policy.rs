@@ -10,7 +10,7 @@ use smithay::{
     desktop::layer_map_for_output,
     input::keyboard::{Keysym, ModifiersState},
     utils::{IsAlive, Rectangle, SERIAL_COUNTER},
-    wayland::{compositor::with_states, shell::xdg::XdgToplevelSurfaceData},
+    wayland::{compositor::with_states, seat::WaylandFocus, shell::xdg::XdgToplevelSurfaceData},
 };
 use std::{
     collections::BTreeMap,
@@ -36,10 +36,16 @@ pub struct Managed {
     opening_started: Option<std::time::Instant>,
     opened: bool,
     movement: Option<Movement>,
+    resize: Option<Resize>,
 }
 #[derive(Debug)]
 struct Movement {
     from: smithay::utils::Point<i32, smithay::utils::Logical>,
+    started: std::time::Instant,
+}
+#[derive(Debug)]
+struct Resize {
+    from: smithay::utils::Size<i32, smithay::utils::Logical>,
     started: std::time::Instant,
 }
 #[derive(Debug)]
@@ -118,6 +124,47 @@ pub fn identity(w: &WindowElement) -> (String, String) {
     }
 }
 impl<B: Backend + 'static> AnvilState<B> {
+    pub(crate) fn window_unmapped(
+        &mut self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) {
+        let Some(index) = self
+            .desktop
+            .windows
+            .iter()
+            .position(|managed| managed.window.0.wl_surface().as_deref() == Some(surface))
+        else {
+            return;
+        };
+
+        let window = self.desktop.windows[index].window.clone();
+        let was_fullscreen = self.desktop.windows[index].fullscreen;
+        let managed = &mut self.desktop.windows[index];
+
+        // An xdg-toplevel unmap resets its role state. Mirror that reset in
+        // compositor policy so the next initial configure is a normal mapping
+        // unless the client explicitly requests fullscreen again.
+        managed.fullscreen = false;
+        managed.last_size = None;
+        managed.opened = false;
+        managed.opening_started = None;
+        managed.movement = None;
+        managed.resize = None;
+
+        if was_fullscreen {
+            for output in self.space.outputs() {
+                let Some(fullscreen) = output.user_data().get::<FullscreenSurface>() else {
+                    continue;
+                };
+                if fullscreen.get().as_ref() == Some(&window) {
+                    fullscreen.clear();
+                    self.backend_data.reset_buffers(output);
+                }
+            }
+        }
+        self.desktop.redraw = true;
+    }
+
     pub fn install_desktop(&mut self) {
         if self.desktop.installed {
             return;
@@ -192,7 +239,7 @@ impl<B: Backend + 'static> AnvilState<B> {
                 let _ = std::process::Command::new("dbus-update-activation-environment")
                     .args([
                         format!("WAYLAND_DISPLAY={socket}"),
-                        "XDG_CURRENT_DESKTOP=wm".into(),
+                        "XDG_CURRENT_DESKTOP=wm:wlr".into(),
                     ])
                     .status();
             }
@@ -236,7 +283,7 @@ impl<B: Backend + 'static> AnvilState<B> {
         c.args(rest)
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_SOCKET")
-            .env("XDG_CURRENT_DESKTOP", "wm")
+            .env("XDG_CURRENT_DESKTOP", "wm:wlr")
             .env("XDG_SESSION_TYPE", "wayland");
         if std::path::Path::new(first).file_name() == Some(std::ffi::OsStr::new("wm-shell")) {
             c.env("GDK_BACKEND", "wayland");
@@ -316,9 +363,12 @@ impl<B: Backend + 'static> AnvilState<B> {
                     && self.desktop.outputs.get(&w.output) == Some(&w.workspace)
             })
     }
-    fn focus_window(&mut self, index: usize) {
+    fn focus_window(&mut self, index: usize, user_initiated: bool) {
         let w = self.desktop.windows[index].window.clone();
         self.space.raise_element(&w, true);
+        if user_initiated {
+            self.raise_above_closing(&w);
+        }
         let k = self.seat.get_keyboard().unwrap();
         k.set_focus(self, Some(w.into()), SERIAL_COUNTER.next_serial());
         self.desktop.redraw = true;
@@ -342,26 +392,28 @@ impl<B: Backend + 'static> AnvilState<B> {
         let out = self.active_output().unwrap_or_default();
         let focused = self.focused_index();
         match v {
-            "status" => {}
+            "status" => return Ok(()),
             "terminal" => {
-                self.spawn_app(&self.desktop.config.terminal.clone())?;
+                return self.spawn_app(&self.desktop.config.terminal.clone());
             }
             "launcher" => {
                 let p = std::env::current_exe()
                     .map_err(|e| e.to_string())?
                     .with_file_name("wm-shell");
-                self.spawn_app(&[p.to_string_lossy().into_owned(), "--launcher".into()])?;
+                return self.spawn_app(&[p.to_string_lossy().into_owned(), "--launcher".into()]);
             }
             "exec" => {
                 let args: Vec<String> = serde_json::from_str(arg)
                     .map_err(|_| "exec requires a JSON array of executable and arguments")?;
-                self.spawn_app(&args)?;
+                return self.spawn_app(&args);
             }
-            "quit" => self
-                .running
-                .store(false, std::sync::atomic::Ordering::SeqCst),
+            "quit" => {
+                self.running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return Ok(());
+            }
             "lock" => {
-                self.spawn_app(&["swaylock".into()])?;
+                return self.spawn_app(&["swaylock".into()]);
             }
             "reload" => match Config::load() {
                 Ok(c) => {
@@ -407,13 +459,15 @@ impl<B: Backend + 'static> AnvilState<B> {
                     }
                 } else {
                     let previous = *self.desktop.outputs.get(&out).unwrap_or(&1);
-                    if let Some(other) = self
+                    let other = self
                         .desktop
                         .outputs
                         .iter()
                         .find(|(o, w)| **w == n && **o != out)
-                        .map(|(o, _)| o.clone())
-                    {
+                        .map(|(o, _)| o.clone());
+                    self.capture_workspace_transition(&out, previous, n);
+                    if let Some(other) = other {
+                        self.capture_workspace_transition(&other, n, previous);
                         self.desktop.outputs.insert(other.clone(), previous);
                         for w in &mut self.desktop.windows {
                             if w.workspace == previous {
@@ -491,7 +545,7 @@ impl<B: Backend + 'static> AnvilState<B> {
                         let w = &self.desktop.windows[i];
                         self.desktop.outputs.insert(w.output.clone(), w.workspace);
                         self.maintain_desktop();
-                        self.focus_window(i);
+                        self.focus_window(i, true);
                     }
                 } else if let Some(i) = focused {
                     let a = self.desktop.windows[i].rect.unwrap_or(Rect {
@@ -528,7 +582,7 @@ impl<B: Backend + 'static> AnvilState<B> {
                         if v == "move" {
                             self.desktop.windows.swap(i, j)
                         } else {
-                            self.focus_window(j)
+                            self.focus_window(j, true)
                         }
                     }
                 }
@@ -626,6 +680,7 @@ impl<B: Backend + 'static> AnvilState<B> {
                 opacity: 1.0,
                 opening_started: None,
                 movement: None,
+                resize: None,
                 opened: false,
             });
             self.desktop.dirty = true;
@@ -649,6 +704,24 @@ impl<B: Backend + 'static> AnvilState<B> {
                 .current_mode()
                 .map(|mode| mode.refresh)
                 .unwrap_or(60_000);
+            if crate::transitions::tick(
+                output,
+                self.desktop.active
+                    && !self.lock.locked
+                    && !self.desktop.config.theme.reduced_motion
+                    && self.desktop.config.theme.animation_ms > 0
+                    && output
+                        .user_data()
+                        .get::<crate::shell::FullscreenSurface>()
+                        .and_then(|fullscreen| fullscreen.get())
+                        .is_none(),
+                *self.desktop.outputs.get(&output.name()).unwrap_or(&1),
+            ) {
+                animating = true;
+                animation_refresh = animation_refresh.max(output_refresh);
+                self.desktop.redraw = true;
+            }
+
             output.user_data().insert_if_missing(|| {
                 std::sync::Mutex::new(crate::effects::OutputTheme::default())
             });
@@ -719,6 +792,7 @@ impl<B: Backend + 'static> AnvilState<B> {
                     }
                 }
             }
+            crate::lock::configure_surface(output);
             let zone = layer_map_for_output(output).non_exclusive_zone();
             let area = Rect {
                 x: geo.loc.x + zone.loc.x,
@@ -921,6 +995,17 @@ impl<B: Backend + 'static> AnvilState<B> {
                 }
                 let current_location = self.space.element_location(&w.window);
                 let target_changed = w.rect != Some(r);
+                w.window
+                    .0
+                    .user_data()
+                    .insert_if_missing(crate::effects::WindowRenderSize::default);
+                let render_size_state = w
+                    .window
+                    .0
+                    .user_data()
+                    .get::<crate::effects::WindowRenderSize>()
+                    .unwrap();
+                let current_render_size = *render_size_state.0.lock().unwrap();
                 if !animate_movement || w.fullscreen || current_location.is_none() {
                     w.movement = None;
                 } else if target_changed {
@@ -934,6 +1019,20 @@ impl<B: Backend + 'static> AnvilState<B> {
                             from,
                             started: std::time::Instant::now(),
                         });
+                }
+                let target_size = (r.w, r.h).into();
+                if !animate_movement || w.fullscreen || current_location.is_none() {
+                    w.resize = None;
+                } else if target_changed
+                    && w.rect
+                        .is_some_and(|previous| (previous.w, previous.h) != (r.w, r.h))
+                {
+                    let from = current_render_size
+                        .or_else(|| w.rect.map(|previous| (previous.w, previous.h).into()));
+                    w.resize = from.filter(|from| *from != target_size).map(|from| Resize {
+                        from,
+                        started: std::time::Instant::now(),
+                    });
                 }
                 let mut location = (r.x, r.y).into();
                 if let Some(movement) = &w.movement {
@@ -959,6 +1058,40 @@ impl<B: Backend + 'static> AnvilState<B> {
                         animation_refresh = animation_refresh.max(output_refresh);
                     }
                 }
+                let mut render_size = target_size;
+                if let Some(resize) = &w.resize {
+                    let progress = wm_core::opening_opacity(
+                        resize.started.elapsed(),
+                        self.desktop.config.theme.animation_ms,
+                        false,
+                    );
+                    if progress >= 1.0 {
+                        w.resize = None;
+                    } else {
+                        let t = f64::from(progress);
+                        render_size = (
+                            (f64::from(resize.from.w)
+                                + (f64::from(r.w) - f64::from(resize.from.w)) * t)
+                                .round()
+                                .max(1.0) as i32,
+                            (f64::from(resize.from.h)
+                                + (f64::from(r.h) - f64::from(resize.from.h)) * t)
+                                .round()
+                                .max(1.0) as i32,
+                        )
+                            .into();
+                        animating = true;
+                        animation_refresh = animation_refresh.max(output_refresh);
+                    }
+                }
+                let committed_size = w.window.0.geometry().size;
+                let next_render_size = (render_size != committed_size).then_some(render_size);
+                let mut previous_render_size = render_size_state.0.lock().unwrap();
+                if *previous_render_size != next_render_size {
+                    *previous_render_size = next_render_size;
+                    self.desktop.redraw = true;
+                }
+                drop(previous_render_size);
                 if target_changed || current_location != Some(location) {
                     scene_moved |= current_location != Some(location);
                     self.desktop.redraw = true;
@@ -1011,10 +1144,20 @@ impl<B: Backend + 'static> AnvilState<B> {
             if !visible && self.space.element_location(&w.window).is_some() {
                 scene_moved = true;
                 w.movement = None;
+                w.resize = None;
+                if let Some(render_size) = w
+                    .window
+                    .0
+                    .user_data()
+                    .get::<crate::effects::WindowRenderSize>()
+                {
+                    *render_size.0.lock().unwrap() = None;
+                }
                 // Re-entering a workspace or restoring a scratchpad starts a
                 // fresh fade. Hidden surfaces never keep the timer alive.
                 w.opened = false;
                 w.opening_started = None;
+                crate::effects::clear_closing_backdrop(&w.window);
                 self.space.unmap_elem(&w.window);
                 self.desktop.redraw = true;
             }
@@ -1065,7 +1208,7 @@ impl<B: Backend + 'static> AnvilState<B> {
                 .iter()
                 .rposition(|w| self.space.element_location(&w.window).is_some())
             {
-                self.focus_window(i)
+                self.focus_window(i, false)
             } else if let Some(k) = self.seat.get_keyboard() {
                 k.set_focus(self, None, SERIAL_COUNTER.next_serial());
             }
@@ -1124,6 +1267,13 @@ impl<B: Backend + 'static> AnvilState<B> {
         for w in &self.desktop.windows {
             let (app_id, title) = identity(&w.window);
             snapshot.windows.push(WindowInfo {
+                surface_size: w.window.wl_surface().and_then(|surface| {
+                    smithay::backend::renderer::utils::with_renderer_surface_state(
+                        &surface,
+                        |state| state.surface_size().map(|size| [size.w, size.h]),
+                    )
+                    .flatten()
+                }),
                 id: w.id,
                 title,
                 app_id,
@@ -1143,6 +1293,12 @@ impl<B: Backend + 'static> AnvilState<B> {
                     snapshot.layers.push(wm_core::LayerInfo {
                         namespace: layer.namespace().into(),
                         output: o.name(),
+                        surface_size:
+                            smithay::backend::renderer::utils::with_renderer_surface_state(
+                                layer.wl_surface(),
+                                |state| state.surface_size().map(|size| [size.w, size.h]),
+                            )
+                            .flatten(),
                         geometry: Rect {
                             x: g.loc.x,
                             y: g.loc.y,

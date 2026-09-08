@@ -30,7 +30,12 @@ with tempfile.TemporaryDirectory(prefix="wm-tray-menu-") as temporary:
         try:
             nested.wait_for(socket, lambda s: bool(s["outputs"]), process)
             wid = subprocess.check_output(["xdotool", "search", "--name", "^" + title + "$"], text=True).strip().splitlines()[-1]
-            subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True, timeout=5)
+            if os.environ.get("WM_CAPTURE_PRIVATE_X11"):
+                subprocess.run(["xdotool", "windowraise", wid], check=True, timeout=5)
+                subprocess.run(["xdotool", "windowfocus", "--sync", wid], check=True, timeout=5)
+            else:
+                subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True, timeout=5)
+            nested.fit_private_host(socket, process, wid)
             command = ["env", "GDK_BACKEND=wayland", "WM_TRAY_MENU_TEST=1",
                 "WM_TEST_HOST_DISPLAY=" + os.environ["DISPLAY"], "WM_TEST_HOST_WINDOW=" + wid,
                 "WM_TRAY_MENU_RECEIPT=" + str(receipt), binary,

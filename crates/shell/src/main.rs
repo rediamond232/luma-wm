@@ -75,7 +75,7 @@ button:checked label, button:checked image, button:checked arrow, button.active 
 button:hover, row:selected {{ background: alpha({accent}, .15); color: {fg}; }}
 button.active, button:checked {{ background: alpha({accent}, .22); color: {accent}; }}
 button:disabled, button:disabled label, button:disabled image, button:disabled arrow {{ color: alpha({muted}, .55); }}
-button:focus-visible, entry:focus-visible {{ outline: 2px solid alpha({accent}, .7); outline-offset: -2px; }}
+button:focus, entry:focus-within {{ outline: 2px solid alpha({accent}, .7); outline-offset: -2px; }}
 popover {{ background: transparent; color: {fg}; font-family: "{font}"; font-size: {size}px; }}
 popover > contents, popover > arrow {{ background: {bg}; border: {border}px solid alpha({accent}, .35); }}
 popover > contents {{ border-radius: {radius}px; box-shadow: none; padding: 0; }}
@@ -254,7 +254,13 @@ fn shell(app: &gtk::Application, c: &Config) {
                     right.append(&media::widget());
                 }
                 if c.shell.modules.iter().any(|m| m == "tray") {
-                    right.append(&tray::widget());
+                    let geometry = monitor.geometry();
+                    right.append(&tray::widget((
+                        geometry.x(),
+                        geometry.y(),
+                        geometry.height(),
+                        c.shell.position == "bottom",
+                    )));
                 }
                 if c.shell.modules.iter().any(|m| m == "battery") {
                     right.append(&battery::widget());
@@ -298,9 +304,44 @@ fn shell(app: &gtk::Application, c: &Config) {
     let build = Rc::new(build);
     build();
     if let Some(d) = gdk::Display::default() {
-        let build = build.clone();
-        d.monitors()
-            .connect_items_changed(move |_, _, _, _| build());
+        let model = d.monitors();
+        let monitor_handlers = Rc::new(RefCell::new(
+            Vec::<(gdk::Monitor, glib::SignalHandlerId)>::new(),
+        ));
+        let reconnect = Rc::new({
+            let model = model.clone();
+            let handlers = monitor_handlers.clone();
+            let build = build.clone();
+            move || {
+                for (monitor, handler) in handlers.borrow_mut().drain(..) {
+                    monitor.disconnect(handler);
+                }
+                for index in 0..model.n_items() {
+                    let Some(monitor) = model
+                        .item(index)
+                        .and_then(|item| item.downcast::<gdk::Monitor>().ok())
+                    else {
+                        continue;
+                    };
+                    let rebuild = build.clone();
+                    let handler = monitor.connect_notify_local(None, move |_, property| {
+                        if matches!(property.name(), "geometry" | "scale-factor") {
+                            rebuild();
+                        }
+                    });
+                    handlers.borrow_mut().push((monitor, handler));
+                }
+            }
+        });
+        reconnect();
+        model.connect_items_changed({
+            let reconnect = reconnect.clone();
+            let build = build.clone();
+            move |_, _, _, _| {
+                reconnect();
+                build();
+            }
+        });
     }
     let rx = subscribe();
     glib::MainContext::default().spawn_local(async move {
@@ -348,6 +389,11 @@ fn shell(app: &gtk::Application, c: &Config) {
                 glib::MainContext::default().spawn_local(async move {
                     let _watcher = watcher;
                     while rx.recv().await.is_ok() {
+                        // The compositor and shell watch the same file. Let the compositor
+                        // publish output scale/transform changes before recreating layer
+                        // surfaces, and collapse editor replace/write event bursts.
+                        glib::timeout_future(std::time::Duration::from_millis(75)).await;
+                        while rx.try_recv().is_ok() {}
                         if let Ok(c) = Config::load() {
                             css(&c);
                             *config.borrow_mut() = c;
@@ -362,7 +408,7 @@ fn shell(app: &gtk::Application, c: &Config) {
 #[derive(Clone)]
 enum Entry {
     App(gio::AppInfo),
-    Window(u64, String),
+    Window(u64, String, String),
     Command(String),
     Power(&'static str, &'static str),
 }
@@ -408,7 +454,7 @@ fn launcher(app: &gtk::Application, c: &Config) {
                         w.title.to_lowercase().contains(q.trim())
                             || w.app_id.to_lowercase().contains(q.trim())
                     })
-                    .map(|w| Entry::Window(w.id, w.title.clone()))
+                    .map(|w| Entry::Window(w.id, w.title.clone(), w.app_id.clone()))
                     .collect()
             } else if let Some(cmd) = text.strip_prefix('>') {
                 vec![Entry::Command(cmd.trim().into())]
@@ -435,16 +481,58 @@ fn launcher(app: &gtk::Application, c: &Config) {
                 a.into_iter().take(30).map(Entry::App).collect()
             };
             for item in &items {
-                let text = match item {
-                    Entry::App(a) => a.display_name().to_string(),
-                    Entry::Window(_, t) => t.clone(),
-                    Entry::Command(c) => format!("Run: {c}"),
-                    Entry::Power(t, _) => t.to_string(),
+                let (text, detail, image) = match item {
+                    Entry::App(a) => (
+                        a.display_name().to_string(),
+                        a.description().unwrap_or_default().to_string(),
+                        a.icon()
+                            .map(|icon| gtk::Image::from_gicon(&icon))
+                            .unwrap_or_else(|| {
+                                gtk::Image::from_icon_name("application-x-executable-symbolic")
+                            }),
+                    ),
+                    Entry::Window(_, title, app_id) => (
+                        title.clone(),
+                        app_id.clone(),
+                        gtk::Image::from_icon_name("focus-windows-symbolic"),
+                    ),
+                    Entry::Command(command) => (
+                        format!("Run: {command}"),
+                        "Shell command".into(),
+                        gtk::Image::from_icon_name("utilities-terminal-symbolic"),
+                    ),
+                    Entry::Power(title, command) => (
+                        title.to_string(),
+                        "Session action".into(),
+                        gtk::Image::from_icon_name(match *command {
+                            "lock" => "system-lock-screen-symbolic",
+                            "suspend" => "system-suspend-symbolic",
+                            "reboot" => "system-reboot-symbolic",
+                            "poweroff" => "system-shutdown-symbolic",
+                            _ => "system-log-out-symbolic",
+                        }),
+                    ),
                 };
-                let l = gtk::Label::new(Some(&text));
-                l.set_xalign(0.);
-                l.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                list.append(&l);
+                image.set_pixel_size(28);
+                image.set_valign(gtk::Align::Center);
+                let labels = gtk::Box::new(gtk::Orientation::Vertical, 1);
+                labels.set_hexpand(true);
+                let title = gtk::Label::new(Some(&text));
+                title.add_css_class("title");
+                title.set_xalign(0.0);
+                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                labels.append(&title);
+                if !detail.trim().is_empty() && detail != text {
+                    let detail = gtk::Label::new(Some(&detail));
+                    detail.add_css_class("muted");
+                    detail.set_xalign(0.0);
+                    detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    labels.append(&detail);
+                }
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                row.append(&image);
+                row.append(&labels);
+                list.append(&row);
             }
             *entries.borrow_mut() = items;
             if let Some(row) = list.row_at_index(0) {
@@ -478,7 +566,7 @@ fn launcher(app: &gtk::Application, c: &Config) {
                             eprintln!("launch: {e}")
                         }
                     }
-                    Entry::Window(id, _) => command(format!("focus {id}")),
+                    Entry::Window(id, _, _) => command(format!("focus {id}")),
                     Entry::Command(c) => {
                         command(format!(
                             "exec {}",

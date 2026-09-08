@@ -16,8 +16,10 @@ pub mod input_handler;
 #[cfg(feature = "libei")]
 pub mod libei;
 pub mod render;
+mod screencopy;
 pub mod shell;
 pub mod state;
+mod transitions;
 #[cfg(feature = "udev")]
 pub mod udev;
 #[cfg(feature = "winit")]

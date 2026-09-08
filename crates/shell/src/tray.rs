@@ -81,6 +81,9 @@ fn text(proxy: &gio::DBusProxy, key: &str) -> String {
 pub(crate) struct IconThemeCache {
     paths: Vec<String>,
     pub(crate) theme: Option<gtk::IconTheme>,
+    monitors: Vec<gio::FileMonitor>,
+    dirty: Rc<Cell<bool>>,
+    monitor_refresh_scheduled: Rc<Cell<bool>>,
 }
 impl IconThemeCache {
     fn update(&mut self, proxy: &gio::DBusProxy) {
@@ -92,6 +95,11 @@ impl IconThemeCache {
                 .collect(),
         );
     }
+    pub(crate) fn update_watched(&mut self, proxy: &gio::DBusProxy, on_change: Rc<dyn Fn()>) {
+        self.update(proxy);
+        self.watch(on_change);
+    }
+
     pub(crate) fn update_paths(&mut self, paths: Vec<String>) {
         let paths: Vec<_> = paths
             .into_iter()
@@ -102,8 +110,12 @@ impl IconThemeCache {
                     && std::path::Path::new(path).is_absolute()
             })
             .collect();
-        if self.paths == paths {
+        let paths_changed = self.paths != paths;
+        if !paths_changed && !self.dirty.replace(false) {
             return;
+        }
+        if paths_changed {
+            self.monitors.clear();
         }
         self.paths = paths;
         self.theme = if self.paths.is_empty() {
@@ -124,6 +136,38 @@ impl IconThemeCache {
         };
     }
 }
+impl IconThemeCache {
+    pub(crate) fn watch(&mut self, on_change: Rc<dyn Fn()>) {
+        if self.paths.is_empty() || !self.monitors.is_empty() {
+            return;
+        }
+        for path in &self.paths {
+            let file = gio::File::for_path(path);
+            let Ok(monitor) =
+                file.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+            else {
+                continue;
+            };
+            let dirty = self.dirty.clone();
+            let scheduled = self.monitor_refresh_scheduled.clone();
+            let refresh = on_change.clone();
+            monitor.connect_changed(move |_, _, _, _| {
+                dirty.set(true);
+                if scheduled.replace(true) {
+                    return;
+                }
+                let scheduled = scheduled.clone();
+                let refresh = refresh.clone();
+                glib::idle_add_local_once(move || {
+                    scheduled.set(false);
+                    refresh();
+                });
+            });
+            self.monitors.push(monitor);
+        }
+    }
+}
+
 fn icon(
     proxy: &gio::DBusProxy,
     image: &gtk::Image,
@@ -222,7 +266,74 @@ fn pixmap_texture(value: &glib::Variant, size: i32) -> Option<gdk::MemoryTexture
     ))
 }
 
-fn item_button(proxy: &gio::DBusProxy) -> gtk::Button {
+#[derive(Default)]
+struct TooltipView {
+    widgets: Option<(gtk::Box, gtk::Image, gtk::Label)>,
+    theme: IconThemeCache,
+    pixmap: PixmapCache,
+}
+impl TooltipView {
+    fn show(&mut self, proxy: &gio::DBusProxy, tip: &gtk::Tooltip) -> bool {
+        let value = proxy.cached_property("ToolTip");
+        let title = text(proxy, "Title");
+        let description = tooltip(value.as_ref(), &title);
+        let (content, image, label) = self.widgets.get_or_insert_with(|| {
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let image = gtk::Image::new();
+            image.set_pixel_size(32);
+            image.set_valign(gtk::Align::Center);
+            let label = gtk::Label::new(None);
+            label.set_xalign(0.0);
+            label.set_wrap(true);
+            label.set_max_width_chars(48);
+            content.append(&image);
+            content.append(&label);
+            (content, image, label)
+        });
+        label.set_text(&description);
+        label.set_visible(!description.is_empty());
+        self.theme.update(proxy);
+        let value = value
+            .as_ref()
+            .filter(|v| v.type_().as_str() == "(sa(iiay)ss)");
+        let name = value.map(|v| v.child_value(0));
+        let name = name
+            .as_ref()
+            .and_then(|v| v.str())
+            .filter(|name| name.len() <= 256 && !name.chars().any(char::is_control))
+            .unwrap_or_default();
+        let custom = self
+            .theme
+            .theme
+            .as_ref()
+            .filter(|theme| !name.is_empty() && theme.has_icon(name));
+        let themed =
+            !name.is_empty() && gtk::IconTheme::for_display(&image.display()).has_icon(name);
+        let has_image = if let Some(theme) = custom {
+            image.set_paintable(Some(&theme.lookup_icon(
+                name,
+                &[],
+                32,
+                image.scale_factor(),
+                image.direction(),
+                gtk::IconLookupFlags::empty(),
+            )));
+            true
+        } else if themed {
+            image.set_icon_name(Some(name));
+            true
+        } else {
+            self.pixmap.show(value.map(|v| v.child_value(1)), image)
+        };
+        image.set_visible(has_image);
+        tip.set_custom(Some(content));
+        has_image || !description.is_empty()
+    }
+}
+
+type OutputGeometry = (i32, i32, i32, bool);
+
+fn item_button(proxy: &gio::DBusProxy, output: OutputGeometry) -> gtk::Button {
     let image = gtk::Image::new();
     image.set_pixel_size(18);
     let overlay = gtk::Overlay::new();
@@ -236,25 +347,45 @@ fn item_button(proxy: &gio::DBusProxy) -> gtk::Button {
     badge.set_can_target(false);
     overlay.add_overlay(&badge);
     let button = gtk::Button::builder().child(&overlay).build();
+    let tooltip_view = RefCell::new(TooltipView::default());
+    let tooltip_proxy = proxy.downgrade();
+    button.connect_query_tooltip(move |_, _, _, _, tip| {
+        tooltip_proxy
+            .upgrade()
+            .is_some_and(|proxy| tooltip_view.borrow_mut().show(&proxy, tip))
+    });
     let weak_button = button.downgrade();
     let weak_image = image.downgrade();
     let weak_badge = badge.downgrade();
     let theme = RefCell::new(IconThemeCache::default());
+    let update_slot = Rc::new(RefCell::new(None::<std::rc::Weak<dyn Fn(&gio::DBusProxy)>>));
+    let monitor_proxy = proxy.downgrade();
+    let monitor_slot = update_slot.clone();
+    let monitor_refresh: Rc<dyn Fn()> = Rc::new(move || {
+        let update = monitor_slot
+            .borrow()
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade);
+        if let (Some(proxy), Some(update)) = (monitor_proxy.upgrade(), update) {
+            update(&proxy);
+        }
+    });
     let caches = RefCell::new([
         PixmapCache::default(),
         PixmapCache::default(),
         PixmapCache::default(),
     ]);
-    let update = Rc::new(move |proxy: &gio::DBusProxy| {
+    let update: Update = Rc::new(move |proxy: &gio::DBusProxy| {
         if let (Some(button), Some(image)) = (weak_button.upgrade(), weak_image.upgrade()) {
             let status = text(proxy, "Status");
             button.set_visible(status != "Passive" && proxy.name_owner().is_some());
             let title = text(proxy, "Title");
             let tooltip = tooltip(proxy.cached_property("ToolTip").as_ref(), &title);
             button.set_tooltip_text(Some(&tooltip));
+            button.set_has_tooltip(true);
             button.update_property(&[gtk::accessible::Property::Label(&title)]);
             let mut theme = theme.borrow_mut();
-            theme.update(proxy);
+            theme.update_watched(proxy, monitor_refresh.clone());
             let custom = theme.theme.as_ref();
             let mut caches = caches.borrow_mut();
             let attention = status == "NeedsAttention"
@@ -267,6 +398,7 @@ fn item_button(proxy: &gio::DBusProxy) -> gtk::Button {
             }
         }
     });
+    *update_slot.borrow_mut() = Some(Rc::downgrade(&update));
     update(proxy);
     for image in [&image, &badge] {
         let update = update.clone();
@@ -287,6 +419,23 @@ fn item_button(proxy: &gio::DBusProxy) -> gtk::Button {
     // SNI implementations often emit NewIcon/NewStatus instead of PropertiesChanged.
     let busy = Rc::new(Cell::new(false));
     let again = Rc::new(Cell::new(false));
+    let initial_refresh = (update.clone(), busy.clone(), again.clone());
+    let mapped_refresh = initial_refresh.clone();
+    let mapped_proxy = proxy.downgrade();
+    button.connect_map(move |_| {
+        if let Some(proxy) = mapped_proxy.upgrade() {
+            // The initial proxy refresh can complete before this button inherits
+            // its monitor scale or before the newly rebuilt bar is mapped. Run
+            // one coalesced reconciliation at that lifecycle boundary.
+            mapped_refresh.0(&proxy);
+            refresh_item(
+                &proxy,
+                mapped_refresh.0.clone(),
+                mapped_refresh.1.clone(),
+                mapped_refresh.2.clone(),
+            );
+        }
+    });
     let proxy_signal = proxy.clone();
     let weak_proxy = proxy_signal.downgrade();
     proxy.connect_local("g-signal", false, move |_| {
@@ -310,13 +459,18 @@ fn item_button(proxy: &gio::DBusProxy) -> gtk::Button {
             &action_proxy,
             button,
             if menu { "ContextMenu" } else { "Activate" },
+            output,
+            (
+                f64::from(button.width()) / 2.0,
+                f64::from(button.height()) / 2.0,
+            ),
         );
     });
     let click = gtk::GestureClick::new();
     click.set_button(0);
     let weak = button.downgrade();
     let click_proxy = proxy.clone();
-    click.connect_pressed(move |gesture, _, _, _| {
+    click.connect_pressed(move |gesture, _, x, y| {
         let method = match gesture.current_button() {
             2 => "SecondaryActivate",
             3 => "ContextMenu",
@@ -327,7 +481,7 @@ fn item_button(proxy: &gio::DBusProxy) -> gtk::Button {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 return;
             }
-            action(&click_proxy, &button, method);
+            action(&click_proxy, &button, method, output, (x, y));
         }
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
@@ -359,6 +513,12 @@ fn item_button(proxy: &gio::DBusProxy) -> gtk::Button {
         glib::Propagation::Stop
     });
     button.add_controller(scroll);
+    refresh_item(
+        proxy,
+        initial_refresh.0,
+        initial_refresh.1,
+        initial_refresh.2,
+    );
     button
 }
 
@@ -443,8 +603,37 @@ fn refresh_item(
         },
     );
 }
-fn action(proxy: &gio::DBusProxy, button: &gtk::Button, method: &str) {
-    call_action(proxy, button, method, &(0i32, 0i32).to_variant());
+fn action(
+    proxy: &gio::DBusProxy,
+    button: &gtk::Button,
+    method: &str,
+    output: OutputGeometry,
+    local: (f64, f64),
+) {
+    let (mut x, mut y) = local;
+    let mut widget = button.clone().upcast::<gtk::Widget>();
+    while let Some(parent) = widget.parent() {
+        let Some(point) =
+            widget.compute_point(&parent, &gtk::graphene::Point::new(x as f32, y as f32))
+        else {
+            break;
+        };
+        x = f64::from(point.x());
+        y = f64::from(point.y());
+        widget = parent;
+    }
+    let (output_x, output_y, output_height, bottom) = output;
+    let bar_y = if bottom {
+        output_height.saturating_sub(widget.height())
+    } else {
+        0
+    };
+    let x =
+        output_x.saturating_add(x.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32);
+    let y = output_y
+        .saturating_add(bar_y)
+        .saturating_add(y.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32);
+    call_action(proxy, button, method, &(x, y).to_variant());
 }
 fn call_action(
     proxy: &gio::DBusProxy,
@@ -473,10 +662,12 @@ struct Host {
     root: glib::WeakRef<gtk::Box>,
     watcher: gio::DBusProxy,
     items: RefCell<BTreeMap<String, (u64, Option<gtk::Button>)>>,
+    proxy_retries: RefCell<BTreeMap<String, u8>>,
     generation: Cell<u64>,
     busy: Cell<bool>,
     again: Cell<bool>,
     name: String,
+    output: OutputGeometry,
 }
 impl Host {
     fn refresh(self: &Rc<Self>) {
@@ -564,18 +755,54 @@ impl Host {
                     {
                         return;
                     }
-                    if let (Ok(proxy), Some(root)) = (result, host.root.upgrade()) {
-                        let button = item_button(&proxy);
-                        root.append(&button);
-                        host.items
-                            .borrow_mut()
-                            .insert(id, (generation, Some(button)));
+                    match result {
+                        Ok(proxy) => {
+                            if let Some(root) = host.root.upgrade() {
+                                let button = item_button(&proxy, host.output);
+                                root.append(&button);
+                                host.proxy_retries.borrow_mut().remove(&id);
+                                host.items
+                                    .borrow_mut()
+                                    .insert(id, (generation, Some(button)));
+                            }
+                        }
+                        Err(_) => {
+                            host.items.borrow_mut().remove(&id);
+                            let attempt = {
+                                let mut retries = host.proxy_retries.borrow_mut();
+                                let attempts = retries.entry(id).or_default();
+                                if *attempts >= 3 {
+                                    None
+                                } else {
+                                    *attempts += 1;
+                                    Some(*attempts)
+                                }
+                            };
+                            if let Some(attempt) = attempt.filter(|_| host.root.upgrade().is_some())
+                            {
+                                let retry = Rc::downgrade(&host);
+                                glib::timeout_add_local_once(
+                                    std::time::Duration::from_millis(u64::from(attempt) * 100),
+                                    move || {
+                                        if let Some(host) = retry.upgrade() {
+                                            host.refresh();
+                                        }
+                                    },
+                                );
+                            }
+                        }
                     }
                 },
             );
         }
     }
     fn register(self: &Rc<Self>) {
+        let retry = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+            if let Some(host) = retry.upgrade().filter(|host| host.root.upgrade().is_some()) {
+                host.refresh();
+            }
+        });
         if self.watcher.name_owner().is_none() {
             self.sync(vec![]);
             return;
@@ -595,7 +822,7 @@ impl Host {
         );
     }
 }
-pub fn widget() -> gtk::Box {
+pub fn widget(output: OutputGeometry) -> gtk::Box {
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     let weak = root.downgrade();
     gio::DBusProxy::for_bus(
@@ -619,10 +846,12 @@ pub fn widget() -> gtk::Box {
                 root: root.downgrade(),
                 watcher: watcher.clone(),
                 items: RefCell::new(BTreeMap::new()),
+                proxy_retries: RefCell::new(BTreeMap::new()),
                 generation: Cell::new(0),
                 busy: Cell::new(false),
                 again: Cell::new(false),
                 name: name.clone(),
+                output,
             });
             let weak = Rc::downgrade(&host);
             watcher.connect_local("g-signal", false, move |_| {

@@ -52,7 +52,7 @@ use smithay::{
         compositor::{
             CompositorClientState, CompositorHandler, CompositorState, get_parent, with_states,
         },
-        dmabuf::DmabufFeedback,
+        dmabuf::{DmabufFeedback, get_dmabuf},
         fifo::{FifoBarrierCachedState, FifoManagerState},
         fixes::FixesState,
         fractional_scale::{
@@ -63,8 +63,8 @@ use smithay::{
             OutputCaptureSourceHandler, OutputCaptureSourceState,
         },
         image_copy_capture::{
-            BufferConstraints, Frame, ImageCopyCaptureHandler, ImageCopyCaptureState, Session,
-            SessionRef,
+            BufferConstraints, Frame, FrameRef, ImageCopyCaptureHandler, ImageCopyCaptureState,
+            Session, SessionRef,
         },
         input_method::{InputMethodHandler, PopupSurface},
         keyboard_shortcuts_inhibit::{
@@ -181,9 +181,11 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub image_capture_source_state: ImageCaptureSourceState,
     pub output_capture_source_state: OutputCaptureSourceState,
     pub image_copy_capture_state: ImageCopyCaptureState,
+    pub(crate) pending_screencopies: Vec<crate::screencopy::PendingFrame>,
+    pub(crate) pending_capture_frames: Vec<PendingCaptureFrame>,
     pub capture_sessions: Vec<Session>,
     pub cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
-    capture_cursor: crate::capture::CaptureCursor,
+    pub(crate) capture_cursor: crate::capture::CaptureCursor,
 
     pub dnd_icon: Option<DndIcon>,
 
@@ -205,6 +207,17 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub renderdoc: Option<renderdoc::RenderDoc<renderdoc::V141>>,
 
     pub show_window_preview: bool,
+}
+
+#[derive(Debug, Default)]
+struct CaptureSessionState {
+    has_captured: AtomicBool,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingCaptureFrame {
+    session: SessionRef,
+    frame: Frame,
 }
 
 #[derive(Debug)]
@@ -675,7 +688,7 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
             ],
             #[cfg(any(feature = "udev", feature = "winit", feature = "x11"))]
-            dma: None,
+            dma: self.backend_data.capture_dmabuf_constraints(&output),
         })
     }
 
@@ -684,15 +697,52 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
         // pending frames. Bound client-owned sessions before accepting more.
         if self.capture_sessions.len() < 32 && self.capture_constraints(&session.source()).is_some()
         {
+            session
+                .user_data()
+                .insert_if_missing(CaptureSessionState::default);
             self.capture_sessions.push(session);
         }
     }
 
     fn session_destroyed(&mut self, session: SessionRef) {
+        self.pending_capture_frames
+            .retain(|pending| pending.session != session);
         self.capture_sessions.retain(|owned| owned != &session);
     }
 
     fn frame(&mut self, session: &SessionRef, frame: Frame) {
+        let has_captured = session
+            .user_data()
+            .get::<CaptureSessionState>()
+            .is_some_and(|state| {
+                state
+                    .has_captured
+                    .load(std::sync::atomic::Ordering::Acquire)
+            });
+        if has_captured {
+            if self.pending_capture_frames.len() >= 32 {
+                frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+            } else {
+                self.pending_capture_frames.push(PendingCaptureFrame {
+                    session: session.clone(),
+                    frame,
+                });
+            }
+            return;
+        }
+        self.complete_capture_frame(session, frame);
+    }
+
+    fn frame_aborted(&mut self, frame: FrameRef) {
+        self.pending_capture_frames
+            .retain(|pending| pending.frame != frame);
+    }
+}
+
+delegate_dispatch2!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+
+impl<BackendData: Backend + 'static> AnvilState<BackendData> {
+    fn complete_capture_frame(&mut self, session: &SessionRef, frame: Frame) {
         if self.capture_constraints(&session.source()).is_none() {
             frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Stopped);
             return;
@@ -705,12 +755,16 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
             .unwrap();
         let mode = output.current_mode().unwrap();
         let size = output.current_transform().transform_size(mode.size);
-        if let Err(error) = crate::capture::validate(&frame.buffer(), size.w, size.h) {
-            tracing::debug!(%error, "rejected capture buffer");
-            frame.fail(
-                smithay::wayland::image_copy_capture::CaptureFailureReason::BufferConstraints,
-            );
-            return;
+        let buffer = frame.buffer();
+        let dmabuf = get_dmabuf(&buffer).ok().cloned();
+        if dmabuf.is_none() {
+            if let Err(error) = crate::capture::validate(&buffer, size.w, size.h) {
+                tracing::debug!(%error, "rejected capture buffer");
+                frame.fail(
+                    smithay::wayland::image_copy_capture::CaptureFailureReason::BufferConstraints,
+                );
+                return;
+            }
         }
         if session.draw_cursor() {
             self.capture_cursor.prepare(
@@ -721,27 +775,58 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
                 self.clock.now().into(),
             );
         }
-        let result = self
-            .backend_data
-            .capture_output(
-                &self.space,
-                &output,
-                session.draw_cursor().then_some(&self.capture_cursor),
-            )
-            .and_then(|pixels| crate::capture::write(&frame.buffer(), size.w, size.h, &pixels));
+        let cursor = session.draw_cursor().then_some(&self.capture_cursor);
+        let result = if let Some(dmabuf) = dmabuf {
+            tracing::debug!(output = %output.name(), "capturing output into DMA-BUF");
+            self.backend_data
+                .capture_output_dmabuf(&self.space, &output, cursor, dmabuf)
+        } else {
+            tracing::debug!(output = %output.name(), "capturing output into shared memory");
+            self.backend_data
+                .capture_output(&self.space, &output, cursor)
+                .and_then(|pixels| crate::capture::write(&buffer, size.w, size.h, &pixels))
+        };
         match result {
-            Ok(()) => frame.success(smithay::utils::Transform::Normal, None, self.clock.now()),
+            Ok(()) => {
+                if let Some(state) = session.user_data().get::<CaptureSessionState>() {
+                    state
+                        .has_captured
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                let damage = smithay::utils::Rectangle::<i32, smithay::utils::Buffer>::from_size(
+                    (size.w, size.h).into(),
+                );
+                frame.success(
+                    smithay::utils::Transform::Normal,
+                    Some(vec![damage]),
+                    self.clock.now(),
+                );
+            }
             Err(error) => {
                 tracing::warn!(%error, "capture failed");
                 frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
             }
         }
     }
-}
 
-delegate_dispatch2!(@<BackendData: Backend + 'static> AnvilState<BackendData>);
+    pub(crate) fn process_pending_capture_frames(&mut self, output: &smithay::output::Output) {
+        let pending = std::mem::take(&mut self.pending_capture_frames);
+        for pending_frame in pending {
+            let matches_output = pending_frame
+                .session
+                .source()
+                .user_data()
+                .get::<smithay::output::WeakOutput>()
+                .and_then(|weak| weak.upgrade())
+                .is_some_and(|captured| captured == *output);
+            if matches_output {
+                self.complete_capture_frame(&pending_frame.session, pending_frame.frame);
+            } else {
+                self.pending_capture_frames.push(pending_frame);
+            }
+        }
+    }
 
-impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     pub fn refresh_capture_sessions(&mut self) {
         let mut sessions = std::mem::take(&mut self.capture_sessions);
         sessions.retain(|session| {
@@ -759,6 +844,19 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             }
         });
         self.capture_sessions = sessions;
+        let pending = std::mem::take(&mut self.pending_capture_frames);
+        for pending_frame in pending {
+            if self
+                .capture_constraints(&pending_frame.session.source())
+                .is_some()
+            {
+                self.pending_capture_frames.push(pending_frame);
+            } else {
+                pending_frame
+                    .frame
+                    .fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Stopped);
+            }
+        }
         self.image_copy_capture_state.cleanup();
     }
 
@@ -854,6 +952,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let image_capture_source_state = ImageCaptureSourceState::new();
         let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
         let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
+        crate::screencopy::init::<Self>(&dh);
 
         // init input
         let seat_name = backend_data.seat_name();
@@ -904,6 +1003,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             image_capture_source_state,
             output_capture_source_state,
             image_copy_capture_state,
+            pending_screencopies: Vec::new(),
+            pending_capture_frames: Vec::new(),
             capture_sessions: Vec::new(),
             cursor_shape_state,
             capture_cursor: crate::capture::CaptureCursor::default(),
@@ -1374,6 +1475,21 @@ pub fn take_presentation_feedback(
 }
 
 pub trait Backend {
+    fn snapshot_window(
+        &mut self,
+        _window: &WindowElement,
+        _output: &Output,
+        _fullscreen: bool,
+    ) -> Result<
+        (
+            smithay::backend::renderer::gles::GlesTexture,
+            smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+        ),
+        String,
+    > {
+        Err("window snapshots unavailable on this backend".into())
+    }
+
     fn capture_output(
         &mut self,
         _space: &Space<WindowElement>,
@@ -1382,6 +1498,22 @@ pub trait Backend {
     ) -> Result<Vec<u8>, String> {
         Err("capture is unavailable on this backend".into())
     }
+    fn capture_dmabuf_constraints(
+        &mut self,
+        _output: &smithay::output::Output,
+    ) -> Option<smithay::wayland::image_copy_capture::DmabufConstraints> {
+        None
+    }
+    fn capture_output_dmabuf(
+        &mut self,
+        _space: &Space<WindowElement>,
+        _output: &smithay::output::Output,
+        _cursor: Option<&crate::capture::CaptureCursor>,
+        _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+    ) -> Result<(), String> {
+        Err("DMA-BUF capture unavailable on backend".into())
+    }
+
     const SUPPORTS_SESSION_LOCK: bool = false;
     const HAS_RELATIVE_MOTION: bool = false;
     const HAS_GESTURES: bool = false;

@@ -18,9 +18,45 @@ use std::sync::Mutex;
 pub struct LockOutput {
     pub locked: bool,
     pub surface: Option<WlSurface>,
+    pub(crate) lock_surface: Option<LockSurface>,
+    pub(crate) configured_size: Option<smithay::utils::Size<i32, smithay::utils::Logical>>,
     pub generation: u64,
     pub presentations: u8,
 }
+fn logical_size(output: &Output) -> Option<smithay::utils::Size<i32, smithay::utils::Logical>> {
+    output.current_mode().map(|mode| {
+        output
+            .current_transform()
+            .transform_size(mode.size)
+            .to_f64()
+            .to_logical(output.current_scale().fractional_scale())
+            .to_i32_round()
+    })
+}
+
+/// Called after output policy changes and when a lock surface is first created.
+/// Keep protocol geometry aligned with the same logical output used for rendering.
+pub(crate) fn configure_surface(output: &Output) {
+    let Some(size) = logical_size(output) else {
+        return;
+    };
+    let Some(state) = output.user_data().get::<Mutex<LockOutput>>() else {
+        return;
+    };
+    let mut state = state.lock().unwrap();
+    if !state.locked || state.configured_size == Some(size) {
+        return;
+    }
+    let Some(surface) = state.lock_surface.clone().filter(|surface| surface.alive()) else {
+        return;
+    };
+    state.configured_size = Some(size);
+    drop(state);
+    surface
+        .with_pending_state(|pending| pending.size = Some((size.w as u32, size.h as u32).into()));
+    surface.send_configure();
+}
+
 impl LockOutput {
     fn record_presented(&mut self, generation: u64) -> bool {
         if !self.locked || self.generation != generation {
@@ -118,17 +154,6 @@ impl<B: Backend + 'static> SessionLockHandler for AnvilState<B> {
     }
     fn new_surface(&mut self, surface: LockSurface, output: WlOutput) {
         if let Some(o) = Output::from_resource(&output) {
-            if let Some(mode) = o.current_mode() {
-                surface.with_pending_state(|s| {
-                    s.size = Some(
-                        mode.size
-                            .to_f64()
-                            .to_logical(o.current_scale().fractional_scale())
-                            .to_i32_round(),
-                    )
-                });
-                surface.send_configure();
-            }
             o.user_data()
                 .insert_if_missing(|| Mutex::new(LockOutput::default()));
             let mut s = o
@@ -140,7 +165,10 @@ impl<B: Backend + 'static> SessionLockHandler for AnvilState<B> {
             s.locked = true;
             s.generation = self.lock.generation;
             s.surface = Some(surface.wl_surface().clone());
+            s.lock_surface = Some(surface.clone());
+            s.configured_size = None;
             drop(s);
+            configure_surface(&o);
             let k = self.seat.get_keyboard().unwrap();
             k.set_focus(
                 self,
@@ -206,5 +234,77 @@ mod tests {
         assert!(!hotplug.ready(2));
         assert!(hotplug.record_presented(2));
         assert!(!hotplug.ready(2));
+    }
+    #[test]
+    fn lock_surface_tracks_logical_output_geometry() {
+        use smithay::{
+            output::{Mode, PhysicalProperties, Scale, Subpixel},
+            utils::Transform,
+        };
+        let output = Output::new(
+            "lock-test".into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Test".into(),
+                model: "Test".into(),
+                serial_number: "Test".into(),
+            },
+        );
+        assert!(logical_size(&output).is_none());
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            output.change_current_state(
+                Some(Mode {
+                    size: (1920, 1080).into(),
+                    refresh: 60000,
+                }),
+                Some(transform),
+                Some(Scale::Fractional(1.5)),
+                None,
+            );
+            let portrait = matches!(
+                transform,
+                Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
+            );
+            assert_eq!(
+                logical_size(&output).unwrap(),
+                if portrait {
+                    (720, 1280).into()
+                } else {
+                    (1280, 720).into()
+                }
+            );
+            // Position changes do not alter the lock surface's local geometry.
+            output.change_current_state(None, None, None, Some((-1920, 200).into()));
+            assert_eq!(
+                logical_size(&output).unwrap(),
+                if portrait {
+                    (720, 1280).into()
+                } else {
+                    (1280, 720).into()
+                }
+            );
+        }
+        output.change_current_state(
+            Some(Mode {
+                size: (2560, 1440).into(),
+                refresh: 60000,
+            }),
+            Some(Transform::Normal),
+            None,
+            None,
+        );
+        assert_eq!(logical_size(&output).unwrap(), (1707, 960).into());
+        output.change_current_state(None, None, Some(Scale::Integer(2)), None);
+        assert_eq!(logical_size(&output).unwrap(), (1280, 720).into());
     }
 }

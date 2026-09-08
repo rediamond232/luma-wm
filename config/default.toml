@@ -1,4 +1,4 @@
-terminal = ["foot"]
+terminal = ["kitty"]
 startup = []
 rules = []
 
@@ -79,7 +79,7 @@ mouse_modifier = "Super"
 "Super+t" = "layout master"
 
 [wallpaper]
-path = ""
+path = "/home/lev/Pictures/Wallpapers/random_wallpaper.jpg"
 kind = "static"
 fit = "fill"
 fps = 30

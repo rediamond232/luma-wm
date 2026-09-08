@@ -220,6 +220,27 @@ impl DmabufHandler for AnvilState<UdevData> {
 }
 
 impl Backend for UdevData {
+    fn snapshot_window(
+        &mut self,
+        window: &crate::shell::WindowElement,
+        output: &Output,
+        fullscreen: bool,
+    ) -> Result<
+        (
+            smithay::backend::renderer::gles::GlesTexture,
+            smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+        ),
+        String,
+    > {
+        // MultiRenderer draws GLES elements on the primary/render GPU before
+        // copying to an output GPU. Retained textures must use that context too.
+        let mut renderer = self
+            .gpus
+            .single_renderer(&self.primary_gpu)
+            .map_err(|e| e.to_string())?;
+        crate::capture::render_window_texture(renderer.as_mut(), window, output, fullscreen)
+    }
+
     fn capture_output(
         &mut self,
         space: &Space<crate::shell::WindowElement>,
@@ -252,6 +273,30 @@ impl Backend for UdevData {
         }
     }
 
+    fn capture_dmabuf_constraints(
+        &mut self,
+        _output: &Output,
+    ) -> Option<smithay::wayland::image_copy_capture::DmabufConstraints> {
+        let node = self.primary_gpu;
+        let renderer = self.gpus.single_renderer(&node).ok()?;
+        crate::capture::dmabuf_constraints(renderer.as_ref(), node)
+    }
+
+    fn capture_output_dmabuf(
+        &mut self,
+        space: &Space<crate::shell::WindowElement>,
+        output: &Output,
+        cursor: Option<&crate::capture::CaptureCursor>,
+        mut dmabuf: Dmabuf,
+    ) -> Result<(), String> {
+        let node = self.primary_gpu;
+        let mut renderer = self
+            .gpus
+            .single_renderer(&node)
+            .map_err(|error| error.to_string())?;
+        crate::capture::render_dmabuf(renderer.as_mut(), space, output, cursor, &mut dmabuf)
+    }
+
     fn seat_name(&self) -> String {
         self.session.seat()
     }
@@ -261,8 +306,10 @@ impl Backend for UdevData {
         config: &std::collections::BTreeMap<String, wm_core::OutputConfig>,
     ) -> Vec<String> {
         let mut errors = Vec::new();
+        let primary_gpu = self.primary_gpu;
+        let gpus = &mut self.gpus;
         for device in self.backends.values_mut() {
-            for surface in device.surfaces.values_mut() {
+            for (crtc, surface) in device.surfaces.iter_mut() {
                 let requested = config
                     .get(&surface.output.name())
                     .cloned()
@@ -273,12 +320,22 @@ impl Backend for UdevData {
                         let mode = surface.modes[index];
                         let wl_mode = WlMode::from(mode);
                         if surface.output.current_mode() != Some(wl_mode) {
-                            // Test the pending mode without the output manager's
-                            // cross-output bandwidth fallback, which may submit
-                            // intermediate frames during a configuration reload.
-                            let result = surface
-                                .drm_output
-                                .with_compositor(|compositor| compositor.use_mode(mode))
+                            let render_node = device.render_node.unwrap_or(primary_gpu);
+                            let result = gpus
+                                .single_renderer(&render_node)
+                                .map_err(|error| error.to_string())
+                                .and_then(|mut renderer| {
+                                    device
+                                        .drm_output_manager
+                                        .lock()
+                                        .use_mode::<_, WindowRenderElement<GlesRenderer>>(
+                                            crtc,
+                                            mode,
+                                            renderer.as_mut(),
+                                            &DrmOutputRenderElements::default(),
+                                        )
+                                        .map_err(|error| error.to_string())
+                                })
                                 .map_err(|error| {
                                     format!(
                                         "{}: mode change failed: {error}",
@@ -478,6 +535,9 @@ pub fn run_udev() {
         .insert_source(notifier, move |event, &mut (), data| match event {
             SessionEvent::PauseSession => {
                 data.desktop.active = false;
+                if let Some((timer, _)) = data.backend_data.cursor_timer.take() {
+                    data.handle.remove(timer);
+                }
                 libinput_context.suspend();
                 info!("pausing session");
 
@@ -711,6 +771,11 @@ pub fn run_udev() {
                 let nodes: Vec<_> = state.backend_data.backends.keys().copied().collect();
                 for node in nodes {
                     state.render(node, None, state.clock.now());
+                }
+                crate::screencopy::process_pending(&mut state);
+                let outputs: Vec<_> = state.space.outputs().cloned().collect();
+                for output in outputs {
+                    state.process_pending_capture_frames(&output);
                 }
             }
             state.popups.cleanup();

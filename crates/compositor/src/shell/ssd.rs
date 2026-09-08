@@ -45,6 +45,18 @@ const BUTTON_HEIGHT: u32 = HEADER_BAR_HEIGHT as u32;
 const BUTTON_WIDTH: u32 = 32;
 
 impl HeaderBar {
+    pub(crate) fn element_ids(&self) -> Vec<smithay::backend::renderer::element::Id> {
+        use smithay::backend::renderer::element::Element;
+        [&self.background, &self.close_button, &self.maximize_button]
+            .into_iter()
+            .map(|buffer| {
+                SolidColorRenderElement::from_buffer(buffer, (0, 0), 1.0, 1.0, Kind::Unspecified)
+                    .id()
+                    .clone()
+            })
+            .collect()
+    }
+
     pub fn pointer_enter(&mut self, loc: Point<f64, Logical>) {
         self.pointer_loc = Some(loc);
     }

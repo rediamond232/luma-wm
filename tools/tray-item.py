@@ -26,7 +26,7 @@ info = Gio.DBusNodeInfo.new_for_xml(xml)
 
 def property_value(_bus, _sender, _path, _interface, name):
     if name == "ToolTip":
-        return GLib.Variant("(sa(iiay)ss)", ("", [], "Tray details", "<b>Ready</b> &amp; waiting<br/><img src='/unused' alt='Status image'/>"))
+        return GLib.Variant("(sa(iiay)ss)", ("", [(32, 32, bytes([255, 220, 110, 40]) * (32 * 32))], "Tray details", "<b>Ready</b> &amp; waiting<br/><img src='/unused' alt='Status image'/>"))
     if name == "Title":
         return GLib.Variant("s", "Test tray icon")
     if name == "Status":
@@ -57,7 +57,8 @@ def method_call(_bus, _sender, _path, _interface, method, args, invocation):
         with (directory / "scrolls").open("a") as output:
             output.write(json.dumps(args.unpack()) + "\n")
     else:
-        assert args.unpack() == (0, 0)
+        with (directory / "actions").open("a") as output:
+            output.write(json.dumps([method, *args.unpack()]) + "\n")
     with (directory / "calls").open("a") as output:
         output.write(method + "\n")
     invocation.return_value(GLib.Variant("()", ()))

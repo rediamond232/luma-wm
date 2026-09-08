@@ -60,6 +60,7 @@ pub struct X11Data {
     dmabuf_state: DmabufState,
     _dmabuf_global: DmabufGlobal,
     _dmabuf_default_feedback: DmabufFeedback,
+    capture_node: smithay::backend::drm::DrmNode,
     #[cfg(feature = "debug")]
     fps: fps_ticker::Fps,
 }
@@ -89,6 +90,20 @@ impl DmabufHandler for AnvilState<X11Data> {
 }
 
 impl Backend for X11Data {
+    fn snapshot_window(
+        &mut self,
+        window: &crate::shell::WindowElement,
+        output: &Output,
+        fullscreen: bool,
+    ) -> Result<
+        (
+            smithay::backend::renderer::gles::GlesTexture,
+            smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+        ),
+        String,
+    > {
+        crate::capture::render_window_texture(&mut self.renderer, window, output, fullscreen)
+    }
     fn capture_output(
         &mut self,
         space: &smithay::desktop::Space<crate::shell::WindowElement>,
@@ -97,6 +112,23 @@ impl Backend for X11Data {
     ) -> Result<Vec<u8>, String> {
         crate::capture::render(&mut self.renderer, space, output, cursor)
     }
+    fn capture_dmabuf_constraints(
+        &mut self,
+        _output: &Output,
+    ) -> Option<smithay::wayland::image_copy_capture::DmabufConstraints> {
+        crate::capture::dmabuf_constraints(&self.renderer, self.capture_node)
+    }
+
+    fn capture_output_dmabuf(
+        &mut self,
+        space: &smithay::desktop::Space<crate::shell::WindowElement>,
+        output: &Output,
+        cursor: Option<&crate::capture::CaptureCursor>,
+        mut dmabuf: Dmabuf,
+    ) -> Result<(), String> {
+        crate::capture::render_dmabuf(&mut self.renderer, space, output, cursor, &mut dmabuf)
+    }
+
     fn seat_name(&self) -> String {
         "x11".to_owned()
     }
@@ -267,6 +299,7 @@ pub fn run_x11() {
         dmabuf_state,
         _dmabuf_global: dmabuf_global,
         _dmabuf_default_feedback: dmabuf_default_feedback,
+        capture_node: node,
         #[cfg(feature = "debug")]
         fps: fps_ticker::Fps::default(),
     };
@@ -328,6 +361,7 @@ pub fn run_x11() {
 
     state.install_desktop();
     while state.running.load(Ordering::SeqCst) {
+        if state.desktop.redraw {}
         if state.backend_data.render && state.desktop.redraw {
             state.desktop.redraw = false;
             profiling::scope!("render_frame");
@@ -340,6 +374,7 @@ pub fn run_x11() {
                     .unwrap_or_default();
             state.pre_repaint(&output, frame_target);
 
+            let mut capture_changed = false;
             let backend_data = &mut state.backend_data;
             // We need to borrow everything we want to refer to inside the renderer callback otherwise rustc is unhappy.
             #[cfg(feature = "debug")]
@@ -445,6 +480,9 @@ pub fn run_x11() {
                     #[cfg(feature = "debug")]
                     let rendered = render_output_result.damage.is_some();
                     if render_output_result.damage.is_some() {
+                        capture_changed = true;
+                    }
+                    if render_output_result.damage.is_some() {
                         let mut output_presentation_feedback =
                             take_presentation_feedback(&output, &state.space, &states);
                         output_presentation_feedback.presented(
@@ -509,6 +547,10 @@ pub fn run_x11() {
                 }
             }
 
+            if capture_changed {
+                crate::screencopy::process_pending(&mut state);
+                state.process_pending_capture_frames(&output);
+            }
             #[cfg(feature = "debug")]
             state.backend_data.fps.tick();
             window.set_cursor_visible(false);

@@ -27,7 +27,11 @@ with tempfile.TemporaryDirectory(prefix="wm-tray-vlc-") as temporary:
         try:
             nested.wait_for(socket, lambda s: any(l["namespace"] == "wm-bar" for l in s["layers"]), process)
             wid = subprocess.check_output(["xdotool", "search", "--name", "^" + title + "$"], text=True).strip().splitlines()[-1]
-            subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True, timeout=5)
+            if os.environ.get("WM_CAPTURE_PRIVATE_X11"):
+                subprocess.run(["xdotool", "windowfocus", "--sync", wid], check=True, timeout=5)
+            else:
+                subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True, timeout=5)
+            nested.fit_private_host(socket, process, wid)
             assert nested.request(socket, "exec " + json.dumps(["/usr/bin/python3", str(ROOT / "tools/tray-vlc-client.py"), str(directory)]))["ok"]
             def wait(condition):
                 deadline = time.monotonic() + 18
@@ -59,7 +63,9 @@ with tempfile.TemporaryDirectory(prefix="wm-tray-vlc-") as temporary:
             wait(menu_ready)
             subprocess.run(["import", "-window", wid, "/tmp/luma-tray-vlc.png"],check=True)
             # The menu focuses its first action; Shift+Tab wraps to the last.
-            subprocess.run(["xdotool", "key", "shift+Tab", "Return"],check=True)
+            subprocess.run(["xdotool", "key", "shift+Tab"], check=True, timeout=5)
+            time.sleep(.2)
+            subprocess.run(["xdotool", "key", "Return"], check=True, timeout=5)
             wait(lambda: (directory / "vlc-exited").exists())
             wait(lambda: icon_bounds() is None)
             print("PASS: real VLC tray registration/icon, exported menu, keyboard Quit action and removal")

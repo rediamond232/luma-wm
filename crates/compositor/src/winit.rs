@@ -1,7 +1,4 @@
-use std::{
-    sync::{Mutex, atomic::Ordering},
-    time::Duration,
-};
+use std::{sync::atomic::Ordering, time::Duration};
 
 #[cfg(feature = "egl")]
 use smithay::backend::renderer::ImportEgl;
@@ -24,10 +21,7 @@ use smithay::{
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
-    input::{
-        keyboard::LedState,
-        pointer::{CursorImageAttributes, CursorImageStatus},
-    },
+    input::{keyboard::LedState, pointer::CursorImageStatus},
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop::EventLoop,
@@ -37,7 +31,6 @@ use smithay::{
     },
     utils::{IsAlive, Scale, Transform},
     wayland::{
-        compositor,
         dmabuf::{
             DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState,
             ImportNotifier,
@@ -47,10 +40,12 @@ use smithay::{
 };
 use tracing::{error, info, warn};
 
+#[cfg(feature = "debug")]
+use crate::drawing::*;
+use crate::render::*;
 use crate::state::{
     AnvilState, Backend, take_presentation_feedback, update_primary_scanout_output,
 };
-use crate::{drawing::*, render::*};
 
 pub const OUTPUT_NAME: &str = "winit";
 
@@ -58,6 +53,7 @@ pub struct WinitData {
     backend: WinitGraphicsBackend<GlesRenderer>,
     damage_tracker: OutputDamageTracker,
     dmabuf_state: (DmabufState, DmabufGlobal, Option<DmabufFeedback>),
+    capture_node: Option<smithay::backend::drm::DrmNode>,
     full_redraw: u8,
     #[cfg(feature = "debug")]
     pub fps: fps_ticker::Fps,
@@ -89,6 +85,47 @@ impl DmabufHandler for AnvilState<WinitData> {
 }
 
 impl Backend for WinitData {
+    fn snapshot_window(
+        &mut self,
+        window: &crate::shell::WindowElement,
+        output: &Output,
+        fullscreen: bool,
+    ) -> Result<
+        (
+            smithay::backend::renderer::gles::GlesTexture,
+            smithay::utils::Rectangle<i32, smithay::utils::Logical>,
+        ),
+        String,
+    > {
+        crate::capture::render_window_texture(self.backend.renderer(), window, output, fullscreen)
+    }
+
+    fn capture_output(
+        &mut self,
+        space: &smithay::desktop::Space<crate::shell::WindowElement>,
+        output: &Output,
+        cursor: Option<&crate::capture::CaptureCursor>,
+    ) -> Result<Vec<u8>, String> {
+        crate::capture::render(self.backend.renderer(), space, output, cursor)
+    }
+
+    fn capture_dmabuf_constraints(
+        &mut self,
+        _output: &Output,
+    ) -> Option<smithay::wayland::image_copy_capture::DmabufConstraints> {
+        crate::capture::dmabuf_constraints(self.backend.renderer(), self.capture_node?)
+    }
+
+    fn capture_output_dmabuf(
+        &mut self,
+        space: &smithay::desktop::Space<crate::shell::WindowElement>,
+        output: &Output,
+        cursor: Option<&crate::capture::CaptureCursor>,
+        mut dmabuf: Dmabuf,
+    ) -> Result<(), String> {
+        crate::capture::render_dmabuf(self.backend.renderer(), space, output, cursor, &mut dmabuf)
+    }
+
     fn seat_name(&self) -> String {
         String::from("winit")
     }
@@ -158,8 +195,12 @@ pub fn run_winit() {
     #[cfg(feature = "debug")]
     let mut fps_element = FpsElement::new(fps_texture);
 
+    if let Ok(title) = std::env::var("WM_NESTED_TITLE") {
+        backend.window().set_title(&title);
+    }
     let render_node = EGLDevice::device_for_display(backend.renderer().egl_context().display())
         .and_then(|device| device.try_get_render_node());
+    let capture_node = render_node.as_ref().ok().and_then(|node| *node);
 
     let dmabuf_default_feedback = match render_node {
         Ok(Some(node)) => {
@@ -213,6 +254,7 @@ pub fn run_winit() {
             backend,
             damage_tracker,
             dmabuf_state,
+            capture_node,
             full_redraw: 0,
             #[cfg(feature = "debug")]
             fps: fps_ticker::Fps::default(),
@@ -229,7 +271,7 @@ pub fn run_winit() {
 
     info!("Initialization completed, starting the main loop.");
 
-    let mut pointer_element = PointerElement::default();
+    let mut pointer_element = crate::capture::CaptureCursor::default();
 
     state.install_desktop();
     while state.running.load(Ordering::SeqCst) {
@@ -265,6 +307,7 @@ pub fn run_winit() {
                     .unwrap_or_default();
             state.pre_repaint(&output, frame_target);
 
+            let mut capture_changed = false;
             let backend = &mut state.backend_data.backend;
 
             // draw the cursor as relevant
@@ -276,9 +319,14 @@ pub fn run_winit() {
             if reset {
                 state.cursor_status = CursorImageStatus::default_named();
             }
-            let cursor_visible = !matches!(state.cursor_status, CursorImageStatus::Surface(_));
-
-            pointer_element.set_status(state.cursor_status.clone());
+            let cursor_pos = state.pointer.current_location();
+            pointer_element.prepare(
+                state.cursor_status.clone(),
+                cursor_pos,
+                state.space.output_geometry(&output).unwrap(),
+                &output,
+                state.clock.now().into(),
+            );
 
             #[cfg(feature = "debug")]
             let fps = state.backend_data.fps.avg().round() as u32;
@@ -294,22 +342,6 @@ pub fn run_winit() {
             let dnd_icon = state.dnd_icon.as_ref();
 
             let scale = Scale::from(output.current_scale().fractional_scale());
-            let cursor_hotspot =
-                if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
-                    compositor::with_states(surface, |states| {
-                        states
-                            .data_map
-                            .get::<Mutex<CursorImageAttributes>>()
-                            .unwrap()
-                            .lock()
-                            .unwrap()
-                            .hotspot
-                    })
-                } else {
-                    (0, 0).into()
-                };
-            let cursor_pos = state.pointer.current_location();
-
             #[cfg(feature = "debug")]
             let mut renderdoc = state.renderdoc.as_mut();
 
@@ -341,16 +373,7 @@ pub fn run_winit() {
 
                 let mut elements = Vec::<CustomRenderElements<GlesRenderer>>::new();
 
-                elements.extend(
-                    pointer_element.render_elements(
-                        renderer,
-                        (cursor_pos - cursor_hotspot.to_f64())
-                            .to_physical(scale)
-                            .to_i32_round(),
-                        scale,
-                        1.0,
-                    ),
-                );
+                elements.extend(pointer_element.render_elements(renderer, &output));
 
                 // draw the dnd icon if any
                 if let Some(icon) = dnd_icon {
@@ -390,6 +413,9 @@ pub fn run_winit() {
             match render_res {
                 Ok(render_output_result) => {
                     let has_rendered = render_output_result.damage.is_some();
+                    if has_rendered {
+                        capture_changed = true;
+                    }
                     if let Some(damage) = render_output_result.damage {
                         if let Err(err) = backend.submit(Some(damage)) {
                             warn!("Failed to submit buffer: {}", err);
@@ -414,7 +440,7 @@ pub fn run_winit() {
                         );
                     }
 
-                    backend.window().set_cursor_visible(cursor_visible);
+                    backend.window().set_cursor_visible(false);
 
                     let states = render_output_result.states;
 
@@ -470,6 +496,10 @@ pub fn run_winit() {
                     state.running.store(false, Ordering::SeqCst);
                 }
                 Err(err) => warn!("Rendering error: {}", err),
+            }
+            if capture_changed {
+                crate::screencopy::process_pending(&mut state);
+                state.process_pending_capture_frames(&output);
             }
         }
 

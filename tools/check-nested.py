@@ -35,6 +35,61 @@ def wait_for(path, predicate, process):
     raise AssertionError(f"Timed out; last snapshot: {last}")
 
 
+def fit_private_host(path, process, wid, max_width=1280, max_height=800):
+    """Keep a nested output inside a host-constrained private Xwayland root."""
+    if not os.environ.get("WM_CAPTURE_PRIVATE_X11"):
+        return None
+    display_width, display_height = map(
+        int,
+        subprocess.check_output(
+            ["xdotool", "getdisplaygeometry"], text=True
+        ).split(),
+    )
+    width = min(max_width, display_width)
+    height = min(max_height, display_height)
+
+    def host_geometry():
+        values = {}
+        for line in subprocess.check_output(
+            ["xdotool", "getwindowgeometry", "--shell", wid], text=True
+        ).splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value
+        return int(values["WIDTH"]), int(values["HEIGHT"])
+
+    if host_geometry() != (width, height):
+        subprocess.run(["xdotool", "windowfocus", "--sync", wid], check=True, timeout=5)
+        subprocess.run(
+            ["xdotool", "windowsize", "--sync", wid, str(width), str(height)],
+            check=True,
+            timeout=5,
+        )
+    deadline = time.monotonic() + 5
+    previous = None
+    stable = 0
+    while time.monotonic() < deadline:
+        actual = host_geometry()
+        stable = stable + 1 if actual == previous else 1
+        previous = actual
+        if stable >= 4:
+            width, height = actual
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("private host window geometry did not settle")
+    wait_for(
+        path,
+        lambda state: (
+            state["outputs"][0]["geometry"]["w"],
+            state["outputs"][0]["geometry"]["h"],
+        )
+        == (width, height),
+        process,
+    )
+    return width, height
+
+
 def main():
     # A private directory isolates IPC and config from every existing session.
     with tempfile.TemporaryDirectory(prefix="wm-check-") as directory:
@@ -86,7 +141,23 @@ def main():
                 print("PASS: opacity rules and fullscreen opacity restoration")
                 if os.environ.get("WM_CHECK_INTERACTION") == "1":
                     wid = subprocess.check_output(["xdotool", "search", "--name", "^" + title + "$"], text=True).strip().splitlines()[-1]
-                    subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True)
+                    if os.environ.get("WM_CAPTURE_PRIVATE_X11"):
+                        fit_private_host(path, process, wid)
+                        subprocess.run(["xdotool", "key", "Super_L+2"], check=True)
+                        wait_for(
+                            path,
+                            lambda state: state["outputs"][0]["workspace"] == 2,
+                            process,
+                        )
+                        subprocess.run(["xdotool", "key", "Super_L+1"], check=True)
+                        wait_for(
+                            path,
+                            lambda state: state["outputs"][0]["workspace"] == 1,
+                            process,
+                        )
+                        print("PASS: configured Super workspace keybinds dispatch")
+                    else:
+                        subprocess.run(["xdotool", "windowactivate", "--sync", wid], check=True)
                     # Host window animations can resize the nested output on activation.
                     time.sleep(0.5)
                     config.write_text(original + '\n[input]\nmouse_modifier = "Control"\n[[rules]]\napp_id = "org.customwm.InteractionTest"\nfloating = true\nwidth = 320\nheight = 200\n')
@@ -144,17 +215,35 @@ def main():
                         config.write_text(config.read_text() + '\n[[rules]]\napp_id="org.customwm.InteractionTest"\nopacity=0.5\n')
                         assert request(path, "reload")["ok"]
                         wait_for(path, lambda s: test_window(s)["opacity"] == 0.5, process)
-                        time.sleep(.2)
-                        subprocess.run(["import", "-window", wid, str(after)], check=True)
                         a = Image.open(before).convert("RGB").getpixel(sample)
-                        b = Image.open(after).convert("RGB").getpixel(sample)
-                        assert max(a) > 8 and all(abs(y - x * .5) <= 3 for x, y in zip(a, b)), (a, b)
+                        deadline = time.monotonic() + 3
+                        while True:
+                            subprocess.run(["import", "-window", wid, str(after)], check=True)
+                            b = Image.open(after).convert("RGB").getpixel(sample)
+                            if max(a) > 8 and all(abs(y - x * .5) <= 3 for x, y in zip(a, b)):
+                                break
+                            assert time.monotonic() < deadline, (a, b)
+                            time.sleep(.03)
                         print("PASS: rendered pixel opacity changes on reload")
                     for _ in range(8):
                         assert request(path, "launcher")["ok"]
-                    wait_for(path, lambda s: len([l for l in s["layers"] if l["namespace"] == "wm-launcher"]) == 1, process)
+                    def launcher_ready(state):
+                        layers = [layer for layer in state["layers"] if layer["namespace"] == "wm-launcher"]
+                        if len(layers) != 1 or not layers[0].get("surface_size"):
+                            return False
+                        size = layers[0]["surface_size"]
+                        return size[0] >= 600 and size[1] >= 450
+                    wait_for(path, launcher_ready, process)
                     time.sleep(0.3)
                     assert len([l for l in request(path, "status")["state"]["layers"] if l["namespace"] == "wm-launcher"]) == 1
+                    if screenshot := os.environ.get("WM_CHECK_LAUNCHER_SCREENSHOT"):
+                        fit_private_host(path, process, wid)
+                        wait_for(path, launcher_ready, process)
+                        time.sleep(.15)
+                        subprocess.run(["import", "-window", wid, screenshot], check=True)
+                        if os.environ.get("WM_CHECK_LAUNCHER_ONLY") == "1":
+                            print("PASS: rendered launcher after live output resize")
+                            return
                     subprocess.run(["xdotool", "key", "Escape"], check=True)
                     wait_for(path, lambda s: not any(l["namespace"] == "wm-launcher" for l in s["layers"]), process)
                     assert request(path, "launcher")["ok"]

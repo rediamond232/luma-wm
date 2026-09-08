@@ -50,7 +50,13 @@ impl Cursor {
         }
     }
 
-    fn get_image(&self, scale: u32, time: Duration) -> (Image, Option<Duration>) {
+    pub fn get_image(&self, scale: u32, time: Duration) -> Image {
+        self.get_frame(scale, time).0
+    }
+    pub fn get_named_image(&mut self, icon: CursorIcon, scale: u32, time: Duration) -> Image {
+        self.get_named_frame(icon, scale, time).0
+    }
+    fn get_frame(&self, scale: u32, time: Duration) -> (Image, Option<Duration>) {
         let size = self.size.saturating_mul(scale);
         frame(time, size, &self.icons)
     }
@@ -62,7 +68,7 @@ impl Cursor {
         time: Duration,
     ) -> (Image, Option<Duration>) {
         if icon == CursorIcon::Default {
-            return self.get_image(scale, time);
+            return self.get_frame(scale, time);
         }
         let images = self.named.entry(icon).or_insert_with(|| {
             std::iter::once(icon.name())
@@ -99,17 +105,29 @@ fn frame(time: Duration, size: u32, images: &[Image]) -> (Image, Option<Duration
     if count <= 1 || total == 0 {
         return (nearest_images(size, images).next().unwrap().clone(), None);
     }
-    let mut millis = time.as_millis() % u128::from(total);
+    if nearest_images(size, images)
+        .filter(|image| image.delay > 0)
+        .count()
+        == 1
+    {
+        return (
+            nearest_images(size, images)
+                .find(|image| image.delay > 0)
+                .unwrap()
+                .clone(),
+            None,
+        );
+    }
+    let mut elapsed = time.as_nanos() % (u128::from(total) * 1_000_000);
     for image in nearest_images(size, images) {
-        if millis < u128::from(image.delay) {
+        let delay = u128::from(image.delay) * 1_000_000;
+        if elapsed < delay {
             return (
                 image.clone(),
-                Some(Duration::from_millis(
-                    (u128::from(image.delay) - millis) as u64,
-                )),
+                Some(Duration::from_nanos((delay - elapsed) as u64)),
             );
         }
-        millis -= u128::from(image.delay);
+        elapsed -= delay;
     }
     unreachable!("cursor cycle contains a nonzero frame delay")
 }
@@ -163,6 +181,10 @@ mod tests {
             assert_eq!(next, Some(Duration::from_millis(remaining)));
         }
         assert!(frame(Duration::from_millis(300), 48, &images).1.is_none());
+        assert_eq!(
+            frame(Duration::from_micros(99_500), 24, &images).1,
+            Some(Duration::from_micros(500))
+        );
         // Cursor selection must not wrap the clock after u32 milliseconds.
         let time = u64::from(u32::MAX) + 123;
         let actual = frame(Duration::from_millis(time), 24, &images);
@@ -179,7 +201,7 @@ mod tests {
         );
         let (selected, next) = frame(Duration::ZERO, 24, &[image(24, 0, 1), image(24, 20, 2)]);
         assert_eq!(selected.xhot, 2);
-        assert_eq!(next, Some(Duration::from_millis(20)));
+        assert_eq!(next, None, "a single visible frame must remain idle");
         let images = [image(24, u32::MAX, 1), image(24, u32::MAX, 2)];
         assert_eq!(
             frame(Duration::from_millis(u64::from(u32::MAX)), 24, &images)

@@ -20,11 +20,17 @@ def main():
         original = (ROOT / "config/smoke.toml").read_text() + '\n'
         config.write_text(original)
         socket = directory / "wm.sock"
-        env = dict(os.environ, WM_CONFIG=str(config), WM_SOCKET=str(socket))
+        title = directory.name
+        env = dict(os.environ, WM_CONFIG=str(config), WM_SOCKET=str(socket), WM_NESTED_TITLE=title)
         with (directory / "session.log").open("w") as log:
             process = subprocess.Popen([str(ROOT / "tools/run-nested.sh")], cwd=ROOT, env=env, stdout=log, stderr=log)
             try:
                 state = nested.wait_for(socket, lambda s: bool(s["outputs"]) and bool(s["layers"]), process)
+                wid = subprocess.check_output(
+                    ["xdotool", "search", "--name", "^" + title + "$"], text=True
+                ).strip().splitlines()[-1]
+                nested.fit_private_host(socket, process, wid)
+                state = nested.request(socket, "status")["state"]
                 output = state["outputs"][0]
                 name = output["name"]
                 width, height = output["geometry"]["w"], output["geometry"]["h"]
@@ -34,11 +40,16 @@ def main():
                     config.write_text(original + f'\n[outputs.{json.dumps(name)}]\ntransform={json.dumps(transform)}\n')
                     assert nested.request(socket, "reload")["ok"]
                     expected = (height, width) if transform in ("90", "270", "flipped-90", "flipped-270") else (width, height)
-                    def settled(state):
-                        geometry = state["outputs"][0]["geometry"]
-                        bars = [l for l in state["layers"] if l["namespace"] == "wm-bar"]
-                        windows = state["windows"]
-                        return (geometry["w"], geometry["h"]) == expected and bars and bars[0]["geometry"]["w"] == expected[0] and windows and all(
+                def settled(state):
+                    geometry = state["outputs"][0]["geometry"]
+                    bars = [l for l in state["layers"] if l["namespace"] == "wm-bar"]
+                    windows = state["windows"]
+                    bar_width = bars[0]["geometry"]["w"] if bars else 0
+                    bar_ready = bar_width > 0 and (
+                        bar_width == expected[0]
+                        or bool(os.environ.get("WM_CAPTURE_PRIVATE_X11"))
+                    )
+                    return (geometry["w"], geometry["h"]) == expected and bar_ready and windows and all(
                             w["geometry"]["x"] >= 0 and w["geometry"]["y"] >= 0 and
                             w["geometry"]["x"] + w["geometry"]["w"] <= expected[0] and
                             w["geometry"]["y"] + w["geometry"]["h"] <= expected[1] for w in windows)

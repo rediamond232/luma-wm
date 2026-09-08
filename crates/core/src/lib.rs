@@ -54,7 +54,7 @@ impl Default for Config {
             theme: Theme::default(),
             layout: Layout::default(),
             input: Input::default(),
-            terminal: vec!["foot".into()],
+            terminal: vec!["kitty".into()],
             bindings,
             startup: vec![],
             wallpaper: Wallpaper::default(),
@@ -520,6 +520,9 @@ pub struct LayerInfo {
     pub namespace: String,
     pub output: String,
     pub geometry: Rect,
+    /// Logical size of the most recently committed surface buffer, if mapped.
+    #[serde(default)]
+    pub surface_size: Option<[i32; 2]>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WindowInfo {
@@ -535,6 +538,9 @@ pub struct WindowInfo {
     pub geometry: Option<Rect>,
     #[serde(default = "opaque")]
     pub opacity: f32,
+    /// Logical size of the current client buffer, independent of target geometry.
+    #[serde(default)]
+    pub surface_size: Option<[i32; 2]>,
 }
 fn opaque() -> f32 {
     1.0

@@ -279,7 +279,16 @@ impl Menu {
             let Some(menu) = weak.upgrade().filter(|m| m.generation.get() == generation) else {
                 return;
             };
-            menu.theme.borrow_mut().update_paths(theme_paths);
+            let weak = Rc::downgrade(&menu);
+            let refresh: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(menu) = weak.upgrade() {
+                    menu.load(false);
+                }
+            });
+            let mut theme = menu.theme.borrow_mut();
+            theme.update_paths(theme_paths);
+            theme.watch(refresh);
+            drop(theme);
             menu.busy.set(false);
             menu.content.set_sensitive(true);
             match rows {
@@ -767,15 +776,38 @@ mod tests {
             open.show();
         });
         window.present();
+        let wait_sequence = Cell::new(0u32);
         let wait = |condition: &dyn Fn() -> bool| {
+            let sequence = wait_sequence.get().wrapping_add(1);
+            wait_sequence.set(sequence);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while !condition() {
                 while context.pending() {
                     context.iteration(false);
                 }
+                if std::time::Instant::now() >= deadline {
+                    let point = button.compute_point(&window, &gtk::graphene::Point::new(0.0, 0.0));
+                    let pointer = std::process::Command::new("xdotool")
+                        .env("DISPLAY", std::env::var("WM_TEST_HOST_DISPLAY").unwrap())
+                        .arg("getmouselocation")
+                        .arg("--shell")
+                        .output()
+                        .ok()
+                        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
+                    eprintln!(
+                        "tray-menu wait {sequence}: window={}x{}, button={}x{} at {point:?}, mapped={}, busy={}, reads={}, host pointer={pointer:?}",
+                        window.width(),
+                        window.height(),
+                        button.width(),
+                        button.height(),
+                        button.is_mapped(),
+                        menu.busy.get(),
+                        reads.get(),
+                    );
+                }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "menu state did not settle"
+                    "menu state did not settle at wait {sequence}"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -784,6 +816,10 @@ mod tests {
             context.block_on(glib::timeout_future(std::time::Duration::from_millis(200)));
         };
         wait(&|| button.is_mapped());
+        // Mapping can precede the layer-shell configure that stretches this
+        // left/right-anchored window from its 260 px request to the output.
+        // Pointer coordinates must use the committed output-width allocation.
+        wait(&|| window.width() > 300);
         pump();
         let input = |args: &[&str]| {
             assert!(

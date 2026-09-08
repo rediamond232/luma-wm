@@ -59,6 +59,7 @@ smithay::backend::renderer::element::render_elements! {
     Preview=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>,
     Effect=crate::effects::EffectElement,
     Border=crate::effects::BorderElement,
+    Snapshot=crate::transitions::SnapshotElement,
 }
 
 impl<
@@ -74,6 +75,7 @@ impl<
             Self::Preview(arg0) => f.debug_tuple("Preview").field(arg0).finish(),
             Self::Effect(arg0) => f.debug_tuple("Effect").field(arg0).finish(),
             Self::Border(arg0) => f.debug_tuple("Border").field(arg0).finish(),
+            Self::Snapshot(arg0) => f.debug_tuple("Snapshot").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
     }
@@ -213,6 +215,7 @@ where
             output_render_elements.extend(space_preview_elements(renderer, space, output));
         }
 
+        let scene_start = output_render_elements.len();
         match crate::effects::scene(renderer.gles_mut(), space, output) {
             Ok(elements) => {
                 output_render_elements.extend(elements.into_iter().map(|element| match element {
@@ -245,6 +248,42 @@ where
             .and_then(|t| wm_core::color(&t.lock().unwrap().0.background))
             .map(Color32F::from)
             .unwrap_or(CLEAR_COLOR);
+        // Insert newest snapshots first so older snapshots can still anchor
+        // themselves to a lower window that has since become a snapshot too.
+        use smithay::backend::renderer::element::Element;
+        let snapshots = crate::transitions::elements(output);
+        if !snapshots.is_empty() {
+            let mut backgrounds = Vec::new();
+            let layers = smithay::desktop::layer_map_for_output(output);
+            for layer in layers.layers() {
+                if matches!(
+                    layer.layer(),
+                    smithay::wayland::shell::wlr_layer::Layer::Background
+                        | smithay::wayland::shell::wlr_layer::Layer::Bottom
+                ) {
+                    layer.with_surfaces(|surface, _| {
+                        backgrounds.push(
+                            smithay::backend::renderer::element::Id::from_wayland_resource(surface),
+                        )
+                    });
+                }
+            }
+            for snapshot in snapshots.into_iter().rev() {
+                let index = output_render_elements
+                    .iter()
+                    .skip(scene_start)
+                    .position(|element| {
+                        let id = match element {
+                            OutputRenderElements::Snapshot(other) => &other.source_id,
+                            _ => element.id(),
+                        };
+                        snapshot.below.contains(id) || backgrounds.contains(id)
+                    })
+                    .map(|index| scene_start + index)
+                    .unwrap_or(output_render_elements.len());
+                output_render_elements.insert(index, OutputRenderElements::Snapshot(snapshot));
+            }
+        }
         (output_render_elements, color)
     }
 }
