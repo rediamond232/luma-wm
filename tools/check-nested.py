@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import tempfile
@@ -105,6 +106,16 @@ def main():
                                        cwd=ROOT, stdout=log, stderr=log)
             try:
                 wait_for(path, lambda s: any(l["namespace"] == "wm-bar" for l in s["layers"]), process)
+                log.flush()
+                startup_log = re.sub(
+                    r"\x1b\[[0-9;]*m",
+                    "",
+                    (directory / "session.log").read_text(errors="replace"),
+                )
+                assert "Reserved isolated XWayland display" in startup_log, startup_log
+                assert "xdisplay=100" in startup_log, startup_log
+                assert "Failed to create sockets" not in startup_log, startup_log
+                print("PASS: compositor XWayland uses isolated display :100")
                 subprocess.run(["python3", str(ROOT / "tools/check-session.py")],
                                env=env, cwd=ROOT, check=True)
 

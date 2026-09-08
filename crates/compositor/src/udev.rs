@@ -368,7 +368,7 @@ impl Backend for UdevData {
                             surface.output.name(),
                             requested.width,
                             requested.height,
-                            requested.refresh
+                            wm_core::output_refresh_millihz(&requested)
                         );
                         warn!("{error}");
                         errors.push(error);
@@ -1346,7 +1346,8 @@ impl AnvilState<UdevData> {
                 .unwrap_or_default();
             let mode_id = wm_core::select_output_mode(&advertised, &requested).or_else(|| {
                 warn!(output = %output_name, width = requested.width, height = requested.height,
-                    refresh = requested.refresh, "Requested mode unavailable; using advertised default");
+                    refresh = wm_core::output_refresh_millihz(&requested),
+                    "Requested mode unavailable; using advertised default");
                 wm_core::select_output_mode(&advertised, &Default::default())
             });
             let Some(mode_id) = mode_id else {

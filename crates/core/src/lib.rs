@@ -213,6 +213,9 @@ pub struct OutputConfig {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    /// Requested refresh rate in hertz. Zero leaves it automatic.
+    pub hz: f64,
+    /// Legacy refresh-rate setting in millihertz.
     pub refresh: i32,
     pub vrr: bool,
 }
@@ -225,28 +228,41 @@ impl Default for OutputConfig {
             y: 0,
             width: 0,
             height: 0,
+            hz: 0.,
             refresh: 0,
             vrr: false,
         }
     }
 }
 
-/// Choose only advertised modes. Refresh values are millihertz; allow common
-/// fractional rates (59.94/143.98 Hz) when an integer rate was requested.
+/// Return the requested refresh rate in millihertz. `hz` is the preferred,
+/// human-readable setting; `refresh` keeps older configurations compatible.
+pub fn output_refresh_millihz(config: &OutputConfig) -> i64 {
+    if config.hz > 0.0 {
+        (config.hz * 1000.0).round() as i64
+    } else {
+        i64::from(config.refresh)
+    }
+}
+
+/// Choose only advertised modes. Advertised refresh values are millihertz;
+/// allow common fractional rates (59.94/143.98 Hz) when an integer rate was
+/// requested.
 pub fn select_output_mode(modes: &[(i32, i32, i32, bool)], config: &OutputConfig) -> Option<usize> {
+    let requested_refresh = output_refresh_millihz(config);
     modes
         .iter()
         .enumerate()
         .filter(|(_, (w, h, refresh, _))| {
             (config.width == 0 || (*w == config.width && *h == config.height))
-                && (config.refresh == 0
-                    || (i64::from(*refresh) - i64::from(config.refresh)).abs() <= 500)
+                && (requested_refresh == 0
+                    || (i64::from(*refresh) - requested_refresh).abs() <= 500)
         })
         .max_by_key(|(index, (_, _, refresh, preferred))| {
-            let distance = if config.refresh == 0 {
+            let distance = if requested_refresh == 0 {
                 0
             } else {
-                -(i64::from(*refresh) - i64::from(config.refresh)).abs()
+                -(i64::from(*refresh) - requested_refresh).abs()
             };
             (distance, *preferred, *refresh, std::cmp::Reverse(*index))
         })
@@ -370,7 +386,10 @@ impl Config {
                 .contains(&o.transform.as_str())
                 || o.width < 0
                 || o.height < 0
+                || !o.hz.is_finite()
+                || !(0.0..=1000.0).contains(&o.hz)
                 || o.refresh < 0
+                || (o.hz > 0.0 && o.refresh > 0)
                 || (o.width == 0) != (o.height == 0)
             {
                 return Err("invalid output settings".into());
@@ -631,6 +650,13 @@ mod tests {
         config.refresh = i32::MAX;
         assert_eq!(select_output_mode(&modes, &config), None);
         assert_eq!(select_output_mode(&[], &config), None);
+
+        config.refresh = 0;
+        config.hz = 144.0;
+        assert_eq!(select_output_mode(&modes, &config), Some(3));
+        config.hz = 143.98;
+        assert_eq!(select_output_mode(&modes, &config), Some(2));
+
         let mut full = Config::default();
         full.outputs.insert(
             "DP-1".into(),
@@ -640,6 +666,17 @@ mod tests {
             },
         );
         assert!(full.validate().is_err());
+
+        let mut conflicting = Config::default();
+        conflicting.outputs.insert(
+            "DP-1".into(),
+            OutputConfig {
+                hz: 144.0,
+                refresh: 144_000,
+                ..Default::default()
+            },
+        );
+        assert!(conflicting.validate().is_err());
     }
     #[test]
     fn config_roundtrip() {

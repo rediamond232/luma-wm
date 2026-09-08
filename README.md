@@ -28,6 +28,9 @@ The TTY script uses `~/.config/wm/config.toml` when present, otherwise the repos
 default. `WM_CONFIG` overrides either. It performs a locked offline incremental build,
 starts a fresh session log, and prints the final log lines if the compositor exits. Logs are in
 `${XDG_STATE_HOME:-~/.local/state}/wm/session.log`; `./tools/logs.sh` follows them.
+Luma reserves XWayland displays `:100` through `:132` so starting it beside an
+inactive Hyprland session cannot probe or unlink Hyprland's `:0`/`:1` sockets.
+Set `WM_XWAYLAND_DISPLAY` to select one exact isolated display when debugging.
 `Super+Shift+E` exits. From another terminal, `./tools/stop.sh` requests exit on the
 TTY session socket. Nested IPC uses `WM_SOCKET=$XDG_RUNTIME_DIR/wm-nested.sock`.
 
@@ -60,15 +63,15 @@ DRM outputs select advertised modes at startup and hotplug:
 [outputs.DP-1]
 width = 2560
 height = 1440
-refresh = 144000 # millihertz: 144 Hz
+hz = 144.0
 vrr = false # opt in with true on a compatible DRM output
 scale = 1.0
 x = 0
 y = 0
 ```
 
-Set both dimensions to zero to leave resolution automatic; refresh zero leaves
-the rate automatic. Exact refresh matches win, with up to 500 mHz tolerance for
+Set both dimensions to zero to leave resolution automatic; `hz = 0` leaves the
+rate automatic. Exact refresh matches win, with up to 0.5 Hz tolerance for
 fractional rates. Automatic selection prefers the display's preferred mode, then
 the highest matching refresh. Unsupported requests log a warning and fall back
 to an advertised default at startup. Reload attempts the requested advertised
@@ -82,6 +85,8 @@ Changes to a connected display's advertised mode list trigger re-evaluation.
 The active mode stays available until a replacement is accepted; a late mode
 list also retries initially failed output setup. Physical EDID changes still
 need hardware testing.
+The older `refresh = 144000` millihertz syntax remains supported, but cannot be
+combined with a nonzero `hz` value.
 VRR requests apply at DRM setup and config reload. Unsupported displays or failed
 requests appear in logs and the status error field. Removing the output's VRR
 setting requests disabling it. Display activation and frame pacing still require

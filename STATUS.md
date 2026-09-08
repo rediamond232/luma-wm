@@ -1,5 +1,16 @@
 # Implementation status
 
+### XWayland display isolation (2026-09-08)
+
+- Smithay's automatic X11 display search starts at `:0`. A missing or stale
+  lock file can let its probe remove an existing compositor's filesystem socket
+  before the abstract-socket bind reports `Address already in use`; the TTY log
+  showed this exact collision against Hyprland's display.
+- Luma now reserves its XWayland server from the separate `:100`-`:132` range,
+  skips existing lock/socket paths, retries collisions, and continues without
+  XWayland instead of crashing if the range is exhausted. An explicit
+  `WM_XWAYLAND_DISPLAY` override is available for debugging.
+
 Last verified: 2026-09-06. This is a development compositor, not a finished desktop.
 
 Implemented and exercised in a nested X11 session:
@@ -818,3 +829,13 @@ DRM behavior remains the TTY3 acceptance gate.
 - The first physical TTY3 run showed the compositor panicking at `input_handler.rs:956` as soon as a configured binding produced `KeyAction::Desktop`. Both backend dispatch tables omitted that common action even though `process_common_key_action` already implemented it. The DRM table reached `unreachable!()` and the nested backend rejected the action as unsupported.
 - `KeyAction::Desktop` now enters the common command dispatcher on both paths. The DRM match is exhaustive at compile time instead of ending in `unreachable!()`, so adding another action cannot recreate the same unchecked crash. A private real-keyboard regression sends `Super+2` and `Super+1` through XTest and verifies workspace changes through compositor IPC; `/tmp/luma-keybind-regression-final.log` passes along with all 35 workspace tests and the optional winit build.
 - `tools/run-tty.sh` now performs a locked offline incremental build on every launch, truncates the prior session log, prints the active config and log path, and shows the final 30 log lines when the compositor exits. This prevents stale debug binaries and makes future TTY failures immediately visible.
+### Human-readable output refresh configuration (2026-09-08)
+
+- Output configuration accepts `hz` as a human-readable floating-point refresh
+  rate, for example `hz = 360.0`, while retaining the legacy millihertz
+  `refresh` field. Setting both is rejected as ambiguous.
+- Mode selection converts Hz once and keeps the existing 0.5 Hz tolerance, so
+  integer requests match advertised fractional modes such as 359.98 Hz.
+- The default configuration now includes a commented connector example. Core
+  mode-selection tests and the workspace build pass; applying a new mode still
+  requires a physical TTY3 check.

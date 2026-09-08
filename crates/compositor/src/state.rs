@@ -1035,17 +1035,51 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
         use smithay::wayland::compositor::CompositorHandler;
 
-        let (xwayland, client) = XWayland::spawn(
-            &self.display_handle,
-            None,
-            std::iter::empty::<(String, String)>(),
-            std::iter::empty::<String>(),
-            true,
-            Stdio::null(),
-            Stdio::null(),
-            |_| (),
-        )
-        .expect("failed to start XWayland");
+        // Smithay's automatic allocator probes displays starting at :0. If an
+        // existing XWayland owns the abstract socket but its lock file is
+        // missing, that probe removes its filesystem socket before discovering
+        // the collision. Keep this compositor in a separate display range so
+        // launching a TTY development session cannot disconnect the desktop
+        // compositor's X11 clients.
+        let displays = std::env::var("WM_XWAYLAND_DISPLAY")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|display| vec![display])
+            .unwrap_or_else(|| (100..=132).collect());
+        let mut spawned = None;
+        for display_number in displays {
+            let lock = format!("/tmp/.X{display_number}-lock");
+            let socket = format!("/tmp/.X11-unix/X{display_number}");
+            if std::path::Path::new(&lock).exists() || std::path::Path::new(&socket).exists() {
+                continue;
+            }
+            match XWayland::spawn(
+                &self.display_handle,
+                Some(display_number),
+                std::iter::empty::<(String, String)>(),
+                std::iter::empty::<String>(),
+                true,
+                Stdio::null(),
+                Stdio::null(),
+                |_| (),
+            ) {
+                Ok(server) => {
+                    info!(
+                        xdisplay = display_number,
+                        "Reserved isolated XWayland display"
+                    );
+                    spawned = Some(server);
+                    break;
+                }
+                Err(error) => {
+                    warn!(xdisplay = display_number, %error, "XWayland display unavailable");
+                }
+            }
+        }
+        let Some((xwayland, client)) = spawned else {
+            tracing::error!("No isolated XWayland display is available");
+            return;
+        };
 
         let display_handle = self.display_handle.clone();
         let ret = self
