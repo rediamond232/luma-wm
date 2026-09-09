@@ -3,18 +3,18 @@ startup = []
 rules = []
 
 [theme]
-background = "#161a22"
-foreground = "#e2e8f0"
-accent = "#89b4fa"
-muted = "#8892a5"
+background = "#1b1b14"
+foreground = "#fff3d1"
+accent = "#e7bd58"
+muted = "#aeb286"
 font = "sans-serif"
 font_size = 13
 gap = 8
-border = 2
-shadow_size = 14
-shadow_opacity = 0.22
-radius = 10.0
-opacity = 0.9399999976158142
+border = 1
+shadow_size = 16
+shadow_opacity = 0.3
+radius = 12.0
+opacity = 0.88
 blur = true
 blur_passes = 3
 animation_ms = 140
@@ -37,6 +37,7 @@ pointer_accel = 0.0
 mouse_modifier = "Super"
 
 [bindings]
+"Print" = "screenshot"
 "Super+1" = "workspace 1"
 "Super+2" = "workspace 2"
 "Super+3" = "workspace 3"
@@ -62,7 +63,7 @@ mouse_modifier = "Super"
 "Super+Alt+9" = "send 9"
 "Super+Shift+Down" = "move down"
 "Super+Shift+Left" = "move left"
-"Super+Shift+Q" = "close"
+"Super+q" = "close"
 "Super+Shift+R" = "reload"
 "Super+Shift+Right" = "move right"
 "Super+Shift+Up" = "move up"
@@ -76,6 +77,8 @@ mouse_modifier = "Super"
 "Super+minus" = "ratio -0.05"
 "Super+Space" = "launcher"
 "Super+t" = "layout master"
+"Super+e" = "launch thunar"
+"Super+w" = "launch firefox"
 
 [wallpaper]
 path = "/home/lev/Pictures/Wallpapers/random_wallpaper.jpg"
@@ -98,6 +101,8 @@ pause_on_battery = true
 
 [shell]
 enabled = true
+backend = "sctk"
+do_not_disturb = false
 position = "top"
 height = 36
 modules = [

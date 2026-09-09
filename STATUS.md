@@ -839,3 +839,37 @@ DRM behavior remains the TTY3 acceptance gate.
 - The default configuration now includes a commented connector example. Core
   mode-selection tests and the workspace build pass; applying a new mode still
   requires a physical TTY3 check.
+
+### Native SCTK shell progress (2026-09-08)
+
+- The default `shell.backend = "sctk"` path provides native SHM layer surfaces
+  for the bar, wallpaper, launcher and notification overlay without GTK. Its
+  focused nested check covers video-wallpaper startup/reload, notification
+  ownership and actions capability, StatusNotifier registration, and launcher
+  mapping.
+- Native modules now cover event-driven audio, NetworkManager, MPRIS, BlueZ,
+  battery, notifications and StatusNotifier icons/actions. GTK retains
+  D-BusMenu, full interactive device panels, IME and accessibility parity.
+- Native bar housekeeping now sleeps until the next clock minute, battery
+  refresh, or pending notification deadline. Notification expiry also owns a
+  one-shot calloop timer, so an idle shell has no unconditional one-second
+  wakeup while expiring notifications remain prompt.
+- Notification replacements, explicit dismissals and history eviction cancel
+  their previous one-shot timers, bounding scheduled expiry work to retained
+  cards. Native module and tray handlers also skip redraws for unchanged state;
+  the tray monitor ignores non-visual StatusNotifier signals. The focused
+  nested check now observes a real `NotificationClosed` expiry signal for a
+  150 ms notification.
+- Native launcher rendering avoids synchronous desktop icon and application
+  discovery work: desktop files are scanned on a worker after its first frame,
+  then rows populate through the event loop. Bar, wallpaper and notification
+  redraws never resolve launcher rows.
+- Notification action hit testing now shares the renderer's icon-adjusted text
+  column, keeping action buttons clickable at their visible position when the
+  notification has an app icon.
+- Wallpaper mode now subscribes to compositor snapshots as well. A fullscreen
+  client cancels native FFmpeg video decoding through its generation guard; the
+  decoder restarts when fullscreen ends, avoiding hidden wallpaper work.
+- Native wallpaper also honors `wallpaper.pause_on_battery`: a dedicated
+  30-second battery check suspends video decoding while discharging and resumes
+  it after AC power returns. Fullscreen suspension always applies.

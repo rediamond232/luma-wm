@@ -1,0 +1,9 @@
+# Minimal native-shell fixture used by tools/check-sctk-shell.py.
+terminal = ["kitty", "--class", "wm-sctk-smoke-terminal", "-o", "confirm_os_window_close=0"]
+
+[shell]
+enabled = true
+backend = "sctk"
+
+[theme]
+radius = 10.0

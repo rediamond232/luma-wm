@@ -24,6 +24,15 @@ cd /home/lev/luma
 ./tools/run-tty.sh
 ```
 
+For a performance test, use the release-only TTY runner instead:
+
+```bash
+./tools/run-tty-release.sh
+```
+
+It builds the complete workspace with Cargo's release profile and starts
+`target/release/wm`; its log is saved to `~/.local/state/wm/session-release.log`.
+
 The TTY script uses `~/.config/wm/config.toml` when present, otherwise the repository
 default. `WM_CONFIG` overrides either. It performs a locked offline incremental build,
 starts a fresh session log, and prints the final log lines if the compositor exits. Logs are in
@@ -45,6 +54,56 @@ target/debug/wmctl config-check
 Existing configuration files reload automatically. `Super+Shift+R` explicitly
 reloads. Invalid values retain the last valid configuration. See
 [STATUS.md](STATUS.md) for runtime validation coverage and hardware checks.
+
+### Native SCTK shell
+
+The native SCTK shell is the default. It focuses on a stable, low-overhead core
+bar, launcher, wallpaper, notification and tray experience. Set this in your
+config to select it explicitly:
+
+```toml
+[shell]
+backend = "sctk"
+do_not_disturb = false
+```
+
+It creates native SHM layer surfaces for a per-output workspace/title bar, an
+image or fallback-gradient wallpaper, and a UTF-8 `>` command launcher with
+Escape dismissal. It uses compositor snapshots and inotify-driven config
+reloads, so it has no GTK runtime or constant status-polling wakeup. Theme colors, font,
+opacity, bar position and height apply to the native surfaces. The native bar
+tracks PulseAudio volume, NetworkManager, BlueZ availability, MPRIS players,
+battery state, freedesktop notifications, and StatusNotifier registrations.
+It owns `org.freedesktop.Notifications` and `org.kde.StatusNotifierWatcher` on
+the compositor session bus; notification replacement, close requests and expiry
+are handled natively. Click the audio module to toggle mute and scroll it to
+adjust output volume in 5% steps. Click media to play/pause, right-click for
+previous, or middle-click for next. Click a notification card to dismiss it or
+right-click the notification center to clear its history.
+Middle-click the network module to enable or disable Wi-Fi through
+NetworkManager, or middle-click Bluetooth to toggle its primary adapter.
+Notification action labels are native buttons and emit the standard
+`ActionInvoked` signal when selected. Dismissal, expiry, and explicit close
+requests emit the standard `NotificationClosed` reason.
+Set `do_not_disturb = true` in `[shell]` to suppress notification cards while
+still acknowledging notification requests; reload applies it immediately. You
+can also middle-click the notifications module to toggle DND for the session.
+MPRIS metadata and playback updates follow player property signals, without a
+status polling loop.
+For `wallpaper.kind = "video"`, the native backend uses installed `ffmpeg` and
+`ffprobe`; decoded frames are capped to one queued frame and 60 FPS.
+
+The GTK backend remains available for its tray icons and
+menus, interactive network/Bluetooth/audio/media controls, video wallpaper,
+and assistive-technology integration. Keep `backend = "gtk"` for those
+features.
+
+Run the focused native integration check on a Wayland host:
+
+```sh
+cargo build --workspace --features wm-compositor/winit --locked
+WM_NESTED_BACKEND=winit python3 tools/check-sctk-shell.py
+```
 
 Physical input settings apply on the TTY backend, including after reload and
 device hotplug. Nested sessions use the host desktop's device settings:
@@ -315,6 +374,19 @@ Default controls:
 | Super+F / Super+Shift+Space | Fullscreen / floating |
 | Super+M / Super+T | Monocle / master-stack layout |
 | Super+Shift+Q | Close window |
+| Print | Copy a full-screen PNG screenshot to the clipboard |
+
+Bindings can also launch applications directly. For example:
+
+```toml
+[bindings]
+"Super+B" = "launch firefox --new-window"
+"Super+Shift+T" = "launch kitty --title 'scratch terminal'"
+```
+
+`launch` parses quoted arguments and starts the program directly; it does not
+interpret shell operators. The existing `exec ["program", "argument"]` action
+remains available for machine-generated command arrays.
 
 `wmctl help` lists IPC commands. `workspace N OUTPUT` selects a workspace on a
 specific output. The launcher supports applications, `@` windows, `>` commands

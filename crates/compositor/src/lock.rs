@@ -94,6 +94,8 @@ impl<B: Backend + 'static> SessionLockHandler for AnvilState<B> {
         keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
         self.release_all_keys();
         self.suppressed_keys.clear();
+        self.super_tap_pending = false;
+        self.super_tap_used = false;
         let pointer = self.pointer.clone();
         let serial = SERIAL_COUNTER.next_serial();
         let time = InputTime::now();

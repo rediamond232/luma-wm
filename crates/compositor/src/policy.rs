@@ -249,8 +249,13 @@ impl<B: Backend + 'static> AnvilState<B> {
         }
         if self.desktop.config.shell.enabled {
             if let Ok(exe) = std::env::current_exe() {
+                let shell_name = if self.desktop.config.shell.backend == "sctk" {
+                    "wm-shell-sctk"
+                } else {
+                    "wm-shell"
+                };
                 let shell = exe
-                    .with_file_name("wm-shell")
+                    .with_file_name(shell_name)
                     .to_string_lossy()
                     .into_owned();
                 self.desktop.services.push((vec![shell.clone()], None, 0));
@@ -340,7 +345,9 @@ impl<B: Backend + 'static> AnvilState<B> {
         );
         for k in [key, raw] {
             let name = xkbcommon::xkb::keysym_get_name(k);
-            if let Some(c) = self.desktop.config.bindings.get(&format!("{prefix}{name}")) {
+            if let Some(c) =
+                binding_action(&self.desktop.config.bindings, &format!("{prefix}{name}"))
+            {
                 return Some(c.clone());
             }
         }
@@ -397,15 +404,28 @@ impl<B: Backend + 'static> AnvilState<B> {
                 return self.spawn_app(&self.desktop.config.terminal.clone());
             }
             "launcher" => {
+                let shell_name = if self.desktop.config.shell.backend == "sctk" {
+                    "wm-shell-sctk"
+                } else {
+                    "wm-shell"
+                };
                 let p = std::env::current_exe()
                     .map_err(|e| e.to_string())?
-                    .with_file_name("wm-shell");
+                    .with_file_name(shell_name);
                 return self.spawn_app(&[p.to_string_lossy().into_owned(), "--launcher".into()]);
             }
             "exec" => {
                 let args: Vec<String> = serde_json::from_str(arg)
                     .map_err(|_| "exec requires a JSON array of executable and arguments")?;
                 return self.spawn_app(&args);
+            }
+            "launch" => {
+                let args = launch_args(arg)?;
+                return self.spawn_app(&args);
+            }
+            "screenshot" => {
+                let command = screenshot_copy_command();
+                return self.spawn_app(&command);
             }
             "quit" => {
                 self.running
@@ -1344,5 +1364,73 @@ impl<B: Backend + 'static> AnvilState<B> {
                 }
             });
         }
+    }
+}
+
+fn binding_action<'a>(bindings: &'a BTreeMap<String, String>, key: &str) -> Option<&'a String> {
+    bindings.get(key).or_else(|| {
+        bindings
+            .iter()
+            .find(|(binding, _)| binding.eq_ignore_ascii_case(key))
+            .map(|(_, action)| action)
+    })
+}
+
+fn launch_args(command: &str) -> Result<Vec<String>, String> {
+    let args = shlex::split(command).ok_or("launch has an unterminated quote")?;
+    if args.is_empty() {
+        Err("launch requires a program".into())
+    } else {
+        Ok(args)
+    }
+}
+
+fn screenshot_copy_command() -> [String; 3] {
+    [
+        "sh".into(),
+        "-c".into(),
+        "grim -t png - | wl-copy --type image/png".into(),
+    ]
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::binding_action;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn binding_lookup_accepts_shifted_keysym_case() {
+        let bindings = BTreeMap::from([("Super+Shift+R".into(), "reload".into())]);
+        assert_eq!(
+            binding_action(&bindings, "Super+Shift+r"),
+            Some(&"reload".into())
+        );
+    }
+
+    #[test]
+    fn exact_binding_spelling_wins_over_case_insensitive_fallback() {
+        let bindings = BTreeMap::from([
+            ("Super+q".into(), "close".into()),
+            ("Super+Q".into(), "quit".into()),
+        ]);
+        assert_eq!(binding_action(&bindings, "Super+q"), Some(&"close".into()));
+    }
+
+    #[test]
+    fn launch_arguments_preserve_quoted_values_without_using_a_shell() {
+        assert_eq!(
+            super::launch_args("firefox --new-window 'https://example.test/a b'").unwrap(),
+            ["firefox", "--new-window", "https://example.test/a b"]
+        );
+        assert!(super::launch_args("").is_err());
+        assert!(super::launch_args("firefox '").is_err());
+    }
+
+    #[test]
+    fn screenshot_action_emits_png_to_the_wayland_clipboard() {
+        assert_eq!(
+            super::screenshot_copy_command(),
+            ["sh", "-c", "grim -t png - | wl-copy --type image/png"]
+        );
     }
 }

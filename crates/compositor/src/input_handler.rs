@@ -227,13 +227,16 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     // so that we can decide on a release if the key
                     // should be forwarded to the client or not.
                     if let KeyState::Pressed = state {
+                        let raw = handle.raw_syms().first().copied().unwrap_or(keysym);
+                        if is_super_key(raw) {
+                            data.super_tap_pending = !inhibited;
+                            data.super_tap_used = false;
+                        } else if data.super_tap_pending {
+                            data.super_tap_used = true;
+                        }
                         if !inhibited {
                             let action = data
-                                .shortcut(
-                                    *modifiers,
-                                    keysym,
-                                    handle.raw_syms().first().copied().unwrap_or(keysym),
-                                )
+                                .shortcut(*modifiers, keysym, raw)
                                 .map(KeyAction::Desktop)
                                 .or_else(|| process_keyboard_shortcut(*modifiers, keysym));
 
@@ -244,6 +247,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                             action
                                 .map(FilterResult::Intercept)
                                 .unwrap_or(FilterResult::Forward)
+                        } else {
+                            FilterResult::Forward
+                        }
+                    } else if is_super_key(handle.raw_syms().first().copied().unwrap_or(keysym))
+                        && data.super_tap_pending
+                    {
+                        let used = data.super_tap_used;
+                        data.super_tap_pending = false;
+                        data.super_tap_used = false;
+                        if !used {
+                            FilterResult::Intercept(KeyAction::Desktop("launcher".into()))
                         } else {
                             FilterResult::Forward
                         }
@@ -1494,4 +1508,8 @@ fn process_keyboard_shortcut(_modifiers: ModifiersState, keysym: Keysym) -> Opti
     } else {
         None
     }
+}
+
+fn is_super_key(keysym: Keysym) -> bool {
+    matches!(keysym.raw(), xkb::KEY_Super_L | xkb::KEY_Super_R)
 }

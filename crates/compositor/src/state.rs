@@ -191,6 +191,8 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     // input-related fields
     pub suppressed_keys: Vec<Keysym>,
+    pub super_tap_pending: bool,
+    pub super_tap_used: bool,
     pub cursor_status: CursorImageStatus,
     pub seat_name: String,
     pub seat: Seat<AnvilState<BackendData>>,
@@ -1010,6 +1012,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             capture_cursor: crate::capture::CaptureCursor::default(),
             dnd_icon: None,
             suppressed_keys: Vec::new(),
+            super_tap_pending: false,
+            super_tap_used: false,
             cursor_status: CursorImageStatus::default_named(),
             seat_name,
             seat,

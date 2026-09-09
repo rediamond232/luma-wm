@@ -22,6 +22,7 @@ impl Default for Config {
             ("Super+Return".into(), "terminal".into()),
             ("Super+space".into(), "launcher".into()),
             ("Super+Shift+Q".into(), "close".into()),
+            ("Super+q".into(), "close".into()),
             ("Super+f".into(), "fullscreen".into()),
             ("Super+Shift+space".into(), "floating".into()),
             ("Super+m".into(), "layout monocle".into()),
@@ -154,16 +155,22 @@ impl Default for Input {
 #[serde(default, deny_unknown_fields)]
 pub struct Shell {
     pub enabled: bool,
+    /// `gtk` keeps the established feature-complete shell. `sctk` enables the
+    /// low-overhead Smithay Client Toolkit implementation.
+    pub backend: String,
     pub position: String,
     pub height: i32,
     pub modules: Vec<String>,
+    pub do_not_disturb: bool,
 }
 impl Default for Shell {
     fn default() -> Self {
         Self {
             enabled: true,
+            backend: "gtk".into(),
             position: "top".into(),
             height: 36,
+            do_not_disturb: false,
             modules: vec![
                 "workspaces",
                 "title",
@@ -366,10 +373,11 @@ impl Config {
         {
             return Err("invalid wallpaper kind, fit, or fps".into());
         }
-        if !["top", "bottom"].contains(&self.shell.position.as_str())
+        if !["gtk", "sctk"].contains(&self.shell.backend.as_str())
+            || !["top", "bottom"].contains(&self.shell.position.as_str())
             || !(20..=100).contains(&self.shell.height)
         {
-            return Err("invalid bar position or height".into());
+            return Err("invalid shell backend, bar position, or height".into());
         }
         for o in self.outputs.values() {
             if !(0.5..=4.0).contains(&o.scale)
@@ -402,6 +410,17 @@ impl Config {
                 .contains(&self.input.mouse_modifier.as_str())
         {
             return Err("invalid input settings".into());
+        }
+        for binding in self.bindings.keys() {
+            let mut parts = binding.split('+');
+            let Some(key) = parts.next_back() else {
+                return Err("invalid binding".into());
+            };
+            if key.is_empty()
+                || parts.any(|modifier| !["Super", "Ctrl", "Alt", "Shift"].contains(&modifier))
+            {
+                return Err(format!("invalid binding: {binding}"));
+            }
         }
         for r in &self.rules {
             if r.workspace
@@ -694,6 +713,8 @@ mod tests {
             "[theme]\nshadow_size=-1",
             "[theme]\nshadow_opacity=1.1",
             "[theme]\nshadow_opacity=nan",
+            "[shell]\nbackend='other'",
+            "[bindings]\n'Supers+space'='launcher'",
             "typo=1",
         ] {
             assert!(Config::parse(s).is_err(), "{s}");
