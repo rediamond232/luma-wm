@@ -40,10 +40,12 @@ the stable release session. The Arch package installs its separate portable
 
 ### Arch Linux package
 
-Released x86-64 builds are available through the `luma-wm-bin` AUR package.
-Install it with an AUR helper or build the AUR checkout with `makepkg -si`.
-The package installs a portable **Luma** Wayland session; it does not refer to
-the maintainer's source checkout. Release archives are generated with:
+Released x86-64 builds include a `luma-wm-bin` Pacman package on GitHub
+Releases. Install the downloaded package with `sudo pacman -U <file>`. The AUR
+recipe is maintained in `packaging/aur` and can be submitted when an AUR
+maintainer account is available. The package installs a portable **Luma**
+Wayland session; it does not refer to the maintainer's source checkout. Release
+archives are generated with:
 
 ```bash
 ./tools/package-release.sh 0.1.0
