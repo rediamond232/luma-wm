@@ -12,9 +12,12 @@ if [[ $(tty) != /dev/tty3 ]]; then
     exit 1
 fi
 
-# Build every companion binary that the compositor can spawn, then run the
-# release compositor so TTY performance checks never accidentally use debug.
-cargo build --release --workspace --locked --offline
+release_binary="$PWD/target/release/wm"
+if [[ ! -x "$release_binary" ]]; then
+    echo "Stable release binary is missing: $release_binary" >&2
+    echo 'Build it first with: cargo build --release --workspace --locked --offline' >&2
+    exit 1
+fi
 
 user_config="${XDG_CONFIG_HOME:-$HOME/.config}/wm/config.toml"
 if [[ -f "$user_config" ]]; then
@@ -36,7 +39,7 @@ log_file="$state_dir/session-release.log"
 printf 'Starting release wm with config %s\nLog: %s\n' "$WM_CONFIG" "$log_file"
 # A private bus prevents this TTY session from taking over another desktop's services.
 set +e
-dbus-run-session -- ./target/release/wm --tty-udev >> "$log_file" 2>&1
+dbus-run-session -- "$release_binary" --tty-udev >> "$log_file" 2>&1
 status=$?
 set -e
 printf '\nrelease wm exited with status %s. Last log lines:\n' "$status" >&2

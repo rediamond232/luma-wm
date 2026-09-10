@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Luma
+Comment=Luma Wayland tiling compositor
+Exec=/usr/bin/luma-session
+Type=Application
+DesktopNames=Luma

@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=Luma (stable)
+Comment=Luma Wayland compositor using the prebuilt release binary
+Exec=/home/lev/luma/tools/run-session-release.sh
+Type=Application

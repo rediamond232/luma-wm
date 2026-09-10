@@ -18,15 +18,33 @@ varying vec2 v_coords;
 uniform float tint;
 #endif
 void main() {
-    vec4 c = texture2D(tex, v_coords) * 0.25;
-    c += texture2D(tex, v_coords + vec2(wm_step.x, 0.0)) * 0.125;
-    c += texture2D(tex, v_coords - vec2(wm_step.x, 0.0)) * 0.125;
-    c += texture2D(tex, v_coords + vec2(0.0, wm_step.y)) * 0.125;
-    c += texture2D(tex, v_coords - vec2(0.0, wm_step.y)) * 0.125;
-    c += texture2D(tex, v_coords + wm_step) * 0.0625;
-    c += texture2D(tex, v_coords - wm_step) * 0.0625;
-    c += texture2D(tex, v_coords + vec2(wm_step.x, -wm_step.y)) * 0.0625;
-    c += texture2D(tex, v_coords + vec2(-wm_step.x, wm_step.y)) * 0.0625;
+    // Concentric, rotated sample rings avoid turning repeating wallpaper
+    // details into the plaid pattern produced by a regular sparse grid.
+    vec4 c = texture2D(tex, v_coords) * 0.12;
+    c += texture2D(tex, v_coords + wm_step * vec2( 0.5000,  0.0000)) * 0.06;
+    c += texture2D(tex, v_coords + wm_step * vec2( 0.3536,  0.3536)) * 0.06;
+    c += texture2D(tex, v_coords + wm_step * vec2( 0.0000,  0.5000)) * 0.06;
+    c += texture2D(tex, v_coords + wm_step * vec2(-0.3536,  0.3536)) * 0.06;
+    c += texture2D(tex, v_coords + wm_step * vec2(-0.5000,  0.0000)) * 0.06;
+    c += texture2D(tex, v_coords + wm_step * vec2(-0.3536, -0.3536)) * 0.06;
+    c += texture2D(tex, v_coords + wm_step * vec2( 0.0000, -0.5000)) * 0.06;
+    c += texture2D(tex, v_coords + wm_step * vec2( 0.3536, -0.3536)) * 0.06;
+    c += texture2D(tex, v_coords + wm_step * vec2( 1.1549,  0.4784)) * 0.035;
+    c += texture2D(tex, v_coords + wm_step * vec2( 0.4784,  1.1549)) * 0.035;
+    c += texture2D(tex, v_coords + wm_step * vec2(-0.4784,  1.1549)) * 0.035;
+    c += texture2D(tex, v_coords + wm_step * vec2(-1.1549,  0.4784)) * 0.035;
+    c += texture2D(tex, v_coords + wm_step * vec2(-1.1549, -0.4784)) * 0.035;
+    c += texture2D(tex, v_coords + wm_step * vec2(-0.4784, -1.1549)) * 0.035;
+    c += texture2D(tex, v_coords + wm_step * vec2( 0.4784, -1.1549)) * 0.035;
+    c += texture2D(tex, v_coords + wm_step * vec2( 1.1549, -0.4784)) * 0.035;
+    c += texture2D(tex, v_coords + wm_step * vec2( 2.2068,  0.4389)) * 0.015;
+    c += texture2D(tex, v_coords + wm_step * vec2( 1.2500,  1.8709)) * 0.015;
+    c += texture2D(tex, v_coords + wm_step * vec2(-0.4389,  2.2068)) * 0.015;
+    c += texture2D(tex, v_coords + wm_step * vec2(-1.8709,  1.2500)) * 0.015;
+    c += texture2D(tex, v_coords + wm_step * vec2(-2.2068, -0.4389)) * 0.015;
+    c += texture2D(tex, v_coords + wm_step * vec2(-1.2500, -1.8709)) * 0.015;
+    c += texture2D(tex, v_coords + wm_step * vec2( 0.4389, -2.2068)) * 0.015;
+    c += texture2D(tex, v_coords + wm_step * vec2( 1.8709, -1.2500)) * 0.015;
     vec2 half_size = wm_rect.zw * 0.5;
     float radius = min(wm_radius, min(half_size.x, half_size.y));
     vec2 p = abs(gl_FragCoord.xy - wm_rect.xy - half_size) - half_size + radius;

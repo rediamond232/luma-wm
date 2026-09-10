@@ -1,0 +1,49 @@
+# Maintainer: Kinglxss <korenlev366 at gmail dot com>
+pkgname=luma-wm-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Wayland tiling compositor with a native desktop shell"
+arch=('x86_64')
+url="https://github.com/rediamond232/luma-wm"
+license=('MIT')
+provides=("luma-wm=$pkgver")
+conflicts=('luma-wm' 'luma-wm-git')
+depends=(
+  'dbus'
+  'glibc'
+  'libdisplay-info'
+  'libgcc'
+  'libinput'
+  'libxkbcommon'
+  'mesa'
+  'pixman'
+  'seatd'
+  'systemd-libs'
+  'wayland'
+  'xorg-xwayland'
+)
+optdepends=(
+  'ffmpeg: video wallpapers'
+  'grim: screenshots'
+  'kitty: default terminal command'
+  'swaylock: session locking'
+  'wl-clipboard: copying screenshots to the clipboard'
+  'xdg-desktop-portal-wlr: screen sharing and capture portals'
+)
+source_x86_64=(
+  "$pkgname-$pkgver.tar.zst::$url/releases/download/v$pkgver/luma-wm-$pkgver-x86_64.tar.zst"
+)
+sha256sums_x86_64=('6fa324c0d5a64dbf2e1bd7b5c59781b7319cd9a63c52d5d3c6881b9315d27c2c')
+
+package() {
+  install -Dm755 "$srcdir/luma-wm" "$pkgdir/usr/bin/luma-wm"
+  install -Dm755 "$srcdir/wmctl" "$pkgdir/usr/bin/wmctl"
+  install -Dm755 "$srcdir/wm-shell-sctk" "$pkgdir/usr/bin/wm-shell-sctk"
+  install -Dm755 "$srcdir/luma-session" "$pkgdir/usr/bin/luma-session"
+  install -Dm644 "$srcdir/default.toml" "$pkgdir/usr/share/luma-wm/default.toml"
+  install -Dm644 "$srcdir/luma-wm.desktop" \
+    "$pkgdir/usr/share/wayland-sessions/luma-wm.desktop"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$srcdir/README.md" "$pkgdir/usr/share/doc/luma-wm/README.md"
+  install -Dm644 "$srcdir/THIRD_PARTY.md" "$pkgdir/usr/share/doc/luma-wm/THIRD_PARTY.md"
+}

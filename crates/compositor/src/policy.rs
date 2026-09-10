@@ -93,6 +93,13 @@ impl Default for Desktop {
 }
 impl Drop for Desktop {
     fn drop(&mut self) {
+        // Applications belong to this compositor session. In particular,
+        // single-instance background programs must not survive with stale
+        // Wayland/X11/D-Bus endpoints and intercept launches in the next login.
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         for (_, child, _) in &mut self.services {
             if let Some(child) = child {
                 let _ = child.kill();
@@ -288,7 +295,10 @@ impl<B: Backend + 'static> AnvilState<B> {
         c.args(rest)
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_SOCKET")
-            .env("XDG_CURRENT_DESKTOP", "wm:wlr")
+            .env(
+                "XDG_CURRENT_DESKTOP",
+                application_desktop_environment(first),
+            )
             .env("XDG_SESSION_TYPE", "wayland");
         if std::path::Path::new(first).file_name() == Some(std::ffi::OsStr::new("wm-shell")) {
             c.env("GDK_BACKEND", "wayland");
@@ -1376,6 +1386,17 @@ fn binding_action<'a>(bindings: &'a BTreeMap<String, String>, key: &str) -> Opti
     })
 }
 
+fn application_desktop_environment(executable: &str) -> &'static str {
+    // GSR's native overlay currently selects wlr-layer-shell only for a short
+    // compositor allowlist. Advertise compatibility to that application alone;
+    // adding `river` session-wide changes desktop portal selection.
+    if std::path::Path::new(executable).file_name() == Some(std::ffi::OsStr::new("gsr-ui")) {
+        "wm:wlr:river"
+    } else {
+        "wm:wlr"
+    }
+}
+
 fn launch_args(command: &str) -> Result<Vec<String>, String> {
     let args = shlex::split(command).ok_or("launch has an unterminated quote")?;
     if args.is_empty() {
@@ -1395,7 +1416,7 @@ fn screenshot_copy_command() -> [String; 3] {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::binding_action;
+    use super::{application_desktop_environment, binding_action};
     use std::collections::BTreeMap;
 
     #[test]
@@ -1432,5 +1453,15 @@ mod binding_tests {
             super::screenshot_copy_command(),
             ["sh", "-c", "grim -t png - | wl-copy --type image/png"]
         );
+    }
+
+    #[test]
+    fn gsr_uses_native_layer_shell_without_spoofing_the_whole_session() {
+        assert_eq!(application_desktop_environment("gsr-ui"), "wm:wlr:river");
+        assert_eq!(
+            application_desktop_environment("/usr/bin/gsr-ui"),
+            "wm:wlr:river"
+        );
+        assert_eq!(application_desktop_environment("vesktop"), "wm:wlr");
     }
 }

@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+user_config="${XDG_CONFIG_HOME:-$HOME/.config}/wm/config.toml"
+if [ -f "$user_config" ]; then
+    export WM_CONFIG="${WM_CONFIG:-$user_config}"
+else
+    export WM_CONFIG="${WM_CONFIG:-/usr/share/luma-wm/default.toml}"
+fi
+
+export WM_SOCKET="${WM_SOCKET:-${XDG_RUNTIME_DIR:?}/wm.sock}"
+export XDG_CURRENT_DESKTOP=wm:wlr
+export XDG_SESSION_TYPE=wayland
+export RUST_LOG="${RUST_LOG:-wm_compositor=info,smithay=warn}"
+
+exec /usr/bin/luma-wm --tty-udev

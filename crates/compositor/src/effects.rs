@@ -903,6 +903,11 @@ pub fn scene(
         })
         .map(|l| Id::from_wayland_resource(l.wl_surface()))
         .collect();
+    let launcher_blurred: Vec<_> = map
+        .layers()
+        .filter(|layer| layer.namespace() == "wm-launcher")
+        .map(|layer| Id::from_wayland_resource(layer.wl_surface()))
+        .collect();
     let mut background_ids = Vec::new();
     for layer in map.layers().filter(|layer| {
         matches!(
@@ -977,6 +982,12 @@ pub fn scene(
                             .into(),
                     ))
                 });
+            let blur_strength = theme.blur_passes as f32
+                * if launcher_blurred.contains(inner.id()) {
+                    2.0
+                } else {
+                    1.0
+                };
             EffectElement {
                 backdrop,
                 frozen_backdrop: false,
@@ -991,7 +1002,7 @@ pub fn scene(
                 ],
                 radius,
                 blur,
-                blur_strength: theme.blur_passes as f32,
+                blur_strength,
                 blur_alpha,
             }
         })

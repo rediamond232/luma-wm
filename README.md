@@ -30,8 +30,24 @@ For a performance test, use the release-only TTY runner instead:
 ./tools/run-tty-release.sh
 ```
 
-It builds the complete workspace with Cargo's release profile and starts
-`target/release/wm`; its log is saved to `~/.local/state/wm/session-release.log`.
+It starts only `target/release/wm`; its log is saved to
+`~/.local/state/wm/session-release.log`. Build the release workspace first; the
+runner intentionally launches only that prebuilt binary.
+
+`sessions/luma-stable.desktop` is the local-checkout display-manager entry for
+the stable release session. The Arch package installs its separate portable
+**Luma** entry using `/usr/bin/luma-session`.
+
+### Arch Linux package
+
+Released x86-64 builds are available through the `luma-wm-bin` AUR package.
+Install it with an AUR helper or build the AUR checkout with `makepkg -si`.
+The package installs a portable **Luma** Wayland session; it does not refer to
+the maintainer's source checkout. Release archives are generated with:
+
+```bash
+./tools/package-release.sh 0.1.0
+```
 
 The TTY script uses `~/.config/wm/config.toml` when present, otherwise the repository
 default. `WM_CONFIG` overrides either. It performs a locked offline incremental build,

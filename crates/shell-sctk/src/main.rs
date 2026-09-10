@@ -4,7 +4,7 @@
 //! still opt-in while the feature-complete GTK shell remains the default.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     io::{BufRead, Read, Write},
     num::NonZeroU32,
     path::{Path, PathBuf},
@@ -65,6 +65,7 @@ enum SurfaceKind {
     Wallpaper,
     Launcher,
     Notifications,
+    TrayMenu,
 }
 
 impl Mode {
@@ -87,6 +88,8 @@ struct Surface {
     width: u32,
     height: u32,
     configured: bool,
+    frame_pending: bool,
+    redraw_requested: bool,
     output: Option<wl_output::WlOutput>,
 }
 
@@ -172,6 +175,7 @@ struct TrayItem {
     path: String,
     icon: Option<image::RgbaImage>,
     visible: bool,
+    menu_path: Option<String>,
 }
 
 impl TrayItem {
@@ -183,6 +187,37 @@ impl TrayItem {
 enum TrayEvent {
     Upsert(TrayItem),
     Remove(String),
+}
+
+#[derive(Clone)]
+struct TrayMenuRow {
+    id: i32,
+    label: String,
+    enabled: bool,
+    separator: bool,
+    submenu: bool,
+    toggle_state: Option<i32>,
+}
+
+#[derive(Clone)]
+struct TrayMenuState {
+    service: String,
+    path: String,
+    menu_path: String,
+    output: wl_output::WlOutput,
+    local_x: i32,
+    action_position: (i32, i32),
+    parents: Vec<i32>,
+    rows: Vec<TrayMenuRow>,
+}
+
+enum TrayMenuEvent {
+    Loaded {
+        service: String,
+        menu_path: String,
+        parent: i32,
+        rows: Option<Vec<TrayMenuRow>>,
+    },
 }
 
 struct TrayServer {
@@ -319,7 +354,7 @@ fn load_named_tray_icon(name: &str, theme_paths: Option<&str>) -> Option<image::
 }
 
 fn load_tray_item(id: String, service: String, path: String) -> TrayItem {
-    let (icon, visible) = (|| {
+    let (icon, visible, menu_path) = (|| {
         let connection = zbus::blocking::Connection::session().ok()?;
         let item = zbus::blocking::Proxy::new(
             &connection,
@@ -351,15 +386,25 @@ fn load_tray_item(id: String, service: String, path: String) -> TrayItem {
         };
         let overlay = tray_pixmap(item.get_property("OverlayIconPixmap").unwrap_or_default())
             .or_else(|| named_icon("OverlayIconName"));
-        Some((icon.map(|icon| overlay_tray_icon(icon, overlay)), visible))
+        let menu_path = item
+            .get_property::<zbus::zvariant::OwnedObjectPath>("Menu")
+            .ok()
+            .map(|path| path.to_string())
+            .filter(|path| path != "/");
+        Some((
+            icon.map(|icon| overlay_tray_icon(icon, overlay)),
+            visible,
+            menu_path,
+        ))
     })()
-    .unwrap_or((None, true));
+    .unwrap_or((None, true, None));
     TrayItem {
         id,
         service,
         path,
         icon,
         visible,
+        menu_path,
     }
 }
 
@@ -464,6 +509,132 @@ fn tray_signal_needs_refresh(member: Option<&str>) -> bool {
                 | "NewIconThemePath"
         )
     )
+}
+
+type RawTrayMenuLayout = (
+    i32,
+    HashMap<String, zbus::zvariant::OwnedValue>,
+    Vec<zbus::zvariant::OwnedValue>,
+);
+
+fn tray_menu_property_string(
+    properties: &HashMap<String, zbus::zvariant::OwnedValue>,
+    key: &str,
+) -> String {
+    properties
+        .get(key)
+        .and_then(|value| <&str>::try_from(value).ok())
+        .unwrap_or_default()
+        .chars()
+        .take(256)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn parse_tray_menu_layout(layout: RawTrayMenuLayout, parent: i32) -> Option<Vec<TrayMenuRow>> {
+    if layout.0 != parent || layout.2.len() > 128 {
+        return None;
+    }
+    let mut ids = BTreeSet::new();
+    let mut rows = Vec::new();
+    for child in layout.2 {
+        let structure: zbus::zvariant::Structure<'static> = child.try_into().ok()?;
+        let (id, properties, _children): RawTrayMenuLayout = structure.try_into().ok()?;
+        if id == parent || !ids.insert(id) {
+            return None;
+        }
+        let visible = properties
+            .get("visible")
+            .and_then(|value| bool::try_from(value).ok())
+            .unwrap_or(true);
+        if !visible {
+            continue;
+        }
+        let separator = tray_menu_property_string(&properties, "type") == "separator";
+        rows.push(TrayMenuRow {
+            id,
+            label: tray_menu_property_string(&properties, "label"),
+            enabled: properties
+                .get("enabled")
+                .and_then(|value| bool::try_from(value).ok())
+                .unwrap_or(true),
+            separator,
+            submenu: tray_menu_property_string(&properties, "children-display") == "submenu",
+            toggle_state: properties
+                .get("toggle-state")
+                .and_then(|value| i32::try_from(value).ok()),
+        });
+    }
+    Some(rows)
+}
+
+fn load_tray_menu_page(
+    service: String,
+    menu_path: String,
+    parent: i32,
+    sender: channel::Sender<TrayMenuEvent>,
+) {
+    thread::spawn(move || {
+        let rows = (|| {
+            let connection = zbus::blocking::Connection::session().ok()?;
+            let menu = zbus::blocking::Proxy::new(
+                &connection,
+                service.as_str(),
+                menu_path.as_str(),
+                "com.canonical.dbusmenu",
+            )
+            .ok()?;
+            let _ = menu.call::<_, _, bool>("AboutToShow", &(parent,));
+            let properties = vec![
+                "label",
+                "type",
+                "enabled",
+                "visible",
+                "toggle-type",
+                "toggle-state",
+                "children-display",
+            ];
+            let (_, layout) = menu
+                .call::<_, _, (u32, RawTrayMenuLayout)>("GetLayout", &(parent, 1i32, properties))
+                .ok()?;
+            parse_tray_menu_layout(layout, parent)
+        })();
+        let _ = sender.send(TrayMenuEvent::Loaded {
+            service,
+            menu_path,
+            parent,
+            rows,
+        });
+    });
+}
+
+fn activate_tray_menu_entry(service: String, menu_path: String, id: i32) {
+    thread::spawn(move || {
+        let Ok(connection) = zbus::blocking::Connection::session() else {
+            return;
+        };
+        let Ok(menu) = zbus::blocking::Proxy::new(
+            &connection,
+            service.as_str(),
+            menu_path.as_str(),
+            "com.canonical.dbusmenu",
+        ) else {
+            return;
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as u32);
+        let _ = menu.call::<_, _, ()>(
+            "Event",
+            &(id, "clicked", zbus::zvariant::Value::I32(0), timestamp),
+        );
+    });
 }
 
 struct NotificationServer {
@@ -595,6 +766,8 @@ struct App {
     wallpapers: BTreeMap<String, image::RgbaImage>,
     video_frame: Option<image::RgbaImage>,
     video_sender: channel::SyncSender<image::RgbaImage>,
+    video_recycler: mpsc::SyncSender<Vec<u8>>,
+    video_recycled: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     video_generation: Arc<AtomicU64>,
     video_suspended: bool,
     font: Option<FontArc>,
@@ -621,6 +794,8 @@ struct App {
     media: MediaState,
     bluetooth: BluetoothState,
     tray: Vec<TrayItem>,
+    tray_menu: Option<TrayMenuState>,
+    tray_menu_events: Option<channel::Sender<TrayMenuEvent>>,
     exit: bool,
 }
 
@@ -658,8 +833,8 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
     let font_config = (mode != Mode::Wallpaper).then(|| config.clone());
     let (notification_signals, notification_signal_receiver) = mpsc::channel();
     let (video_sender, video_receiver) = channel::sync_channel::<image::RgbaImage>(1);
-    let (desktop_entries_sender, desktop_entries_receiver) =
-        channel::channel::<Vec<DesktopEntry>>();
+    let (video_recycler, video_recycled) = mpsc::sync_channel::<Vec<u8>>(2);
+    let video_recycled = Arc::new(Mutex::new(video_recycled));
     let (font_sender, font_receiver) = channel::channel::<Option<FontArc>>();
     let video_generation = Arc::new(AtomicU64::new(0));
     let do_not_disturb = Arc::new(AtomicBool::new(config.shell.do_not_disturb));
@@ -676,6 +851,8 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
         wallpapers,
         video_frame: None,
         video_sender: video_sender.clone(),
+        video_recycler,
+        video_recycled: video_recycled.clone(),
         video_generation: video_generation.clone(),
         video_suspended: false,
         font: None,
@@ -710,26 +887,30 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
             powered: None,
         },
         tray: Vec::new(),
+        tray_menu: None,
+        tray_menu_events: None,
         exit: false,
     };
 
-    handle
-        .insert_source(desktop_entries_receiver, |event, _, app| {
-            if let channel::Event::Msg(entries) = event {
-                app.apps = entries;
-                app.apps_loaded = true;
-                app.launcher_selected = app
-                    .launcher_selected
-                    .min(app.launcher_items().len().saturating_sub(1));
-                if app.mode == Mode::Launcher {
+    if mode == Mode::Launcher {
+        let (desktop_entries_sender, desktop_entries_receiver) =
+            channel::channel::<Vec<DesktopEntry>>();
+        handle
+            .insert_source(desktop_entries_receiver, |event, _, app| {
+                if let channel::Event::Msg(entries) = event {
+                    app.apps = entries;
+                    app.apps_loaded = true;
+                    app.launcher_selected = app
+                        .launcher_selected
+                        .min(app.launcher_items().len().saturating_sub(1));
                     app.redraw_all(&qh);
                 }
-            }
-        })
-        .map_err(|error| error.to_string())?;
-    thread::spawn(move || {
-        let _ = desktop_entries_sender.send(load_desktop_entries());
-    });
+            })
+            .map_err(|error| error.to_string())?;
+        thread::spawn(move || {
+            let _ = desktop_entries_sender.send(load_desktop_entries());
+        });
+    }
     handle
         .insert_source(font_receiver, |event, _, app| {
             if let channel::Event::Msg(font) = event {
@@ -754,6 +935,11 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                 channel::Event::Msg(snapshot) => {
                     if app.snapshot != snapshot {
                         let config_error_changed = app.snapshot.error != snapshot.error;
+                        let visible_state_changed = match app.mode {
+                            Mode::Bar => bar_snapshot_changed(&app.snapshot, &snapshot),
+                            Mode::Wallpaper => false,
+                            Mode::Launcher => false,
+                        };
                         app.snapshot = snapshot;
                         if config_error_changed {
                             if let Some(error) = app.snapshot.error.as_deref() {
@@ -770,7 +956,9 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                             }
                         }
                         app.update_video_wallpaper_playback();
-                        app.redraw_all(&qh);
+                        if visible_state_changed {
+                            app.redraw_all(&qh);
+                        }
                     }
                 }
                 channel::Event::Closed => {}
@@ -780,6 +968,49 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
     }
 
     if mode == Mode::Bar {
+        let (tray_menu_sender, tray_menu_receiver) = channel::channel::<TrayMenuEvent>();
+        app.tray_menu_events = Some(tray_menu_sender);
+        handle
+            .insert_source(tray_menu_receiver, |event, _, app| {
+                let channel::Event::Msg(TrayMenuEvent::Loaded {
+                    service,
+                    menu_path,
+                    parent,
+                    rows,
+                }) = event
+                else {
+                    return;
+                };
+                let Some(current) = app.tray_menu.as_mut() else {
+                    return;
+                };
+                if current.service != service
+                    || current.menu_path != menu_path
+                    || current.parents.last().copied() != Some(parent)
+                {
+                    return;
+                }
+                if let Some(rows) = rows {
+                    current.rows = rows;
+                    app.show_tray_menu_surface(&qh);
+                } else {
+                    let fallback = (
+                        current.service.clone(),
+                        current.path.clone(),
+                        current.action_position,
+                    );
+                    app.close_tray_menu(&qh);
+                    App::activate_tray_item(
+                        fallback.0,
+                        fallback.1,
+                        "ContextMenu",
+                        fallback.2.0,
+                        fallback.2.1,
+                    );
+                }
+            })
+            .map_err(|error| error.to_string())?;
+
         let (sender, receiver) = channel::channel::<NotificationEvent>();
         app.notification_events = Some(sender.clone());
         let notification_timer_handle = handle.clone();
@@ -996,7 +1227,9 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
         handle
             .insert_source(video_receiver, |event, _, app| {
                 if let channel::Event::Msg(frame) = event {
-                    app.video_frame = Some(frame);
+                    if let Some(previous) = app.video_frame.replace(frame) {
+                        let _ = app.video_recycler.try_send(previous.into_raw());
+                    }
                     app.redraw_all(&qh);
                 }
             })
@@ -1006,6 +1239,7 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                 app.config.wallpaper.path.clone(),
                 app.config.wallpaper.fps,
                 video_sender,
+                video_recycled,
                 video_generation,
                 0,
             );
@@ -1826,6 +2060,7 @@ fn spawn_video_wallpaper(
     path: String,
     fps: u32,
     sender: channel::SyncSender<image::RgbaImage>,
+    recycled: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     generation: Arc<AtomicU64>,
     expected_generation: u64,
 ) {
@@ -1866,8 +2101,13 @@ fn spawn_video_wallpaper(
             .args([
                 "-loglevel",
                 "error",
+                "-filter_threads",
+                "1",
+                "-re",
                 "-stream_loop",
                 "-1",
+                "-threads",
+                "2",
                 "-i",
                 &path,
                 "-vf",
@@ -1876,6 +2116,8 @@ fn spawn_video_wallpaper(
                 "rawvideo",
                 "-pix_fmt",
                 "rgba",
+                "-threads",
+                "1",
                 "-",
             ])
             .stdout(std::process::Stdio::piped())
@@ -1892,7 +2134,12 @@ fn spawn_video_wallpaper(
                 let _ = child.wait();
                 return;
             }
-            let mut pixels = vec![0; frame_size];
+            let mut pixels = recycled
+                .lock()
+                .ok()
+                .and_then(|receiver| receiver.try_recv().ok())
+                .filter(|pixels| pixels.len() == frame_size)
+                .unwrap_or_else(|| vec![0; frame_size]);
             if stdout.read_exact(&mut pixels).is_err() {
                 let _ = child.wait();
                 return;
@@ -1902,11 +2149,11 @@ fn spawn_video_wallpaper(
                 let _ = child.wait();
                 return;
             }
-            match sender.try_send(
+            match sender.send(
                 image::RgbaImage::from_raw(width, height, pixels).expect("validated frame size"),
             ) {
-                Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Ok(()) => {}
+                Err(std::sync::mpsc::SendError(_)) => {
                     let _ = child.kill();
                     let _ = child.wait();
                     return;
@@ -2144,7 +2391,7 @@ impl App {
         )
     }
 
-    fn tray_item_at(&self, surface: &wl_surface::WlSurface, x: f64) -> Option<(String, String)> {
+    fn tray_item_at(&self, surface: &wl_surface::WlSurface, x: f64) -> Option<TrayItem> {
         let surface = self
             .surfaces
             .iter()
@@ -2212,7 +2459,7 @@ impl App {
                     .filter(|item| item.has_visible_icon())
                     .take(6)
                     .nth(icon_index)
-                    .map(|item| (item.service.clone(), item.path.clone()));
+                    .cloned();
             }
             right = left.saturating_sub(16);
         }
@@ -2350,6 +2597,161 @@ impl App {
         });
     }
 
+    fn request_tray_menu(
+        &mut self,
+        item: TrayItem,
+        surface: &wl_surface::WlSurface,
+        local_x: f64,
+        action_position: (i32, i32),
+        qh: &QueueHandle<Self>,
+    ) -> bool {
+        let Some(menu_path) = item.menu_path.clone() else {
+            return false;
+        };
+        let Some(output) = self
+            .surfaces
+            .iter()
+            .find(|candidate| candidate.layer.wl_surface() == surface)
+            .and_then(|surface| surface.output.clone())
+        else {
+            return false;
+        };
+        let state = TrayMenuState {
+            service: item.service,
+            path: item.path,
+            menu_path,
+            output,
+            local_x: local_x.round().clamp(0.0, i32::MAX as f64) as i32,
+            action_position,
+            parents: vec![0],
+            rows: Vec::new(),
+        };
+        let Some(sender) = self.tray_menu_events.clone() else {
+            return false;
+        };
+        self.tray_menu = Some(state.clone());
+        self.ensure_tray_menu_surface(qh, state.output.clone());
+        load_tray_menu_page(state.service, state.menu_path, 0, sender);
+        true
+    }
+
+    fn ensure_tray_menu_surface(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        if self.surfaces.iter().any(|surface| {
+            surface.kind == SurfaceKind::TrayMenu && surface.output.as_ref() == Some(&output)
+        }) {
+            return;
+        }
+        self.add_kind_surface(qh, SurfaceKind::TrayMenu, Some(output));
+    }
+
+    fn show_tray_menu_surface(&mut self, qh: &QueueHandle<Self>) {
+        const WIDTH: u32 = 280;
+        const ROW_HEIGHT: u32 = 28;
+        let Some(menu) = self.tray_menu.as_ref() else {
+            return;
+        };
+        let rows = menu.rows.len() + usize::from(menu.parents.len() > 1);
+        let height = (rows.max(1) as u32 * ROW_HEIGHT + 12).min(480);
+        let output_width = self
+            .output_state
+            .info(&menu.output)
+            .and_then(|info| info.logical_size.map(|size| size.0))
+            .unwrap_or(WIDTH as i32)
+            .max(WIDTH as i32);
+        let left = menu
+            .local_x
+            .saturating_sub(WIDTH as i32 - 16)
+            .clamp(0, output_width.saturating_sub(WIDTH as i32));
+        let bottom = self.config.shell.position == "bottom";
+        let Some(index) = self.surfaces.iter().position(|surface| {
+            surface.kind == SurfaceKind::TrayMenu && surface.output.as_ref() == Some(&menu.output)
+        }) else {
+            return;
+        };
+        let surface = &self.surfaces[index];
+        surface
+            .layer
+            .set_anchor((if bottom { Anchor::BOTTOM } else { Anchor::TOP }) | Anchor::LEFT);
+        surface.layer.set_margin(
+            if bottom { 0 } else { self.config.shell.height },
+            0,
+            if bottom { self.config.shell.height } else { 0 },
+            left,
+        );
+        surface.layer.set_size(WIDTH, height);
+        surface.layer.commit();
+        if surface.configured {
+            self.draw(index, qh);
+        }
+    }
+
+    fn close_tray_menu(&mut self, qh: &QueueHandle<Self>) {
+        self.tray_menu = None;
+        let indices = self
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, surface)| (surface.kind == SurfaceKind::TrayMenu).then_some(index))
+            .collect::<Vec<_>>();
+        for index in indices {
+            let surface = &self.surfaces[index];
+            surface.layer.set_size(1, 1);
+            surface.layer.set_margin(0, 0, 0, 0);
+            surface.layer.commit();
+            if surface.configured {
+                self.draw(index, qh);
+            }
+        }
+    }
+
+    fn click_tray_menu(&mut self, y: f64, button: u32, qh: &QueueHandle<Self>) {
+        if button != 0x110 {
+            self.close_tray_menu(qh);
+            return;
+        }
+        const ROW_HEIGHT: u32 = 28;
+        let Some(menu) = self.tray_menu.as_mut() else {
+            return;
+        };
+        let row = (y.max(0.0) as u32 / ROW_HEIGHT) as usize;
+        if menu.parents.len() > 1 && row == 0 {
+            menu.parents.pop();
+            menu.rows.clear();
+            let parent = *menu.parents.last().unwrap_or(&0);
+            if let Some(sender) = self.tray_menu_events.clone() {
+                load_tray_menu_page(menu.service.clone(), menu.menu_path.clone(), parent, sender);
+            }
+            return;
+        }
+        let offset = usize::from(menu.parents.len() > 1);
+        let Some(item) = row
+            .checked_sub(offset)
+            .and_then(|row| menu.rows.get(row))
+            .cloned()
+        else {
+            self.close_tray_menu(qh);
+            return;
+        };
+        if item.separator || !item.enabled {
+            return;
+        }
+        if item.submenu && menu.parents.len() < 16 {
+            menu.parents.push(item.id);
+            menu.rows.clear();
+            if let Some(sender) = self.tray_menu_events.clone() {
+                load_tray_menu_page(
+                    menu.service.clone(),
+                    menu.menu_path.clone(),
+                    item.id,
+                    sender,
+                );
+            }
+        } else {
+            activate_tray_menu_entry(menu.service.clone(), menu.menu_path.clone(), item.id);
+            self.close_tray_menu(qh);
+        }
+    }
+
     fn scroll_tray_item(service: String, path: String, delta: i32, axis: &'static str) {
         if delta == 0 {
             return;
@@ -2403,20 +2805,43 @@ impl App {
         button: u32,
         qh: &QueueHandle<Self>,
     ) {
+        if self.tray_menu.is_some() {
+            self.close_tray_menu(qh);
+        }
         if x < 12.0 {
             if button == 0x110 {
                 Self::run_command("launcher".into());
             }
             return;
         }
-        if let Some((service, path)) = self.tray_item_at(surface, x) {
+        if let Some(item) = self.tray_item_at(surface, x) {
             let (action_x, action_y) = self.tray_action_position(surface, x, y);
             match button {
-                0x110 => Self::activate_tray_item(service, path, "Activate", action_x, action_y),
-                0x111 => Self::activate_tray_item(service, path, "ContextMenu", action_x, action_y),
-                0x112 => {
-                    Self::activate_tray_item(service, path, "SecondaryActivate", action_x, action_y)
+                0x110 => Self::activate_tray_item(
+                    item.service,
+                    item.path,
+                    "Activate",
+                    action_x,
+                    action_y,
+                ),
+                0x111 => {
+                    if !self.request_tray_menu(item.clone(), surface, x, (action_x, action_y), qh) {
+                        Self::activate_tray_item(
+                            item.service,
+                            item.path,
+                            "ContextMenu",
+                            action_x,
+                            action_y,
+                        );
+                    }
                 }
+                0x112 => Self::activate_tray_item(
+                    item.service,
+                    item.path,
+                    "SecondaryActivate",
+                    action_x,
+                    action_y,
+                ),
                 _ => {}
             }
             return;
@@ -2469,8 +2894,8 @@ impl App {
         if steps == 0 {
             return;
         }
-        if let Some((service, path)) = self.tray_item_at(surface, x) {
-            Self::scroll_tray_item(service, path, steps, "vertical");
+        if let Some(item) = self.tray_item_at(surface, x) {
+            Self::scroll_tray_item(item.service, item.path, steps, "vertical");
             return;
         }
         if self.bar_module_at(surface, x) != Some("audio") {
@@ -2589,6 +3014,7 @@ impl App {
                 self.config.wallpaper.path.clone(),
                 self.config.wallpaper.fps,
                 self.video_sender.clone(),
+                self.video_recycled.clone(),
                 self.video_generation.clone(),
                 generation,
             );
@@ -2610,7 +3036,9 @@ impl App {
         }
         if wallpaper_changed && self.mode == Mode::Wallpaper {
             self.wallpapers = load_wallpapers(&self.config);
-            self.video_frame = None;
+            if let Some(previous) = self.video_frame.take() {
+                let _ = self.video_recycler.try_send(previous.into_raw());
+            }
             let generation = self.video_generation.fetch_add(1, Ordering::Relaxed) + 1;
             if self.mode == Mode::Wallpaper
                 && self.config.wallpaper.kind == "video"
@@ -2620,6 +3048,7 @@ impl App {
                     self.config.wallpaper.path.clone(),
                     self.config.wallpaper.fps,
                     self.video_sender.clone(),
+                    self.video_recycled.clone(),
                     self.video_generation.clone(),
                     generation,
                 );
@@ -2629,7 +3058,7 @@ impl App {
             self.font = load_font(&self.config);
         }
         for surface in &self.surfaces {
-            if self.mode == Mode::Bar {
+            if surface.kind == SurfaceKind::Bar {
                 let anchor = if self.config.shell.position == "bottom" {
                     Anchor::BOTTOM
                 } else {
@@ -2684,6 +3113,7 @@ impl App {
             SurfaceKind::Wallpaper => (Layer::Background, "wm-wallpaper"),
             SurfaceKind::Launcher => (Layer::Overlay, "wm-launcher"),
             SurfaceKind::Notifications => (Layer::Overlay, "wm-notifications"),
+            SurfaceKind::TrayMenu => (Layer::Overlay, "wm-tray-menu"),
         };
         let layer = self.layer_shell.create_layer_surface(
             qh,
@@ -2724,6 +3154,12 @@ impl App {
                 layer.set_size(380, 320);
                 layer.set_keyboard_interactivity(KeyboardInteractivity::None);
             }
+            SurfaceKind::TrayMenu => {
+                layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+                layer.set_size(1, 1);
+                layer.set_exclusive_zone(-1);
+                layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+            }
         }
         layer.commit();
         self.surfaces.push(Surface {
@@ -2734,6 +3170,8 @@ impl App {
             width: 1,
             height: 1,
             configured: false,
+            frame_pending: false,
+            redraw_requested: false,
             output,
         });
     }
@@ -2741,12 +3179,20 @@ impl App {
     fn redraw_all(&mut self, qh: &QueueHandle<Self>) {
         for index in 0..self.surfaces.len() {
             if self.surfaces[index].configured {
-                self.draw(index, qh);
+                if self.surfaces[index].frame_pending {
+                    self.surfaces[index].redraw_requested = true;
+                } else {
+                    self.draw(index, qh);
+                }
             }
         }
     }
 
     fn draw(&mut self, index: usize, qh: &QueueHandle<Self>) {
+        if self.surfaces[index].frame_pending {
+            self.surfaces[index].redraw_requested = true;
+            return;
+        }
         let colors = Colors::from_config(&self.config);
         let title = self
             .snapshot
@@ -2837,17 +3283,21 @@ impl App {
             .take(3)
             .cloned()
             .collect::<Vec<_>>();
+        let tray_menu = (kind == SurfaceKind::TrayMenu)
+            .then(|| self.tray_menu.clone())
+            .flatten();
+        let wallpaper_output_name = self.surfaces[index]
+            .output
+            .as_ref()
+            .and_then(|output| self.output_state.info(output))
+            .and_then(|info| info.name);
         let wallpaper = if self.config.wallpaper.kind == "video" {
-            self.video_frame.clone()
+            self.video_frame.as_ref()
         } else {
-            self.surfaces[index]
-                .output
+            wallpaper_output_name
                 .as_ref()
-                .and_then(|output| self.output_state.info(output))
-                .and_then(|info| info.name)
-                .and_then(|name| self.wallpapers.get(&name))
+                .and_then(|name| self.wallpapers.get(name))
                 .or_else(|| self.wallpapers.get(""))
-                .cloned()
         };
         let surface = &mut self.surfaces[index];
         let width = surface.width;
@@ -2892,7 +3342,7 @@ impl App {
                 width,
                 height,
                 colors,
-                wallpaper.as_ref(),
+                wallpaper,
                 &self.config.wallpaper.fit,
             ),
             SurfaceKind::Launcher => draw_launcher(
@@ -2920,17 +3370,28 @@ impl App {
                 self.notification_offset,
                 self.do_not_disturb.load(Ordering::Relaxed),
             ),
+            SurfaceKind::TrayMenu => draw_tray_menu(
+                canvas,
+                width,
+                height,
+                colors,
+                font.as_ref(),
+                font_size,
+                tray_menu.as_ref(),
+            ),
         }
         surface
             .layer
             .wl_surface()
             .damage_buffer(0, 0, width as i32, height as i32);
-        surface
-            .layer
-            .wl_surface()
-            .frame(qh, surface.layer.wl_surface().clone());
         if buffer.attach_to(surface.layer.wl_surface()).is_ok() {
+            surface
+                .layer
+                .wl_surface()
+                .frame(qh, surface.layer.wl_surface().clone());
             surface.layer.commit();
+            surface.frame_pending = true;
+            surface.redraw_requested = false;
         }
     }
 }
@@ -3086,6 +3547,31 @@ fn video_wallpaper_is_suspended(
     on_battery: bool,
 ) -> bool {
     snapshot.windows.iter().any(|window| window.fullscreen) || (pause_on_battery && on_battery)
+}
+
+fn bar_snapshot_changed(previous: &Snapshot, current: &Snapshot) -> bool {
+    if focused_bar_identity(previous) != focused_bar_identity(current)
+        || previous.outputs.len() != current.outputs.len()
+    {
+        return true;
+    }
+    previous.outputs.iter().any(|old| {
+        current
+            .outputs
+            .iter()
+            .find(|new| new.name == old.name)
+            .is_none_or(|new| new.workspace != old.workspace || new.active != old.active)
+    })
+}
+
+fn focused_bar_identity(snapshot: &Snapshot) -> Option<(u64, &str, &str)> {
+    snapshot.focused.and_then(|id| {
+        snapshot
+            .windows
+            .iter()
+            .find(|window| window.id == id)
+            .map(|window| (id, window.title.as_str(), window.app_id.as_str()))
+    })
 }
 
 fn battery_state() -> (Option<String>, bool) {
@@ -3471,7 +3957,7 @@ fn draw_launcher(
                 panel_w.saturating_sub(48),
                 24,
                 6,
-                0x334f_8cff,
+                0x330f_1c33,
             );
         }
         text(
@@ -3590,7 +4076,7 @@ fn draw_notifications(
                 action_width,
                 18,
                 5,
-                0x3388_92a5,
+                0x331b_1d21,
             );
             text(
                 canvas,
@@ -3613,9 +4099,86 @@ fn draw_notifications(
                 y + 60,
                 width.saturating_sub(36),
                 1,
-                0x3388_92a5,
+                0x331b_1d21,
             );
         }
+    }
+}
+
+fn draw_tray_menu(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    colors: Colors,
+    font: Option<&FontArc>,
+    font_size: u32,
+    menu: Option<&TrayMenuState>,
+) {
+    fill(canvas, 0);
+    let Some(menu) = menu else {
+        return;
+    };
+    rounded_rect(canvas, width, 0, 0, width, height, 10, colors.background);
+    const ROW_HEIGHT: u32 = 28;
+    let mut row_index = 0u32;
+    if menu.parents.len() > 1 {
+        text(
+            canvas,
+            width,
+            font,
+            14,
+            20,
+            "‹ Back",
+            font_size,
+            colors.foreground,
+            width.saturating_sub(28),
+        );
+        row_index += 1;
+    }
+    for row in &menu.rows {
+        let top = row_index * ROW_HEIGHT;
+        if top + ROW_HEIGHT > height {
+            break;
+        }
+        if row.separator {
+            rect(
+                canvas,
+                width,
+                12,
+                top + ROW_HEIGHT / 2,
+                width.saturating_sub(24),
+                1,
+                colors.muted,
+            );
+        } else {
+            let color = if row.enabled {
+                colors.foreground
+            } else {
+                colors.muted
+            };
+            let marker = match row.toggle_state {
+                Some(1) => "✓ ",
+                Some(_) => "  ",
+                None => "",
+            };
+            let label = format!(
+                "{marker}{}{}",
+                row.label,
+                if row.submenu { "  ›" } else { "" }
+            );
+            text(
+                canvas,
+                width,
+                font,
+                14,
+                top + 20,
+                &label,
+                font_size,
+                color,
+                width.saturating_sub(28),
+            );
+        }
+        row_index += 1;
     }
 }
 
@@ -3630,7 +4193,7 @@ fn rect(canvas: &mut [u8], width: u32, x: u32, y: u32, w: u32, h: u32, color: u3
     for py in y.min(height)..y.saturating_add(h).min(height) {
         for px in x.min(width)..x.saturating_add(w).min(width) {
             let index = ((py * width + px) * 4) as usize;
-            canvas[index..index + 4].copy_from_slice(&color.to_le_bytes());
+            paint_premultiplied_pixel(canvas, index, color, u8::MAX);
         }
     }
 }
@@ -3677,13 +4240,17 @@ fn rounded_rect(
             let coverage = ((radius as f32 + 0.5 - distance).clamp(0.0, 1.0) * 255.0).round() as u8;
             if coverage != 0 {
                 let index = ((py * width + px) * 4) as usize;
-                if coverage == u8::MAX {
-                    canvas[index..index + 4].copy_from_slice(&color.to_le_bytes());
-                } else {
-                    blend_premultiplied_pixel(canvas, index, color, coverage);
-                }
+                paint_premultiplied_pixel(canvas, index, color, coverage);
             }
         }
+    }
+}
+
+fn paint_premultiplied_pixel(canvas: &mut [u8], index: usize, color: u32, coverage: u8) {
+    if coverage == u8::MAX && color >> 24 == 0xff {
+        canvas[index..index + 4].copy_from_slice(&color.to_le_bytes());
+    } else {
+        blend_premultiplied_pixel(canvas, index, color, coverage);
     }
 }
 
@@ -3950,7 +4517,26 @@ impl CompositorHandler for App {
         _: wl_output::Transform,
     ) {
     }
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        let Some(index) = self
+            .surfaces
+            .iter()
+            .position(|candidate| candidate.layer.wl_surface() == surface)
+        else {
+            return;
+        };
+        self.surfaces[index].frame_pending = false;
+        if self.surfaces[index].redraw_requested {
+            self.surfaces[index].redraw_requested = false;
+            self.draw(index, qh);
+        }
+    }
     fn surface_enter(
         &mut self,
         _: &Connection,
@@ -4017,6 +4603,7 @@ impl LayerShellHandler for App {
                 SurfaceKind::Wallpaper => 1,
                 SurfaceKind::Launcher => 480,
                 SurfaceKind::Notifications => 320,
+                SurfaceKind::TrayMenu => 1,
             };
             surface.height =
                 NonZeroU32::new(configure.new_size.1).map_or(default_height, NonZeroU32::get);
@@ -4204,6 +4791,9 @@ impl PointerHandler for App {
                     Some(SurfaceKind::Notifications) => {
                         self.click_notification(event.position.0, event.position.1, button, qh);
                     }
+                    Some(SurfaceKind::TrayMenu) => {
+                        self.click_tray_menu(event.position.1, button, qh);
+                    }
                     _ => {}
                 }
             }
@@ -4218,10 +4808,13 @@ impl PointerHandler for App {
                     self.scroll_bar(&event.surface, event.position.0, steps);
                     let horizontal_steps = scroll_steps(horizontal);
                     if horizontal_steps != 0 {
-                        if let Some((service, path)) =
-                            self.tray_item_at(&event.surface, event.position.0)
-                        {
-                            Self::scroll_tray_item(service, path, horizontal_steps, "horizontal");
+                        if let Some(item) = self.tray_item_at(&event.surface, event.position.0) {
+                            Self::scroll_tray_item(
+                                item.service,
+                                item.path,
+                                horizontal_steps,
+                                "horizontal",
+                            );
                         }
                     }
                 }
@@ -4346,6 +4939,51 @@ mod tests {
     }
 
     #[test]
+    fn native_tray_menu_parses_visible_actions_and_submenus() {
+        use zbus::zvariant::{OwnedValue, Str, Structure};
+
+        let child = |id, properties: HashMap<String, OwnedValue>| {
+            OwnedValue::try_from(Structure::from((id, properties, Vec::<OwnedValue>::new())))
+                .unwrap()
+        };
+        let rows = parse_tray_menu_layout(
+            (
+                0,
+                HashMap::new(),
+                vec![
+                    child(
+                        1,
+                        HashMap::from([
+                            ("label".into(), OwnedValue::from(Str::from("_Open"))),
+                            ("enabled".into(), OwnedValue::from(true)),
+                        ]),
+                    ),
+                    child(
+                        2,
+                        HashMap::from([
+                            ("label".into(), OwnedValue::from(Str::from("More"))),
+                            (
+                                "children-display".into(),
+                                OwnedValue::from(Str::from("submenu")),
+                            ),
+                        ]),
+                    ),
+                    child(
+                        3,
+                        HashMap::from([("visible".into(), OwnedValue::from(false))]),
+                    ),
+                ],
+            ),
+            0,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "_Open");
+        assert!(rows[0].enabled);
+        assert!(rows[1].submenu);
+    }
+
+    #[test]
     fn fullscreen_windows_suspend_video_wallpaper_decoding() {
         let mut snapshot = Snapshot::default();
         assert!(!video_wallpaper_is_suspended(&snapshot, true, false));
@@ -4365,6 +5003,54 @@ mod tests {
             surface_size: None,
         });
         assert!(video_wallpaper_is_suspended(&snapshot, false, false));
+    }
+
+    #[test]
+    fn bar_snapshot_ignores_animation_only_geometry_and_opacity() {
+        let mut previous = Snapshot::default();
+        previous.focused = Some(1);
+        previous.windows.push(wm_core::WindowInfo {
+            id: 1,
+            title: "Terminal".into(),
+            app_id: "terminal".into(),
+            workspace: 1,
+            output: "TEST-1".into(),
+            floating: false,
+            fullscreen: false,
+            scratchpad: false,
+            geometry: Some(wm_core::Rect {
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 600,
+            }),
+            opacity: 1.0,
+            surface_size: None,
+        });
+        previous.outputs.push(wm_core::OutputInfo {
+            name: "TEST-1".into(),
+            workspace: 1,
+            geometry: wm_core::Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+            wallpaper_visible: true,
+            active: true,
+        });
+        let mut animated = previous.clone();
+        animated.windows[0].geometry.as_mut().unwrap().x = 64;
+        animated.windows[0].opacity = 0.5;
+        assert!(!bar_snapshot_changed(&previous, &animated));
+
+        let mut retitled = animated.clone();
+        retitled.windows[0].title = "Editor".into();
+        assert!(bar_snapshot_changed(&previous, &retitled));
+
+        let mut switched = animated;
+        switched.outputs[0].workspace = 2;
+        assert!(bar_snapshot_changed(&previous, &switched));
     }
 
     #[test]
@@ -4635,5 +5321,12 @@ mod tests {
         assert!((1..255).contains(&edge_alpha));
         assert_eq!(pixel(5, 0), 0xff11_2233);
         assert_eq!(pixel(0, 0), 0);
+    }
+
+    #[test]
+    fn translucent_rect_composites_without_punching_through_its_parent() {
+        let mut canvas = 0xff00_00ff_u32.to_le_bytes().to_vec();
+        rect(&mut canvas, 1, 0, 0, 1, 1, 0x3300_0000);
+        assert_eq!(u32::from_le_bytes(canvas.try_into().unwrap()), 0xff00_00cc);
     }
 }

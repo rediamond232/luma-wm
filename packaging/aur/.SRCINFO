@@ -1,0 +1,32 @@
+pkgbase = luma-wm-bin
+	pkgdesc = Wayland tiling compositor with a native desktop shell
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/rediamond232/luma-wm
+	arch = x86_64
+	license = MIT
+	depends = dbus
+	depends = glibc
+	depends = libdisplay-info
+	depends = libgcc
+	depends = libinput
+	depends = libxkbcommon
+	depends = mesa
+	depends = pixman
+	depends = seatd
+	depends = systemd-libs
+	depends = wayland
+	depends = xorg-xwayland
+	optdepends = ffmpeg: video wallpapers
+	optdepends = grim: screenshots
+	optdepends = kitty: default terminal command
+	optdepends = swaylock: session locking
+	optdepends = wl-clipboard: copying screenshots to the clipboard
+	optdepends = xdg-desktop-portal-wlr: screen sharing and capture portals
+	provides = luma-wm=0.1.0
+	conflicts = luma-wm
+	conflicts = luma-wm-git
+	source_x86_64 = luma-wm-bin-0.1.0.tar.zst::https://github.com/rediamond232/luma-wm/releases/download/v0.1.0/luma-wm-0.1.0-x86_64.tar.zst
+	sha256sums_x86_64 = 6fa324c0d5a64dbf2e1bd7b5c59781b7319cd9a63c52d5d3c6881b9315d27c2c
+
+pkgname = luma-wm-bin

@@ -4,7 +4,7 @@ edition = "2024"
 license = "MIT"
 name = "wm-compositor"
 publish = false
-version = "0.0.1"
+version.workspace = true
 
 [dependencies]
 wm-core = { path = "../core" }
