@@ -130,6 +130,9 @@ pub struct EffectElement {
     pub blur: Option<GlesTexProgram>,
     pub blur_strength: f32,
     pub blur_alpha: f32,
+    /// Compositor opacity for layer-shell GUI surfaces. Managed windows carry
+    /// their own alpha in `WindowRenderElement`, so they leave this at one.
+    pub opacity: f32,
     pub backdrop: Option<std::sync::Arc<std::sync::Mutex<Option<GlesTexture>>>>,
     pub frozen_backdrop: bool,
     pub geometry_override: Option<Rectangle<i32, Physical>>,
@@ -167,6 +170,11 @@ impl Element for EffectElement {
         if self.geometry_override.is_some() {
             return OpaqueRegions::default();
         }
+        // The compositor blends this element with what is already on the
+        // output. It consequently cannot occlude anything beneath it.
+        if self.opacity < 1.0 {
+            return OpaqueRegions::default();
+        }
         if self.radius > 0.0 {
             let origin = self.geometry(scale).loc;
             let interior = rounded_interior(self.rect, self.radius);
@@ -185,7 +193,7 @@ impl Element for EffectElement {
         }
     }
     fn alpha(&self) -> f32 {
-        self.inner.alpha()
+        self.inner.alpha() * self.opacity
     }
     fn is_framebuffer_effect(&self) -> bool {
         self.blur.is_some() && !self.frozen_backdrop
@@ -313,7 +321,7 @@ impl EffectElement {
                     damage,
                     &[],
                     Transform::Normal,
-                    self.blur_alpha,
+                    self.blur_alpha * self.opacity,
                     Some(program),
                     &[
                         Uniform::new(
@@ -329,12 +337,13 @@ impl EffectElement {
                 )?;
             }
         }
-        if self.radius > 0.0 {
+        if self.radius > 0.0 || self.opacity < 1.0 {
             frame.override_default_tex_program(
                 self.program.clone(),
                 vec![
                     Uniform::new("wm_rect", self.rect),
                     Uniform::new("wm_radius", self.radius),
+                    Uniform::new("wm_opacity", self.opacity),
                 ],
             );
         }
@@ -544,6 +553,7 @@ pub fn program(renderer: &mut GlesRenderer) -> Result<GlesTexProgram, GlesError>
         &[
             UniformName::new("wm_rect", UniformType::_4f),
             UniformName::new("wm_radius", UniformType::_1f),
+            UniformName::new("wm_opacity", UniformType::_1f),
         ],
     )?;
     let blur = renderer.compile_custom_texture_shader(
@@ -893,16 +903,30 @@ pub fn scene(
     >(renderer, [space], output, 1.0)
     .unwrap_or_default();
     let map = smithay::desktop::layer_map_for_output(output);
-    let blurred: Vec<_> = map
-        .layers()
-        .filter(|l| {
-            matches!(
-                l.namespace(),
-                "wm-bar" | "wm-launcher" | "wm-notifications" | "wm-notification-center"
-            )
-        })
-        .map(|l| Id::from_wayland_resource(l.wl_surface()))
-        .collect();
+    // Layer-shell clients bypass WindowElement, so give visible GUI layers the
+    // same backdrop treatment. Background/bottom layers are deliberately left
+    // alone: they are the scene being blurred, not foreground UI. Luma's own
+    // shell has already baked theme opacity into its buffers; external GUI
+    // processes receive the compositor theme opacity here instead.
+    let mut blurred = Vec::new();
+    let mut layer_opacity = std::collections::HashMap::new();
+    for layer in map.layers().filter(|layer| {
+        matches!(
+            layer.layer(),
+            smithay::wayland::shell::wlr_layer::Layer::Top
+                | smithay::wayland::shell::wlr_layer::Layer::Overlay
+        )
+    }) {
+        blurred.push(Id::from_wayland_resource(layer.wl_surface()));
+        let opacity = if layer.namespace().starts_with("wm-") {
+            1.0
+        } else {
+            theme.opacity
+        };
+        layer.with_surfaces(|surface, _| {
+            layer_opacity.insert(Id::from_wayland_resource(surface), opacity);
+        });
+    }
     let launcher_blurred: Vec<_> = map
         .layers()
         .filter(|layer| layer.namespace() == "wm-launcher")
@@ -953,6 +977,7 @@ pub fn scene(
                 .find(|(ids, _, _, _, _, _)| ids.contains(inner.id()))
                 .map(|(_, _, _, _, opening, _)| *opening)
                 .unwrap_or(1.0);
+            let opacity = layer_opacity.get(inner.id()).copied().unwrap_or(1.0);
             let backdrop = windows
                 .iter()
                 .find(|(_, _, _, id, _, _)| id.as_ref() == Some(inner.id()))
@@ -1004,6 +1029,7 @@ pub fn scene(
                 blur,
                 blur_strength,
                 blur_alpha,
+                opacity,
             }
         })
         .collect();

@@ -10,25 +10,34 @@ provides=("luma-wm=$pkgver")
 conflicts=('luma-wm' 'luma-wm-git')
 depends=(
   'dbus'
+  'ffmpeg'
   'glibc'
+  'gstreamer'
+  'gst-plugins-bad-libs'
+  'gst-plugins-base'
+  'gst-plugins-base-libs'
+  'gst-plugins-good'
   'libdisplay-info'
   'libgcc'
   'libinput'
+  'libglvnd'
+  'libxcb'
   'libxkbcommon'
   'mesa'
   'pixman'
   'seatd'
   'systemd-libs'
+  'util-linux'
   'wayland'
   'xorg-xwayland'
 )
 optdepends=(
-  'ffmpeg: video wallpapers'
   'grim: screenshots'
   'kitty: default terminal command'
   'swaylock: session locking'
   'wl-clipboard: copying screenshots to the clipboard'
   'xdg-desktop-portal-wlr: screen sharing and capture portals'
+  'nvidia-utils: NVIDIA NVENC support for direct OpenGL and Vulkan game capture'
 )
 source_x86_64=(
   "$pkgname-$pkgver.tar.zst::$url/releases/download/v$pkgver/luma-wm-$pkgver-x86_64.tar.zst"
@@ -38,11 +47,36 @@ sha256sums_x86_64=('6fa324c0d5a64dbf2e1bd7b5c59781b7319cd9a63c52d5d3c6881b9315d2
 package() {
   install -Dm755 "$srcdir/luma-wm" "$pkgdir/usr/bin/luma-wm"
   install -Dm755 "$srcdir/wmctl" "$pkgdir/usr/bin/wmctl"
+  install -Dm755 "$srcdir/luma-recorder-engine" "$pkgdir/usr/bin/luma-recorder-engine"
+  install -Dm755 "$srcdir/luma-game-capture-muxer" \
+    "$pkgdir/usr/bin/luma-game-capture-muxer"
   install -Dm755 "$srcdir/wm-shell-sctk" "$pkgdir/usr/bin/wm-shell-sctk"
+  # These direct-capture files intentionally stay together: the graphics-API
+  # launch/injection helpers find the muxer and hook library by sibling path.
+  install -Dm755 "$srcdir/luma-game-capture-gl" \
+    "$pkgdir/usr/bin/luma-game-capture-gl"
+  install -Dm755 "$srcdir/luma-game-record-gl" \
+    "$pkgdir/usr/bin/luma-game-record-gl"
+  install -Dm755 "$srcdir/luma-game-attach" \
+    "$pkgdir/usr/bin/luma-game-attach"
+  install -Dm755 "$srcdir/luma-game-inject" \
+    "$pkgdir/usr/bin/luma-game-inject"
+  install -Dm755 "$srcdir/luma-game-record-vulkan" \
+    "$pkgdir/usr/bin/luma-game-record-vulkan"
+  install -Dm755 "$srcdir/luma-vulkan-capture-receiver" \
+    "$pkgdir/usr/bin/luma-vulkan-capture-receiver"
+  install -Dm755 "$srcdir/luma-vulkan-game-launch" \
+    "$pkgdir/usr/bin/luma-vulkan-game-launch"
+  install -Dm755 "$srcdir/libluma_vk_dmabuf_capture.so" \
+    "$pkgdir/usr/bin/libluma_vk_dmabuf_capture.so"
+  install -Dm755 "$srcdir/libluma-game-capture-gl.so" \
+    "$pkgdir/usr/bin/libluma-game-capture-gl.so"
   install -Dm755 "$srcdir/luma-session" "$pkgdir/usr/bin/luma-session"
   install -Dm644 "$srcdir/default.toml" "$pkgdir/usr/share/luma-wm/default.toml"
   install -Dm644 "$srcdir/luma-wm.desktop" \
     "$pkgdir/usr/share/wayland-sessions/luma-wm.desktop"
+  install -Dm644 "$srcdir/luma-recorder.desktop" \
+    "$pkgdir/usr/share/applications/luma-recorder.desktop"
   install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 "$srcdir/README.md" "$pkgdir/usr/share/doc/luma-wm/README.md"
   install -Dm644 "$srcdir/THIRD_PARTY.md" "$pkgdir/usr/share/doc/luma-wm/THIRD_PARTY.md"

@@ -1,5 +1,29 @@
 # Implementation status
 
+### Injection-free Xwayland game capture (2026-09-12)
+
+- **Xwayland Zero-Copy** now captures at the compositor's surface-commit point.
+  Luma reuses Smithay's already-imported game texture and GPU-copies it into the
+  native recorder's persistent eight-buffer DMA-BUF pool. This removes the old
+  per-frame X Composite pixmap naming, DRI3 export, and EGL import path. The
+  recorder-owned target also prevents Xwayland buffer reuse from corrupting a
+  frame that NVENC is still consuming.
+- The 480 Hz boost timer only releases frame callbacks for this mode. A capture
+  completes only when the selected window commits a new buffer, so timer ticks
+  cannot create repeated captures of an unchanged surface. The compositor still
+  validates the X11 window against its managed-window list, and stopping the
+  native recorder never stops the game.
+- Commit-paced recorder timestamps assign every admitted surface update exactly
+  one CFR slot; wall-clock scheduling jitter no longer creates a skipped real
+  frame followed by a padded duplicate. An isolated nested GLX test captured
+  1,815/1,815 frames with zero duplicates, skips, unfilled slots, or timestamp
+  gaps; source telemetry settled at 479.64 FPS, and the first 480 decoded frame
+  hashes were all distinct. This validates the control, compositor-copy, and
+  mux path at 640x360 output, not full-resolution physical Minecraft/NVIDIA.
+- The superseded external X11 path reached about 438 FPS at 1140x338 in its
+  controlled physical NVIDIA test. That result remains a baseline until the new
+  build is tested with Minecraft at the configured 2560x1440 output size.
+
 ### XWayland display isolation (2026-09-08)
 
 - Smithay's automatic X11 display search starts at `:0`. A missing or stale

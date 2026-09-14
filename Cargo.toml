@@ -1,5 +1,14 @@
 [workspace]
-members = ["crates/core", "crates/compositor", "crates/control", "crates/shell", "crates/shell-sctk"]
+members = [
+    "crates/core",
+    "crates/compositor",
+    "crates/control",
+    "crates/game-capture-protocol",
+    "crates/game-capture-muxer",
+    "crates/recorder",
+    "crates/shell",
+    "crates/shell-sctk",
+]
 resolver = "2"
 
 [workspace.package]

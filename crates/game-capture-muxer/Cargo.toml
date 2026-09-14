@@ -1,0 +1,16 @@
+[package]
+name = "luma-game-capture-muxer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Authenticated H.264 to Hybrid MP4 muxer for Luma direct game capture"
+publish = false
+
+[dependencies]
+gstreamer = { version = "0.24", features = ["v1_24"] }
+libc = "0.2"
+luma-game-capture-protocol = { path = "../game-capture-protocol" }
+
+[[bin]]
+name = "luma-game-capture-muxer"
+path = "src/main.rs"

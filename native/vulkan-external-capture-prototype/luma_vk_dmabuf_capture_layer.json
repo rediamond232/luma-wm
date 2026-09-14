@@ -1,0 +1,11 @@
+{
+  "file_format_version": "1.0.0",
+  "layer": {
+    "name": "VK_LAYER_LUMA_dmabuf_capture_prototype",
+    "type": "GLOBAL",
+    "library_path": "libluma_vk_dmabuf_capture.so",
+    "api_version": "1.2.0",
+    "implementation_version": "1",
+    "description": "Luma opt-in Vulkan DMA-BUF game capture"
+  }
+}

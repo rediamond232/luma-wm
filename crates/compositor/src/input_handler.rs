@@ -285,7 +285,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let state = wl_pointer::ButtonState::from(evt.state());
 
         if wl_pointer::ButtonState::Pressed == state {
-            self.update_keyboard_focus(self.pointer.current_location(), serial);
+            self.update_keyboard_focus(self.pointer.current_location(), serial, true);
             self.begin_mouse_action(button, serial);
         };
         let pointer = self.pointer.clone();
@@ -301,7 +301,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         pointer.frame(self);
     }
 
-    fn update_keyboard_focus(&mut self, location: Point<f64, Logical>, serial: Serial) {
+    /// Update focus from a physical pointer action. Cursor-follow focus keeps the
+    /// current stacking order; explicit presses retain click-to-raise behavior.
+    fn update_keyboard_focus(
+        &mut self,
+        location: Point<f64, Logical>,
+        serial: Serial,
+        raise_window: bool,
+    ) {
         if self.lock.locked {
             return;
         }
@@ -333,10 +340,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         .surface_under(location - output_geo.loc.to_f64(), WindowSurfaceType::ALL)
                     {
                         #[cfg(feature = "xwayland")]
-                        if let Some(surface) = window.0.x11_surface() {
+                        if raise_window && let Some(surface) = window.0.x11_surface() {
                             self.xwm.as_mut().unwrap().raise_window(surface).unwrap();
                         }
-                        keyboard.set_focus(self, Some(window.into()), serial);
+                        let target = window.into();
+                        if keyboard.current_focus().as_ref() != Some(&target) {
+                            keyboard.set_focus(self, Some(target), serial);
+                        }
                         return;
                     }
                 }
@@ -355,7 +365,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                                 - layers.layer_geometry(layer).unwrap().loc.to_f64(),
                             WindowSurfaceType::ALL,
                         ) {
-                            keyboard.set_focus(self, Some(layer.clone().into()), serial);
+                            let target = layer.clone().into();
+                            if keyboard.current_focus().as_ref() != Some(&target) {
+                                keyboard.set_focus(self, Some(target), serial);
+                            }
                             return;
                         }
                     }
@@ -367,13 +380,18 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .element_under(location)
                 .map(|(w, p)| (w.clone(), p))
             {
-                self.space.raise_element(&window, true);
-                self.raise_above_closing(&window);
+                if raise_window {
+                    self.space.raise_element(&window, true);
+                    self.raise_above_closing(&window);
+                }
                 #[cfg(feature = "xwayland")]
-                if let Some(surface) = window.0.x11_surface() {
+                if raise_window && let Some(surface) = window.0.x11_surface() {
                     self.xwm.as_mut().unwrap().raise_window(surface).unwrap();
                 }
-                keyboard.set_focus(self, Some(window.into()), serial);
+                let target = window.into();
+                if keyboard.current_focus().as_ref() != Some(&target) {
+                    keyboard.set_focus(self, Some(target), serial);
+                }
                 return;
             }
 
@@ -393,11 +411,20 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                                 - layers.layer_geometry(layer).unwrap().loc.to_f64(),
                             WindowSurfaceType::ALL,
                         ) {
-                            keyboard.set_focus(self, Some(layer.clone().into()), serial);
+                            let target = layer.clone().into();
+                            if keyboard.current_focus().as_ref() != Some(&target) {
+                                keyboard.set_focus(self, Some(target), serial);
+                            }
                         }
                     }
                 }
             };
+        }
+    }
+
+    fn follow_pointer_focus(&mut self, location: Point<f64, Logical>, serial: Serial) {
+        if self.desktop.config.input.follow_mouse {
+            self.update_keyboard_focus(location, serial, false);
         }
     }
 
@@ -548,7 +575,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         };
 
         let serial = SCOUNTER.next_serial();
-        self.update_keyboard_focus(touch_location, serial);
+        self.update_keyboard_focus(touch_location, serial, true);
 
         let under = self.surface_under(touch_location);
         handle.down(
@@ -776,6 +803,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             },
         );
         pointer.frame(self);
+        self.follow_pointer_focus(pos, serial);
     }
 
     pub fn release_all_keys(&mut self) {
@@ -1112,6 +1140,7 @@ impl AnvilState<UdevData> {
             },
         );
         pointer.frame(self);
+        self.follow_pointer_focus(pointer_location, serial);
 
         // If pointer is now in a constraint region, activate it
         // TODO Anywhere else pointer is moved needs to do this
@@ -1170,6 +1199,7 @@ impl AnvilState<UdevData> {
             },
         );
         pointer.frame(self);
+        self.follow_pointer_focus(pointer_location, serial);
     }
 
     fn on_tablet_tool_axis<B: InputBackend>(&mut self, evt: B::TabletToolAxisEvent) {
@@ -1312,7 +1342,7 @@ impl AnvilState<UdevData> {
                     );
 
                     // change the keyboard focus
-                    self.update_keyboard_focus(self.pointer.current_location(), serial);
+                    self.update_keyboard_focus(self.pointer.current_location(), serial, true);
                 }
                 TabletToolTipState::Up => {
                     tool.up(

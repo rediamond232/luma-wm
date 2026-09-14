@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Launch one Vulkan renderer through Luma's explicit DMA-BUF capture layer.
+set -euo pipefail
+umask 077
+
+usage() {
+    echo "Usage: $0 --output /absolute/file.mp4 --fps 30..480 [--quality 1..51] -- command [args...]" >&2
+}
+
+output= fps= quality=20
+while (($#)); do
+    case $1 in
+        --output) output=${2:-}; shift 2 ;;
+        --fps) fps=${2:-}; shift 2 ;;
+        --quality) quality=${2:-}; shift 2 ;;
+        --) shift; break ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; exit 64 ;;
+    esac
+done
+[[ $output = /* && $fps =~ ^[0-9]+$ && $fps -ge 30 && $fps -le 480 &&
+   $quality =~ ^([1-9]|[1-4][0-9]|5[0-1])$ && $# -gt 0 ]] || { usage; exit 64; }
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [[ -n ${LUMA_GAME_CAPTURE_MUXER:-} ]]; then
+    muxer=$LUMA_GAME_CAPTURE_MUXER
+elif [[ -x $script_dir/luma-game-capture-muxer ]]; then
+    muxer=$script_dir/luma-game-capture-muxer
+else
+    muxer=$script_dir/../../target/release/luma-game-capture-muxer
+fi
+receiver=${LUMA_VULKAN_CAPTURE_RECEIVER:-$script_dir/luma-vulkan-capture-receiver}
+layer=${LUMA_VULKAN_CAPTURE_LAYER:-$script_dir/libluma_vk_dmabuf_capture.so}
+game_launch=${LUMA_VULKAN_GAME_LAUNCHER:-$script_dir/luma-vulkan-game-launch}
+[[ -x $muxer && -x $receiver && -r $layer && -x $game_launch ]] || {
+    echo "Vulkan capture requires the muxer, receiver, layer, and launch gate" >&2
+    exit 66
+}
+
+mkdir -p -- "$(dirname -- "$output")"
+runtime=${XDG_RUNTIME_DIR:-/tmp}
+session=$(mktemp -d -- "$runtime/luma-vulkan-capture.XXXXXX")
+export_socket=$session/export.sock
+stream_socket=$session/video.sock
+expected_receiver=$session/receiver.pid
+manifest=$session/luma_vk_dmabuf_capture_layer.json
+token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+game_pid= receiver_pid= muxer_pid= game_released=0 stopping=0 capture_status=0
+
+stop_sidecars() {
+    if [[ -n ${receiver_pid:-} ]] && kill -0 "$receiver_pid" 2>/dev/null; then
+        kill -TERM "$receiver_pid" 2>/dev/null || true
+        for _ in $(seq 1 1000); do
+            kill -0 "$receiver_pid" 2>/dev/null || break
+            sleep 0.01
+        done
+        kill -0 "$receiver_pid" 2>/dev/null && kill -KILL "$receiver_pid" 2>/dev/null || true
+        wait "$receiver_pid" 2>/dev/null || capture_status=1
+    elif [[ -n ${receiver_pid:-} ]]; then
+        wait "$receiver_pid" 2>/dev/null || capture_status=1
+    fi
+    receiver_pid=
+    if [[ -n ${muxer_pid:-} ]] && kill -0 "$muxer_pid" 2>/dev/null; then
+        for _ in $(seq 1 1000); do
+            kill -0 "$muxer_pid" 2>/dev/null || break
+            sleep 0.01
+        done
+        kill -0 "$muxer_pid" 2>/dev/null && kill -TERM "$muxer_pid" 2>/dev/null || true
+        wait "$muxer_pid" 2>/dev/null || capture_status=1
+    elif [[ -n ${muxer_pid:-} ]]; then
+        wait "$muxer_pid" 2>/dev/null || capture_status=1
+    fi
+    muxer_pid=
+}
+cleanup() {
+    stop_sidecars
+    if [[ $game_released = 0 && -n ${game_pid:-} ]] && kill -0 "$game_pid" 2>/dev/null; then
+        kill -KILL "$game_pid" 2>/dev/null || true
+        wait "$game_pid" 2>/dev/null || true
+    fi
+    rm -f -- "$export_socket" "$stream_socket" "$expected_receiver" "$manifest"
+    rmdir -- "$session" 2>/dev/null || true
+}
+on_stop() { stopping=1; exit 0; }
+trap cleanup EXIT
+trap on_stop INT TERM
+
+escaped_layer=${layer//\\/\\\\}
+escaped_layer=${escaped_layer//\"/\\\"}
+printf '%s\n' \
+    '{' \
+    '  "file_format_version": "1.0.0",' \
+    '  "layer": {' \
+    '    "name": "VK_LAYER_LUMA_dmabuf_capture",' \
+    '    "type": "GLOBAL",' \
+    "    \"library_path\": \"$escaped_layer\"," \
+    '    "api_version": "1.2.0",' \
+    '    "implementation_version": "2",' \
+    '    "description": "Luma Vulkan DMA-BUF capture"' \
+    '  }' \
+    '}' >"$manifest"
+
+VK_LAYER_PATH=$session \
+VK_INSTANCE_LAYERS="VK_LAYER_LUMA_dmabuf_capture${VK_INSTANCE_LAYERS:+:$VK_INSTANCE_LAYERS}" \
+LUMA_VK_CAPTURE_SOCKET=$export_socket \
+    "$game_launch" "$@" &
+game_pid=$!
+for _ in $(seq 1 300); do
+    state=$(awk '{print $3}' "/proc/$game_pid/stat" 2>/dev/null || true)
+    [[ $state = T ]] && break
+    kill -0 "$game_pid" 2>/dev/null || break
+    sleep 0.01
+done
+[[ ${state:-} = T ]] || { echo "Vulkan game launch gate did not stop cleanly" >&2; exit 70; }
+
+"$receiver" --export-socket "$export_socket" --stream-socket "$stream_socket" \
+    --token "$token" --expected-pid "$game_pid" --fps "$fps" --quality "$quality" &
+receiver_pid=$!
+printf '%s\n' "$receiver_pid" >"$expected_receiver"
+chmod 600 "$expected_receiver"
+for _ in $(seq 1 300); do
+    [[ -S $export_socket ]] && break
+    kill -0 "$receiver_pid" 2>/dev/null || break
+    sleep 0.01
+done
+[[ -S $export_socket ]] || { echo "Vulkan GPU receiver did not open its socket" >&2; exit 70; }
+
+"$muxer" --socket "$stream_socket" --token "$token" --output "$output" --fps "$fps" \
+    --expected-pid-file "$expected_receiver" &
+muxer_pid=$!
+for _ in $(seq 1 300); do
+    [[ -S $stream_socket ]] && break
+    kill -0 "$muxer_pid" 2>/dev/null || break
+    sleep 0.01
+done
+[[ -S $stream_socket ]] || { echo "Vulkan capture muxer did not open its socket" >&2; exit 70; }
+
+kill -CONT "$game_pid"
+game_released=1
+echo "Luma started Vulkan API capture for PID $game_pid" >&2
+set +e
+wait "$game_pid"
+game_status=$?
+set -e
+game_pid=
+stop_sidecars
+[[ -s $output ]] || capture_status=1
+if [[ $game_status = 0 && $capture_status != 0 ]]; then
+    echo "Vulkan renderer exited normally but capture did not finalize" >&2
+    exit 74
+fi
+exit "$game_status"

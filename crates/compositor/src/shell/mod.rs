@@ -178,6 +178,7 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
 
     fn commit(&mut self, surface: &WlSurface) {
         self.desktop.redraw = true;
+        let synchronized = is_sync_subsurface(surface);
         let assignment = with_states(surface, |states| {
             match states
                 .cached_state
@@ -190,6 +191,22 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
                 None => 0,
             }
         });
+        let mut applied_content_update = false;
+        if !synchronized {
+            with_surface_tree_upward(
+                surface,
+                (),
+                |_, _, _| TraversalAction::DoChildren(()),
+                |_, states, _| {
+                    let mut guard = states.cached_state.get::<SurfaceAttributes>();
+                    let attributes = guard.current();
+                    applied_content_update |=
+                        matches!(attributes.buffer, Some(BufferAssignment::NewBuffer(_)))
+                            || !attributes.damage.is_empty();
+                },
+                |_, _, _| true,
+            );
+        }
         if assignment < 0 {
             self.capture_closing_window(surface);
             self.window_unmapped(surface);
@@ -200,13 +217,24 @@ impl<BackendData: Backend> CompositorHandler for AnvilState<BackendData> {
         on_commit_buffer_handler::<Self>(surface);
         self.backend_data.early_import(surface);
 
-        if !is_sync_subsurface(surface) {
-            let mut root = surface.clone();
-            while let Some(parent) = get_parent(&root) {
-                root = parent;
-            }
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        if applied_content_update {
+            self.capture_generation = self.capture_generation.wrapping_add(1).max(1);
+        }
+        if !synchronized {
             if let Some(window) = self.window_for_surface(&root) {
                 window.0.on_commit();
+
+                if applied_content_update {
+                    // early_import above has made the new client texture
+                    // available. Copying it into the recorder-owned DMA-BUF
+                    // pool here gives the frame an independent lifetime before
+                    // Xwayland is allowed to reuse its wl_buffer.
+                    self.process_commit_driven_capture(&window);
+                }
 
                 if &root == surface {
                     let buffer_offset = with_states(surface, |states| {

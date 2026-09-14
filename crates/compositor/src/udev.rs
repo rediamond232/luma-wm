@@ -297,6 +297,43 @@ impl Backend for UdevData {
         crate::capture::render_dmabuf(renderer.as_mut(), space, output, cursor, &mut dmabuf)
     }
 
+    fn capture_window_dmabuf(
+        &mut self,
+        window: &crate::shell::WindowElement,
+        output: &Output,
+        mut dmabuf: Dmabuf,
+    ) -> Result<(), String> {
+        let node = self.primary_gpu;
+        let mut renderer = self
+            .gpus
+            .single_renderer(&node)
+            .map_err(|error| error.to_string())?;
+        crate::capture::render_window_dmabuf(renderer.as_mut(), window, output, &mut dmabuf)
+    }
+
+    fn capture_region_dmabuf(
+        &mut self,
+        space: &Space<crate::shell::WindowElement>,
+        output: &Output,
+        cursor: Option<&crate::capture::CaptureCursor>,
+        region: wm_core::Rect,
+        mut dmabuf: Dmabuf,
+    ) -> Result<(), String> {
+        let node = self.primary_gpu;
+        let mut renderer = self
+            .gpus
+            .single_renderer(&node)
+            .map_err(|error| error.to_string())?;
+        crate::capture::render_region_dmabuf(
+            renderer.as_mut(),
+            space,
+            output,
+            cursor,
+            region,
+            &mut dmabuf,
+        )
+    }
+
     fn seat_name(&self) -> String {
         self.session.seat()
     }
@@ -535,6 +572,12 @@ pub fn run_udev() {
         .insert_source(notifier, move |event, &mut (), data| match event {
             SessionEvent::PauseSession => {
                 data.desktop.active = false;
+                data.stop_capture_boost();
+                if data.desktop.recorder.is_running() {
+                    data.desktop
+                        .recorder
+                        .abort("recording stopped because the session became inactive");
+                }
                 if let Some((timer, _)) = data.backend_data.cursor_timer.take() {
                     data.handle.remove(timer);
                 }
@@ -774,6 +817,7 @@ pub fn run_udev() {
                 }
                 crate::screencopy::process_pending(&mut state);
                 let outputs: Vec<_> = state.space.outputs().cloned().collect();
+                state.capture_generation = state.capture_generation.wrapping_add(1).max(1);
                 for output in outputs {
                     state.process_pending_capture_frames(&output);
                 }

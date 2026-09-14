@@ -2,8 +2,9 @@
 use crate::{
     AnvilState,
     focus::KeyboardFocusTarget,
+    recorder::RecorderController,
     shell::{FullscreenSurface, WindowElement},
-    state::Backend,
+    state::{Backend, RecorderCaptureSource},
 };
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState;
 use smithay::{
@@ -64,6 +65,7 @@ pub struct Desktop {
     pub services: Vec<(Vec<String>, Option<Child>, u8)>,
     pub installed: bool,
     pub watcher: Option<notify::RecommendedWatcher>,
+    pub recorder: RecorderController,
     animation_timer: Option<smithay::reexports::calloop::RegistrationToken>,
 }
 impl Default for Desktop {
@@ -87,6 +89,7 @@ impl Default for Desktop {
             services: vec![],
             installed: false,
             watcher: None,
+            recorder: RecorderController::default(),
             animation_timer: None,
         }
     }
@@ -106,6 +109,8 @@ impl Drop for Desktop {
                 let _ = child.wait();
             }
         }
+        // RecorderController finalizes a live recording before falling back to
+        // terminating its child in its own Drop implementation.
     }
 }
 pub fn identity(w: &WindowElement) -> (String, String) {
@@ -401,6 +406,75 @@ impl<B: Backend + 'static> AnvilState<B> {
             })
             .or_else(|| self.space.outputs().next().map(|o| o.name()))
     }
+    fn recorder_source(&self, value: &str) -> Result<RecorderCaptureSource, String> {
+        let mut parts = value.split_whitespace();
+        match parts.next().unwrap_or("output") {
+            "output" => Ok(RecorderCaptureSource::Output),
+            "window" => {
+                let id = parts
+                    .next()
+                    .ok_or("window source requires an id")?
+                    .parse::<u64>()
+                    .map_err(|_| "window id must be a number")?;
+                if parts.next().is_some()
+                    || !self.desktop.windows.iter().any(|window| window.id == id)
+                {
+                    return Err("recorder window does not exist".into());
+                }
+                Ok(RecorderCaptureSource::Window(id))
+            }
+            "region" => {
+                let values = parts
+                    .map(|value| {
+                        value
+                            .parse::<i32>()
+                            .map_err(|_| "region values must be integers")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if values.len() != 4 || values[2] <= 0 || values[3] <= 0 {
+                    return Err(
+                        "region source requires x y width height with a positive size".into(),
+                    );
+                }
+                Ok(RecorderCaptureSource::Region(Rect {
+                    x: values[0],
+                    y: values[1],
+                    w: values[2],
+                    h: values[3],
+                }))
+            }
+            _ => Err("recorder source must be output, window ID, or region X Y W H".into()),
+        }
+    }
+    fn recorder_output(&self, source: RecorderCaptureSource) -> Result<String, String> {
+        match source {
+            RecorderCaptureSource::Output => self
+                .active_output()
+                .ok_or_else(|| "recorder has no active output".into()),
+            RecorderCaptureSource::Window(id) => self
+                .desktop
+                .windows
+                .iter()
+                .find(|window| window.id == id)
+                .map(|window| window.output.clone())
+                .ok_or_else(|| "recorder window does not exist".into()),
+            RecorderCaptureSource::Region(region) => self
+                .space
+                .outputs()
+                .filter_map(|output| {
+                    let geometry = self.space.output_geometry(output)?;
+                    let left = region.x.max(geometry.loc.x);
+                    let top = region.y.max(geometry.loc.y);
+                    let right = (region.x + region.w).min(geometry.loc.x + geometry.size.w);
+                    let bottom = (region.y + region.h).min(geometry.loc.y + geometry.size.h);
+                    let area = i64::from((right - left).max(0)) * i64::from((bottom - top).max(0));
+                    (area > 0).then(|| (area, output.name()))
+                })
+                .max_by_key(|(area, _)| *area)
+                .map(|(_, name)| name)
+                .ok_or_else(|| "recorder region does not intersect an output".into()),
+        }
+    }
     pub fn desktop_command(&mut self, cmd: &str) -> Result<(), String> {
         if self.lock.locked && !["status"].contains(&cmd) {
             return Err("session is locked".into());
@@ -423,6 +497,215 @@ impl<B: Backend + 'static> AnvilState<B> {
                     .map_err(|e| e.to_string())?
                     .with_file_name(shell_name);
                 return self.spawn_app(&[p.to_string_lossy().into_owned(), "--launcher".into()]);
+            }
+            "recorder" if arg.is_empty() => {
+                let p = std::env::current_exe()
+                    .map_err(|e| e.to_string())?
+                    // The recorder panel is implemented by the native shell
+                    // and remains available even when the desktop bar uses
+                    // the legacy GTK backend.
+                    .with_file_name("wm-shell-sctk");
+                return self.spawn_app(&[p.to_string_lossy().into_owned(), "--recorder".into()]);
+            }
+            "recorder" => {
+                let mut request = arg.splitn(2, ' ');
+                let action = request.next().unwrap_or_default();
+                let source_arg = request.next().unwrap_or("");
+                match action {
+                    "start" => {
+                        let config = self.desktop.config.recorder.clone();
+                        let source = self.recorder_source(source_arg)?;
+                        let capture_output = self.recorder_output(source)?;
+                        self.capture_override = source;
+                        self.capture_commit_driven = false;
+                        if let Err(error) = self.start_capture_boost(config.screen_fps) {
+                            self.capture_override = RecorderCaptureSource::Output;
+                            return Err(error);
+                        }
+                        if let Err(error) = self.desktop.recorder.start(
+                            &config,
+                            false,
+                            self.socket_name.as_deref(),
+                            &capture_output,
+                            false,
+                        ) {
+                            self.stop_capture_boost();
+                            return Err(error);
+                        }
+                        self.desktop.recorder.status.source = Some(match self.capture_override {
+                            RecorderCaptureSource::Output => "output".into(),
+                            RecorderCaptureSource::Window(id) => format!("window {id}"),
+                            RecorderCaptureSource::Region(region) => format!(
+                                "region {},{} {}x{}",
+                                region.x, region.y, region.w, region.h
+                            ),
+                        });
+                    }
+                    "game-start" => {
+                        let profile_name = source_arg.trim();
+                        if profile_name.is_empty() {
+                            return Err("game-start requires a configured game profile name".into());
+                        }
+                        let config = self.desktop.config.recorder.clone();
+                        let profile = config
+                            .game_profiles
+                            .iter()
+                            .find(|profile| profile.name == profile_name)
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!("recorder game profile '{profile_name}' does not exist")
+                            })?;
+                        if !matches!(profile.api.as_str(), "opengl" | "vulkan") {
+                            return Err(format!(
+                                "game capture profile '{profile_name}' has unsupported API {}",
+                                profile.api
+                            ));
+                        }
+                        // This path is the renderer's own API present hook. Do
+                        // not request compositor copies or start the capture
+                        // boost timer: doing so would re-render the desktop at
+                        // the requested game FPS and defeat its purpose.
+                        self.capture_override = RecorderCaptureSource::Output;
+                        self.desktop.recorder.start_game(&config, &profile)?;
+                    }
+                    "game-attach" => {
+                        let pid = source_arg.trim().parse::<u32>().map_err(
+                            |_| "game-attach requires one positive graphics-process PID",
+                        )?;
+                        if pid == 0 {
+                            return Err(
+                                "game-attach requires one positive graphics-process PID".into()
+                            );
+                        }
+                        self.capture_override = RecorderCaptureSource::Output;
+                        let config = self.desktop.config.recorder.clone();
+                        self.desktop.recorder.start_game_attach(&config, pid)?;
+                    }
+                    "xwayland-start" => {
+                        let window = source_arg
+                            .trim()
+                            .parse::<u32>()
+                            .map_err(|_| "xwayland-start requires one positive X11 window ID")?;
+                        if window == 0 {
+                            return Err("xwayland-start requires one positive X11 window ID".into());
+                        }
+                        #[cfg(feature = "xwayland")]
+                        {
+                            let (managed_id, capture_output) = self
+                                .desktop
+                                .windows
+                                .iter()
+                                .find(|managed| {
+                                    managed
+                                        .window
+                                        .0
+                                        .x11_surface()
+                                        .is_some_and(|surface| surface.window_id() == window)
+                                })
+                                .map(|managed| (managed.id, managed.output.clone()))
+                                .ok_or_else(|| {
+                                    format!(
+                                        "X11 window {window:#x} is not managed by this Luma session"
+                                    )
+                                })?;
+                            let config = self.desktop.config.recorder.clone();
+                            self.capture_override = RecorderCaptureSource::Window(managed_id);
+                            self.capture_commit_driven = true;
+                            if let Err(error) = self.start_capture_boost(config.fps) {
+                                self.capture_override = RecorderCaptureSource::Output;
+                                self.capture_commit_driven = false;
+                                return Err(error);
+                            }
+                            if let Err(error) = self.desktop.recorder.start_game_xwayland(
+                                &config,
+                                self.socket_name.as_deref(),
+                                &capture_output,
+                                window,
+                            ) {
+                                self.stop_capture_boost();
+                                return Err(error);
+                            }
+                        }
+                        #[cfg(not(feature = "xwayland"))]
+                        return Err("this Luma build has no Xwayland support".into());
+                    }
+                    "replay-start" => {
+                        let config = self.desktop.config.recorder.clone();
+                        let source = self.recorder_source(source_arg)?;
+                        let capture_output = self.recorder_output(source)?;
+                        self.capture_override = source;
+                        self.capture_commit_driven = false;
+                        if let Err(error) = self.start_capture_boost(config.screen_fps) {
+                            self.capture_override = RecorderCaptureSource::Output;
+                            return Err(error);
+                        }
+                        if let Err(error) = self.desktop.recorder.start(
+                            &config,
+                            true,
+                            self.socket_name.as_deref(),
+                            &capture_output,
+                            false,
+                        ) {
+                            self.stop_capture_boost();
+                            return Err(error);
+                        }
+                        self.desktop.recorder.status.source = Some(match self.capture_override {
+                            RecorderCaptureSource::Output => "output".into(),
+                            RecorderCaptureSource::Window(id) => format!("window {id}"),
+                            RecorderCaptureSource::Region(region) => format!(
+                                "region {},{} {}x{}",
+                                region.x, region.y, region.w, region.h
+                            ),
+                        });
+                    }
+                    "stop" => {
+                        let game_capture = self.desktop.recorder.is_game_capture();
+                        let result = self.desktop.recorder.stop();
+                        if !game_capture {
+                            self.stop_capture_boost();
+                        }
+                        result?;
+                    }
+                    "toggle" => {
+                        if self.desktop.recorder.is_running() {
+                            let result = self.desktop.recorder.stop();
+                            self.stop_capture_boost();
+                            result?;
+                        } else {
+                            let config = self.desktop.config.recorder.clone();
+                            let capture_output =
+                                self.recorder_output(RecorderCaptureSource::Output)?;
+                            self.capture_override = RecorderCaptureSource::Output;
+                            self.capture_commit_driven = false;
+                            if let Err(error) = self.start_capture_boost(config.screen_fps) {
+                                return Err(error);
+                            }
+                            if let Err(error) = self.desktop.recorder.start(
+                                &config,
+                                false,
+                                self.socket_name.as_deref(),
+                                &capture_output,
+                                false,
+                            ) {
+                                self.stop_capture_boost();
+                                return Err(error);
+                            }
+                        }
+                    }
+                    "pause" => {
+                        self.desktop.recorder.toggle_pause()?;
+                    }
+                    "replay-save" => self.desktop.recorder.save_replay()?,
+                    "status" => return Ok(()),
+                    _ => {
+                        return Err(
+                            "recorder requires start [source], game-start PROFILE, game-attach PID, xwayland-start WINDOW, replay-start [source], stop, toggle, pause, replay-save, or status"
+                                .into(),
+                        );
+                    }
+                }
+                self.desktop.dirty = true;
+                return Ok(());
             }
             "exec" => {
                 let args: Vec<String> = serde_json::from_str(arg)
@@ -624,6 +907,12 @@ impl<B: Backend + 'static> AnvilState<B> {
         Ok(())
     }
     pub fn maintain_desktop(&mut self) {
+        if self.desktop.recorder.poll() {
+            if !self.desktop.recorder.is_running() {
+                self.stop_capture_boost();
+            }
+            self.desktop.dirty = true;
+        }
         let outputs: Vec<_> = self.space.outputs().cloned().collect();
         let names: Vec<_> = outputs.iter().map(|o| o.name()).collect();
         self.desktop.outputs.retain(|n, _| names.contains(n));
@@ -1292,11 +1581,16 @@ impl<B: Backend + 'static> AnvilState<B> {
             version: 1,
             focused: self.focused_index().map(|i| self.desktop.windows[i].id),
             error: self.desktop.error.clone(),
+            recorder: self.desktop.recorder.status.clone(),
             ..Default::default()
         };
         for w in &self.desktop.windows {
             let (app_id, title) = identity(&w.window);
             snapshot.windows.push(WindowInfo {
+                #[cfg(feature = "xwayland")]
+                x11_window: w.window.0.x11_surface().map(|surface| surface.window_id()),
+                #[cfg(not(feature = "xwayland"))]
+                x11_window: None,
                 surface_size: w.window.wl_surface().and_then(|surface| {
                     smithay::backend::renderer::utils::with_renderer_surface_state(
                         &surface,

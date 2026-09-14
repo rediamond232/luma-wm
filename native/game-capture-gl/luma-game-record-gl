@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Launch one OpenGL game through Luma's explicit, GPU-only capture path.
+#
+# This is intentionally a launcher, never an attach-to-PID tool.  The game
+# retains normal process ownership; the helper only owns its recorder sidecar.
+set -euo pipefail
+umask 077
+
+usage() {
+    echo "Usage: $0 --output FILE.mp4 --fps 30..480 [--quality 1..51] -- command [args...]" >&2
+}
+
+output=
+fps=
+quality=20
+while (($#)); do
+    case "$1" in
+        --output)
+            (($# >= 2)) || { usage; exit 64; }
+            output=$2
+            shift 2
+            ;;
+        --fps)
+            (($# >= 2)) || { usage; exit 64; }
+            fps=$2
+            shift 2
+            ;;
+        --quality)
+            (($# >= 2)) || { usage; exit 64; }
+            quality=$2
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            exit 64
+            ;;
+    esac
+done
+
+[[ -n $output && $output = /* && -n $fps && $fps =~ ^[0-9]+$ && $fps -ge 30 && $fps -le 480 && $quality =~ ^([1-9]|[1-4][0-9]|5[0-1])$ && $# -gt 0 ]] || {
+    usage
+    exit 64
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [[ -n ${LUMA_GAME_CAPTURE_MUXER:-} ]]; then
+    muxer=$LUMA_GAME_CAPTURE_MUXER
+elif [[ -x $script_dir/luma-game-capture-muxer ]]; then
+    muxer=$script_dir/luma-game-capture-muxer
+else
+    muxer=$script_dir/../../target/release/luma-game-capture-muxer
+fi
+[[ -x $muxer ]] || {
+    echo "Luma direct-game muxer is missing: $muxer" >&2
+    echo "Build it with: cargo build --release -p luma-game-capture-muxer" >&2
+    exit 66
+}
+
+mkdir -p -- "$(dirname -- "$output")"
+runtime_base=${XDG_RUNTIME_DIR:-/tmp}
+session_dir=$(mktemp -d -- "$runtime_base/luma-game-capture.XXXXXX")
+socket_path="$session_dir/video.sock"
+expected_pid_file="$session_dir/game.pid"
+token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+muxer_pid=
+game_wait_pid=
+stopping=0
+
+stop_muxer() {
+    # Deliberately address only the sidecar's PID. In particular, never use a
+    # negative PID/process-group signal here: the game runs in its own session
+    # and must keep running when a user stops recording from Luma.
+    if [[ -n ${muxer_pid:-} ]] && kill -0 "$muxer_pid" 2>/dev/null; then
+        kill -TERM "$muxer_pid" 2>/dev/null || true
+        wait "$muxer_pid" 2>/dev/null || true
+    fi
+    muxer_pid=
+}
+
+cleanup() {
+    stop_muxer
+    [[ -e $socket_path ]] && rm -f -- "$socket_path"
+    [[ -e $expected_pid_file ]] && rm -f -- "$expected_pid_file"
+    rmdir -- "$session_dir" 2>/dev/null || true
+}
+
+on_stop_signal() {
+    # `wmctl recorder stop` signals this wrapper, not the game. Exit directly
+    # from the trap so an interrupted `wait` cannot fall through into the
+    # normal game-exit path and accidentally wait on or signal the game.
+    stopping=1
+    exit 0
+}
+
+trap cleanup EXIT
+trap on_stop_signal INT TERM
+
+"$muxer" --socket "$socket_path" --token "$token" --output "$output" --fps "$fps" --expected-pid-file "$expected_pid_file" &
+muxer_pid=$!
+
+# The hook never retries a failed connection because retrying from every
+# present could perturb a game.  Wait for the private listener before launch.
+for _ in $(seq 1 200); do
+    [[ -S $socket_path ]] && break
+    kill -0 "$muxer_pid" 2>/dev/null || break
+    sleep 0.01
+done
+[[ -S $socket_path ]] || {
+    wait "$muxer_pid" || true
+    echo "Luma direct-game muxer did not open its private socket" >&2
+    exit 70
+}
+
+# The game gets its own session/process group. This protects it from an
+# accidental process-group signal aimed at the recorder wrapper and also makes
+# the ownership boundary explicit: Luma owns the muxer, the user owns the
+# game. `--wait` preserves normal finalization when the game exits naturally.
+set +e
+setsid --wait "$script_dir/luma-game-capture-gl" \
+    --stream-socket "$socket_path" --token "$token" --fps "$fps" \
+    --quality "$quality" --expected-pid-file "$expected_pid_file" -- "$@" &
+game_wait_pid=$!
+# The hook launcher atomically publishes its own exec-preserved PID before it
+# starts the target. That removes the first-swap race and prevents inherited
+# `LD_PRELOAD` helpers from claiming this recording's private socket.
+wait "$game_wait_pid"
+game_status=$?
+set -e
+
+# A connected hook reaches EOF as the game exits, which asks the muxer to
+# drain every already-received AU and write MP4 indexes. Give that graceful
+# path time rather than routinely cutting its final frames; only a stuck
+# recorder is terminated after 15 seconds.
+for _ in $(seq 1 1500); do
+    kill -0 "$muxer_pid" 2>/dev/null || break
+    sleep 0.01
+done
+if kill -0 "$muxer_pid" 2>/dev/null; then
+    kill "$muxer_pid" 2>/dev/null || true
+fi
+wait "$muxer_pid" || true
+muxer_pid=
+exit "$game_status"

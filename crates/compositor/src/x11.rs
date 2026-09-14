@@ -129,6 +129,33 @@ impl Backend for X11Data {
         crate::capture::render_dmabuf(&mut self.renderer, space, output, cursor, &mut dmabuf)
     }
 
+    fn capture_window_dmabuf(
+        &mut self,
+        window: &crate::shell::WindowElement,
+        output: &Output,
+        mut dmabuf: Dmabuf,
+    ) -> Result<(), String> {
+        crate::capture::render_window_dmabuf(&mut self.renderer, window, output, &mut dmabuf)
+    }
+
+    fn capture_region_dmabuf(
+        &mut self,
+        space: &smithay::desktop::Space<crate::shell::WindowElement>,
+        output: &Output,
+        cursor: Option<&crate::capture::CaptureCursor>,
+        region: wm_core::Rect,
+        mut dmabuf: Dmabuf,
+    ) -> Result<(), String> {
+        crate::capture::render_region_dmabuf(
+            &mut self.renderer,
+            space,
+            output,
+            cursor,
+            region,
+            &mut dmabuf,
+        )
+    }
+
     fn seat_name(&self) -> String {
         "x11".to_owned()
     }
@@ -548,6 +575,7 @@ pub fn run_x11() {
             }
 
             if capture_changed {
+                state.capture_generation = state.capture_generation.wrapping_add(1).max(1);
                 crate::screencopy::process_pending(&mut state);
                 state.process_pending_capture_frames(&output);
             }

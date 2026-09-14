@@ -1,6 +1,9 @@
 //! Shared configuration, layout mathematics and local control protocol.
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 pub const PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -15,6 +18,7 @@ pub struct Config {
     pub outputs: BTreeMap<String, OutputConfig>,
     pub rules: Vec<WindowRule>,
     pub shell: Shell,
+    pub recorder: Recorder,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -34,6 +38,10 @@ impl Default for Config {
             ("Super+Shift+asciitilde".into(), "scratchpad send".into()),
             ("Super+Escape".into(), "lock".into()),
             ("Super+Shift+E".into(), "quit".into()),
+            ("Super+Alt+R".into(), "recorder".into()),
+            ("Super+F8".into(), "recorder replay-save".into()),
+            ("Super+F9".into(), "recorder toggle".into()),
+            ("Super+F10".into(), "recorder pause".into()),
         ]);
         for (key, dir) in [
             ("Left", "left"),
@@ -62,6 +70,76 @@ impl Default for Config {
             outputs: BTreeMap::new(),
             rules: vec![],
             shell: Shell::default(),
+            recorder: Recorder::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Recorder {
+    pub enabled: bool,
+    /// Ceiling for composition/screen capture. Direct launch profiles have
+    /// their own rate; runtime attach uses `fps` below.
+    pub screen_fps: u32,
+    pub fps: u32,
+    pub codec: String,
+    pub quality: u8,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub output_directory: String,
+    pub container: String,
+    pub cursor: bool,
+    pub desktop_audio: String,
+    pub microphone: String,
+    pub replay_seconds: u32,
+    pub replay_max_mib: u32,
+    /// Explicit commands launched with a graphics-API capture backend.
+    /// Generic runtime OpenGL injection is selected separately by PID.
+    pub game_profiles: Vec<GameCaptureProfile>,
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            screen_fps: 240,
+            fps: 480,
+            codec: "h264".into(),
+            quality: 20,
+            output_width: 2560,
+            output_height: 1440,
+            output_directory: "~/Videos/Luma".into(),
+            container: "mp4".into(),
+            cursor: true,
+            desktop_audio: "default_output".into(),
+            microphone: "default_input".into(),
+            replay_seconds: 30,
+            replay_max_mib: 1024,
+            game_profiles: vec![],
+        }
+    }
+}
+
+/// A deliberately explicit game-launch profile.  `api` selects the graphics
+/// interception surface, not a fallback: `opengl` uses the preload hook and
+/// `vulkan` uses the opt-in Vulkan layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GameCaptureProfile {
+    pub name: String,
+    pub api: String,
+    pub command: Vec<String>,
+    pub fps: u32,
+}
+
+impl Default for GameCaptureProfile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            api: "opengl".into(),
+            command: vec![],
+            fps: 480,
         }
     }
 }
@@ -135,6 +213,8 @@ pub struct Input {
     pub tap_to_click: bool,
     pub pointer_accel: f64,
     pub mouse_modifier: String,
+    /// Focus the window under the cursor as it moves, without changing stack order.
+    pub follow_mouse: bool,
 }
 impl Default for Input {
     fn default() -> Self {
@@ -148,6 +228,7 @@ impl Default for Input {
             tap_to_click: true,
             pointer_accel: 0.,
             mouse_modifier: "Super".into(),
+            follow_mouse: true,
         }
     }
 }
@@ -182,6 +263,7 @@ impl Default for Shell {
                 "battery",
                 "notifications",
                 "clock",
+                "power",
             ]
             .into_iter()
             .map(str::to_string)
@@ -379,6 +461,39 @@ impl Config {
         {
             return Err("invalid shell backend, bar position, or height".into());
         }
+        if !(30..=480).contains(&self.recorder.fps)
+            || !(30..=480).contains(&self.recorder.screen_fps)
+            || !["hevc", "h264"].contains(&self.recorder.codec.as_str())
+            || !(1..=51).contains(&self.recorder.quality)
+            || self.recorder.output_width == 0
+            || self.recorder.output_height == 0
+            || self.recorder.output_width > 16_384
+            || self.recorder.output_height > 16_384
+            || !self.recorder.output_width.is_multiple_of(2)
+            || !self.recorder.output_height.is_multiple_of(2)
+            || self.recorder.output_directory.is_empty()
+            || self.recorder.container != "mp4"
+            || !(2..=3600).contains(&self.recorder.replay_seconds)
+            || !(64..=8192).contains(&self.recorder.replay_max_mib)
+        {
+            return Err(
+                "invalid recorder fps, codec, quality, dimensions, output, or replay limits".into(),
+            );
+        }
+        let mut game_profile_names = BTreeSet::new();
+        for profile in &self.recorder.game_profiles {
+            if profile.name.trim().is_empty()
+                || !game_profile_names.insert(profile.name.clone())
+                || !["opengl", "vulkan"].contains(&profile.api.as_str())
+                || profile.command.is_empty()
+                || profile.command.iter().any(|argument| argument.is_empty())
+                || !(30..=480).contains(&profile.fps)
+            {
+                return Err(
+                    "invalid recorder game profile name, API, command, or fps limit".into(),
+                );
+            }
+        }
         for o in self.outputs.values() {
             if !(0.5..=4.0).contains(&o.scale)
                 || ![
@@ -552,6 +667,35 @@ pub struct Snapshot {
     pub error: Option<String>,
     #[serde(default)]
     pub layers: Vec<LayerInfo>,
+    #[serde(default)]
+    pub recorder: RecorderStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RecorderStatus {
+    pub state: RecorderState,
+    pub source: Option<String>,
+    pub requested_fps: u32,
+    pub source_fps: f32,
+    pub encoded_fps: f32,
+    pub dropped_frames: u64,
+    pub elapsed_ms: u64,
+    pub replay_seconds: f32,
+    pub replay_bytes: u64,
+    pub output_path: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecorderState {
+    #[default]
+    Idle,
+    Starting,
+    Recording,
+    Paused,
+    Replay,
+    Error,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LayerInfo {
@@ -565,6 +709,10 @@ pub struct LayerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WindowInfo {
     pub id: u64,
+    /// X11 protocol window ID for an Xwayland client. Native Wayland windows
+    /// leave this unset. It selects the injection-free compositor capture path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x11_window: Option<u32>,
     pub title: String,
     pub app_id: String,
     pub workspace: u8,
@@ -704,6 +852,11 @@ mod tests {
         Config::parse(&text).unwrap();
     }
     #[test]
+    fn follow_mouse_can_be_disabled() {
+        let config = Config::parse("[input]\nfollow_mouse = false").unwrap();
+        assert!(!config.input.follow_mouse);
+    }
+    #[test]
     fn invalid_config_rejected() {
         for s in [
             "[layout]\nmaster_ratio=1.1",
@@ -714,6 +867,10 @@ mod tests {
             "[theme]\nshadow_opacity=1.1",
             "[theme]\nshadow_opacity=nan",
             "[shell]\nbackend='other'",
+            "[recorder]\nfps=481",
+            "[recorder]\ncodec='vp9'",
+            "[recorder]\noutput_width=2559",
+            "[recorder]\nreplay_max_mib=32",
             "[bindings]\n'Supers+space'='launcher'",
             "typo=1",
         ] {

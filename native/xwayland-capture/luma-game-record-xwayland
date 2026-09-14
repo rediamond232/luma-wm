@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Capture one existing Xwayland window through Composite/DRI3 without injection.
+set -euo pipefail
+umask 077
+
+usage() {
+    echo "Usage: $0 --window XID --output /absolute/file.mp4 --fps 30..480 [--quality 1..51]" >&2
+}
+
+window= output= fps= quality=20
+while (($#)); do
+    case $1 in
+        --window) window=${2:-}; shift 2 ;;
+        --output) output=${2:-}; shift 2 ;;
+        --fps) fps=${2:-}; shift 2 ;;
+        --quality) quality=${2:-}; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; exit 64 ;;
+    esac
+done
+[[ $window =~ ^(0x[0-9a-fA-F]+|[1-9][0-9]*)$ && $output = /* &&
+   $fps =~ ^[0-9]+$ && $fps -ge 30 && $fps -le 480 &&
+   $quality =~ ^([1-9]|[1-4][0-9]|5[0-1])$ && -n ${DISPLAY:-} ]] || {
+    usage
+    exit 64
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+capture=${LUMA_XWAYLAND_CAPTURE:-$script_dir/luma-xwayland-capture}
+muxer=${LUMA_GAME_CAPTURE_MUXER:-$script_dir/../../target/release/luma-game-capture-muxer}
+[[ -x $script_dir/luma-game-capture-muxer && -z ${LUMA_GAME_CAPTURE_MUXER:-} ]] && \
+    muxer=$script_dir/luma-game-capture-muxer
+[[ -x $capture && -x $muxer ]] || {
+    echo "Xwayland capture requires luma-xwayland-capture and luma-game-capture-muxer" >&2
+    exit 66
+}
+
+mkdir -p -- "$(dirname -- "$output")"
+runtime=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+session=$(mktemp -d -- "$runtime/luma-xwayland-capture.XXXXXX")
+socket=$session/video.sock
+expected=$session/capture.pid
+token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+capture_pid= muxer_pid= capture_status=0 muxer_status=0
+
+cleanup() {
+    if [[ -n ${capture_pid:-} ]] && kill -0 "$capture_pid" 2>/dev/null; then
+        kill -TERM "$capture_pid" 2>/dev/null || true
+        for _ in $(seq 1 500); do
+            kill -0 "$capture_pid" 2>/dev/null || break
+            sleep 0.01
+        done
+        kill -0 "$capture_pid" 2>/dev/null && kill -KILL "$capture_pid" 2>/dev/null || true
+    fi
+    [[ -n ${capture_pid:-} ]] && wait "$capture_pid" 2>/dev/null || true
+    [[ -n ${muxer_pid:-} ]] && kill -TERM "$muxer_pid" 2>/dev/null || true
+    [[ -n ${muxer_pid:-} ]] && wait "$muxer_pid" 2>/dev/null || true
+    rm -f -- "$socket" "$expected"
+    rmdir -- "$session" 2>/dev/null || true
+}
+stop_capture() { exit 0; }
+trap cleanup EXIT
+trap stop_capture INT TERM
+
+"$capture" --window "$window" --stream-socket "$socket" --token "$token" \
+    --fps "$fps" --quality "$quality" &
+capture_pid=$!
+printf '%s\n' "$capture_pid" >"$expected"
+chmod 600 "$expected"
+"$muxer" --socket "$socket" --token "$token" --output "$output" --fps "$fps" \
+    --expected-pid-file "$expected" &
+muxer_pid=$!
+
+while kill -0 "$capture_pid" 2>/dev/null && kill -0 "$muxer_pid" 2>/dev/null; do
+    sleep 0.1
+done
+set +e
+if ! kill -0 "$capture_pid" 2>/dev/null; then
+    wait "$capture_pid"; capture_status=$?; capture_pid=
+    kill -TERM "$muxer_pid" 2>/dev/null || true
+    wait "$muxer_pid"; muxer_status=$?; muxer_pid=
+else
+    wait "$muxer_pid"; muxer_status=$?; muxer_pid=
+    kill -TERM "$capture_pid" 2>/dev/null || true
+    wait "$capture_pid"; capture_status=$?; capture_pid=
+fi
+set -e
+[[ $capture_status = 0 && $muxer_status = 0 && -s $output ]] || exit 74

@@ -132,6 +132,7 @@ pointer_accel = 0.0 # -1.0 to 1.0
 natural_scroll = false
 tap_to_click = true
 mouse_modifier = "Super" # Super, Alt, Control, or disabled
+follow_mouse = true # focus the window below the cursor without raising it
 ```
 
 DRM outputs select advertised modes at startup and hotplug:
@@ -393,6 +394,8 @@ Default controls:
 | Super+M / Super+T | Monocle / master-stack layout |
 | Super+Shift+Q | Close window |
 | Print | Copy a full-screen PNG screenshot to the clipboard |
+| Super+Alt+R | Open the recorder panel |
+| Super+F9 / Super+F10 | Toggle recording / pause |
 
 Bindings can also launch applications directly. For example:
 
@@ -409,6 +412,178 @@ remains available for machine-generated command arrays.
 `wmctl help` lists IPC commands. `workspace N OUTPUT` selects a workspace on a
 specific output. The launcher supports applications, `@` windows, `>` commands
 and `:` session actions.
+
+### High-rate recording
+
+Luma exposes four deliberately separate capture modes.
+
+- **Screen (low-lag)** captures the compositor through its image-copy protocol.
+  Frames are rendered into a DMA-BUF, imported into GL for GPU scaling and
+  color conversion, then encoded with NVIDIA NVENC through GStreamer. It is the
+  normal choice for desktop, window, and region recording. Its rate is a
+  requested constant-frame-rate output: when the compositor has no new frame,
+  it may pad short gaps with duplicate frames. A high setting therefore is not
+  evidence that a game supplied that many distinct frames.
+- **Xwayland Zero-Copy** is driven by commits from the selected managed X11
+  window without loading code into the application. Luma reuses the surface
+  texture Smithay has already imported, GPU-copies it directly into one of the
+  native recorder's eight persistent DMA-BUFs, and feeds that pool to NVENC.
+  The 480 Hz pacing timer only releases Xwayland frame callbacks; it never
+  records an unchanged surface. This removes per-frame X Composite naming,
+  DRI3 export, and EGL re-import while keeping client-buffer reuse safe. No
+  frame pixels cross CPU memory. Each admitted commit occupies exactly one CFR
+  slot, so scheduler jitter cannot replace real frames with synthetic padding.
+- **OpenGL API capture** hooks GLX/EGL presentation, independent of the game.
+  A launch profile loads the hook before the renderer starts; **OpenGL API
+  Inject** uses a matching x86-64 helper to load it into an already-running,
+  same-user graphics process with remote `dlopen`. It patches resolved GLX/EGL
+  present relocations and recognizes LWJGL2's separate writable GLX dispatch
+  slot. Accepted presents stay on the GPU and go to
+  NVENC without CPU pixel readback. Luma does not hide the hook or bypass an
+  anti-cheat or Linux ptrace policy.
+- **Vulkan API capture** launches any configured Vulkan renderer through an
+  explicit loader layer. At `vkQueuePresentKHR`, the layer submits a GPU copy
+  into a four-image export ring and passes a DMA-BUF plus native fence to a
+  separate EGL/NVENC receiver. The receiver acknowledges a slot only after its
+  GPU copy is complete. A full ring drops capture work without blocking present.
+
+The graphics-API profile's FPS is a ceiling, not a promise or synthetic frame rate.
+Only real game presents that reach the next timing slot are accepted; Luma never
+pads a direct recording with duplicate frames to reach the requested FPS. The
+Vulkan layer drops capture work when its bounded export ring is full, so its
+separate receiver cannot back-pressure the game's present thread. The current
+OpenGL hook owns NVENC in-process and uses the driver's required synchronous
+Linux output contract, so it can add presentation latency when encoding is the
+bottleneck. The actual source FPS must be measured from the resulting video.
+This is not a claim of Windows Game Capture-equivalent performance.
+
+The Xwayland path performs its surface-to-recorder copy in the compositor, but
+NVENC and muxing stay in the separate native recorder process. The persistent
+DMA-BUF pool decouples encoder ownership from Xwayland's reusable client
+buffers. The OpenGL fast path currently performs the GPU copy and NVENC submission
+inside the hooked process, then sends encoded H.264 access units to the muxer.
+The Vulkan path uses the more OBS-like cross-process GPU-sharing architecture:
+the renderer exports images and synchronization while the recorder process
+owns EGL import and NVENC. Neither path transfers frame pixels through CPU RAM.
+
+`recorder.quality` is the H.264 constant-QP value used by both recorder paths:
+valid values are 1 through 51, lower is higher quality, and the default is 20.
+At 2560x1440 and 480 FPS, QP 20 can create very large files and requires a very
+fast local disk for sustained recording. Raise the QP or lower the capture rate
+when storage cannot sustain the recording; do not expect the game-present path
+to hide disk or encoder overload.
+
+For an application which can be started directly, configure an API launch profile.
+It must `exec` the renderer; a launcher that forks a child is rejected by the
+exact-PID guard. For a running renderer, open Luma Recorder, choose **OpenGL API
+Inject**, select a detected GLX/EGL process, and press Enter. The picker reads
+only PID, ownership, mapped graphics-library names, and `comm`; it never reads
+the command line because application arguments can contain secrets. Runtime
+injection has no JDK or JVM Attach dependency; it always loads the native `.so`.
+
+For a running Xwayland game, open Luma Recorder, choose **Xwayland Zero-Copy**,
+select the managed X11 window, and press Enter. The equivalent IPC command is
+`wmctl recorder xwayland-start WINDOW_ID`; the window ID is published only for
+Xwayland windows in `wmctl status`. Stopping capture terminates only Luma's
+native recorder worker, never the selected application.
+
+```toml
+[[recorder.game_profiles]]
+name = "minecraft-opengl"
+api = "opengl"
+# This must be the executable that owns the OpenGL presents, not a launcher
+# which later forks the game process.
+command = ["/absolute/path/to/game-binary", "--game"]
+fps = 480
+```
+
+For Vulkan, use the same shape with `api = "vulkan"`. Vulkan must be selected
+before instance/device creation, so Luma launches the renderer through the
+layer instead of injecting into an already-running Vulkan device:
+
+```toml
+[[recorder.game_profiles]]
+name = "game-vulkan"
+api = "vulkan"
+command = ["/absolute/path/to/vulkan-game"]
+fps = 480
+```
+
+```sh
+wmctl recorder game-start minecraft-opengl
+# Or inject into a detected same-user GLX/EGL process:
+wmctl recorder game-attach PID
+```
+
+Select **OpenGL Launch Profile** in the native recorder panel to use a matching
+profile there, or **Vulkan API Layer** for a Vulkan profile.
+The direct path currently requires `recorder.codec = "h264"`; HEVC remains
+available for the Screen recorder path.
+
+Direct graphics-API capture is currently **video-only**. It does not add desktop audio
+or microphone tracks; those tracks belong to the Screen recorder path.
+
+Stopping a direct recording with the panel's **Stop** control or `wmctl recorder
+stop` releases the injected GL/NVENC state on the next present, finalizes the
+MP4, and leaves the application running. Re-injection into the same process is
+currently unsupported; restart it before a second injected recording.
+
+The **Screen** profile targets 2560x1440 at up to 240 FPS by default, H.264 in
+Hybrid MP4, NVENC's performance tune, with separate desktop and microphone
+tracks. Encoded tracks stream through a small internal fragmented-MP4 transport
+into FFmpeg's `hybrid_fragmented` muxer: completed fragments remain recoverable
+after an interruption, while a clean stop finalizes the file as a normal indexed
+MP4.
+The native engine currently requires an NVIDIA GPU, an FFmpeg build with the
+`hybrid_fragmented` MP4 flag, plus GStreamer GL, NVCodec, PulseAudio, Opus,
+ISO-MP4, and fd-sink plugins.
+`Super+Alt+R` opens the native panel; use Left/Right to choose Screen, OpenGL
+API injection, launch-profile, or Vulkan mode. Up/Down selects an output,
+window, running GLX/EGL process, or profile; Enter starts or stops and Space pauses Screen
+capture. Instant
+replay is temporarily unavailable in the native engine. Window capture follows
+the client as it moves, resizes, or enters fullscreen and includes client
+popups but not Luma's server-side decoration.
+
+The direct OpenGL path remains experimental: launch-time hooking and native
+`.so` runtime injection have controlled NVIDIA GLX-to-MP4 coverage, including
+an LWJGL2 JVM fixture and cleanup which leaves the application running. Runtime
+injection is x86-64 only and can be rejected by
+Linux ptrace policy or an anti-cheat; signing the library does not grant trust.
+Luma does not weaken or bypass those policies. A detected
+captured-surface resize rejects and stops the direct capture; it does not keep
+encoding at the old dimensions. Do not rely on it for an important recording
+until that end-to-end validation is complete.
+
+The Vulkan path is also experimental. It has live NVIDIA 610-series validation
+with `vkcube`: 677 H.264 packets over a 1.85-second timestamp span (about 365
+distinct FPS at 1140x1386) with a 480 FPS ceiling, a clean full software decode,
+the first 30 decoded frames all distinct, an upright image, and a finalized Hybrid MP4. Drivers must
+support external DMA-BUF memory, DRM format modifiers, and native fence export;
+unsupported formats fail without replacing the API path with screen capture.
+
+The same controls are available over IPC:
+
+```sh
+wmctl recorder start output
+wmctl recorder start window 7
+wmctl recorder start region 100 80 1920 1080
+wmctl recorder pause
+wmctl recorder stop
+```
+
+The packaged build also installs **Luma Recorder** in application menus. For a
+local checkout, install the development desktop entry once with:
+
+```sh
+install -Dm644 sessions/luma-recorder.desktop \
+  ~/.local/share/applications/luma-recorder.desktop
+```
+
+Region coordinates are global logical coordinates. Luma chooses the backing
+output, and the selected region is cropped and scaled into the fixed output
+canvas entirely on the GPU. If the encoder cannot keep up, recorder capture
+falls behind without blocking physical presentation.
 
 Verification:
 

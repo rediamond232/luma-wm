@@ -4,7 +4,7 @@ fn run() -> Result<(), String> {
     match command.as_str() {
         "" | "--help" | "help" => {
             println!(
-                "wmctl status | subscribe | terminal | launcher | close | fullscreen | floating\n      workspace N [OUTPUT] | send N | focus DIRECTION/ID | move DIRECTION\n      layout master/monocle | ratio DELTA | scratchpad send/show\n      reload | lock | quit | config-default | config-check"
+                "wmctl status | subscribe | terminal | launcher | recorder | close | fullscreen | floating\n      recorder start|replay-start [output|window ID|region X Y W H]  (Screen capture)\n      recorder game-start PROFILE  (launch through an OpenGL or Vulkan API hook)\n      recorder game-attach PID  (inject into a running OpenGL process)\n      recorder xwayland-start WINDOW  (commit-paced compositor DMA-BUF capture)\n      recorder stop|toggle|pause|replay-save|status\n      Game Capture: Xwayland captures managed X11 windows without injection; OpenGL can launch or attach.\n      workspace N [OUTPUT] | send N | focus DIRECTION/ID | move DIRECTION\n      layout master/monocle | ratio DELTA | scratchpad send/show\n      reload | lock | quit | config-default | config-check"
             );
             Ok(())
         }

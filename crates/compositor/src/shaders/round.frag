@@ -12,6 +12,7 @@ uniform sampler2D tex;
 uniform float alpha;
 uniform vec4 wm_rect;
 uniform float wm_radius;
+uniform float wm_opacity;
 varying vec2 v_coords;
 #if defined(DEBUG_FLAGS)
 uniform float tint;
@@ -25,5 +26,5 @@ void main() {
     float radius = min(wm_radius, min(half_size.x, half_size.y));
     vec2 p = abs(gl_FragCoord.xy - wm_rect.xy - half_size) - half_size + radius;
     float distance = length(max(p, 0.0)) + min(max(p.x, p.y), 0.0) - radius;
-    gl_FragColor = color * alpha * (1.0 - smoothstep(-0.75, 0.75, distance));
+    gl_FragColor = color * alpha * wm_opacity * (1.0 - smoothstep(-0.75, 0.75, distance));
 }

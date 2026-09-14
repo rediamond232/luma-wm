@@ -15,6 +15,7 @@ pub mod focus;
 pub mod input_handler;
 #[cfg(feature = "libei")]
 pub mod libei;
+pub mod recorder;
 pub mod render;
 mod screencopy;
 pub mod shell;

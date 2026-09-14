@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Luma Recorder
+GenericName=Screen Recorder
+Comment=Record monitors, regions, or individual windows at high frame rates
+Exec=/usr/bin/wmctl recorder
+TryExec=/usr/bin/wmctl
+Icon=media-record
+Terminal=false
+Categories=AudioVideo;
+Keywords=screen;record;capture;video;replay;
+StartupNotify=false

@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Explicit launcher for the transparent Luma OpenGL present-event hook.
+set -euo pipefail
+
+usage() {
+    echo "Usage: $0 [--socket present-events.sock] [--stream-socket capture.sock --token 64-hex-token --fps N --quality 1..51 --expected-pid-file /absolute/path] [--debug-log /absolute/path] -- command [args...]" >&2
+}
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ -n ${LUMA_GAME_CAPTURE_GL_HOOK:-} ]]; then
+    library=$LUMA_GAME_CAPTURE_GL_HOOK
+elif [[ -n ${LUMA_GAME_CAPTURE_GL_LIBRARY:-} ]]; then
+    library=$LUMA_GAME_CAPTURE_GL_LIBRARY
+elif [[ -r $script_dir/libluma-game-capture-gl.so ]]; then
+    library=$script_dir/libluma-game-capture-gl.so
+else
+    library=$script_dir/build/libluma-game-capture-gl.so
+fi
+socket_path=
+stream_socket=
+stream_token=
+capture_fps=
+capture_quality=
+debug_log=
+expected_pid_file=
+
+while (($#)); do
+    case "$1" in
+        --socket)
+            (($# >= 2)) || { usage; exit 2; }
+            socket_path=$2
+            shift 2
+            ;;
+        --stream-socket)
+            (($# >= 2)) || { usage; exit 2; }
+            stream_socket=$2
+            shift 2
+            ;;
+        --token)
+            (($# >= 2)) || { usage; exit 2; }
+            stream_token=$2
+            shift 2
+            ;;
+        --fps)
+            (($# >= 2)) || { usage; exit 2; }
+            capture_fps=$2
+            shift 2
+            ;;
+        --quality)
+            (($# >= 2)) || { usage; exit 2; }
+            capture_quality=$2
+            shift 2
+            ;;
+        --debug-log)
+            (($# >= 2)) || { usage; exit 2; }
+            debug_log=$2
+            shift 2
+            ;;
+        --expected-pid-file)
+            (($# >= 2)) || { usage; exit 2; }
+            expected_pid_file=$2
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+[[ $# -gt 0 ]] || { usage; exit 2; }
+[[ -z $socket_path || $socket_path = /* ]] || { usage; exit 2; }
+[[ -z $stream_socket || $stream_socket = /* ]] || { usage; exit 2; }
+[[ -z $debug_log || $debug_log = /* ]] || { usage; exit 2; }
+[[ -z $expected_pid_file || $expected_pid_file = /* ]] || { usage; exit 2; }
+if [[ -n $stream_socket || -n $stream_token || -n $capture_fps ]]; then
+    [[ -n $stream_socket && $stream_token =~ ^[[:xdigit:]]{64}$ ]] || { usage; exit 2; }
+    [[ -z $capture_fps || $capture_fps =~ ^[1-9][0-9]*$ ]] || { usage; exit 2; }
+fi
+[[ -z $capture_quality || $capture_quality =~ ^([1-9]|[1-4][0-9]|5[0-1])$ ]] || { usage; exit 2; }
+[[ -z $capture_quality || -n $stream_socket ]] || { usage; exit 2; }
+[[ -n $socket_path || -n $stream_socket ]] || { usage; exit 2; }
+[[ -r $library ]] || { echo "Luma OpenGL hook is not built: $library" >&2; exit 1; }
+
+if [[ -n $socket_path ]]; then export LUMA_GAME_CAPTURE_SOCKET=$socket_path; fi
+if [[ -n $stream_socket ]]; then
+    export LUMA_GAME_CAPTURE_STREAM_SOCKET=$stream_socket
+    export LUMA_GAME_CAPTURE_TOKEN=$stream_token
+    if [[ -n $capture_fps ]]; then export LUMA_GAME_CAPTURE_FPS=$capture_fps; fi
+    if [[ -n $capture_quality ]]; then export LUMA_GAME_CAPTURE_QUALITY=$capture_quality; fi
+fi
+# The hook stays loaded for dynamic-loader semantics, but only this exec'ed
+# process may capture. `$$` is inherited from a parent Bash when this launcher
+# itself is started in the background; BASHPID is the process that will exec
+# the target and therefore the PID the kernel exposes through SO_PEERCRED.
+# Forked helpers inherit the preload harmlessly and pass through to the real
+# GL functions without touching the capture socket.
+capture_pid=${BASHPID:-$$}
+export LUMA_GAME_CAPTURE_TARGET_PID=$capture_pid
+if [[ -n $debug_log ]]; then export LUMA_GAME_CAPTURE_DEBUG_LOG=$debug_log; fi
+# `exec` preserves this PID. Publish it before the target can make its first
+# GL swap, using a same-directory rename so a muxer never observes a partial
+# number. The caller owns removal of the runtime file.
+if [[ -n $expected_pid_file ]]; then
+    pid_dir=$(dirname -- "$expected_pid_file")
+    [[ -d $pid_dir ]] || { echo "Luma expected PID directory does not exist: $pid_dir" >&2; exit 2; }
+    pid_tmp=$(mktemp "$pid_dir/.luma-game-capture-pid.XXXXXX")
+    trap 'rm -f -- "$pid_tmp"' EXIT
+    printf '%s\n' "$capture_pid" >"$pid_tmp"
+    chmod 600 "$pid_tmp"
+    mv -f -- "$pid_tmp" "$expected_pid_file"
+    trap - EXIT
+fi
+export LD_PRELOAD="$library${LD_PRELOAD:+:$LD_PRELOAD}"
+exec "$@"

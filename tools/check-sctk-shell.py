@@ -65,9 +65,26 @@ def main():
             f"path = {json.dumps(str(video))}\n"
             "fps = 2\n"
         )
+        if os.environ.get("WM_CHECK_VULKAN_PROFILE"):
+            video_config += (
+                "\n[recorder]\n"
+                f"output_directory = {json.dumps(str(directory / 'captures'))}\n"
+                "\n[[recorder.game_profiles]]\n"
+                'name = "vulkan-ui-fixture"\n'
+                'api = "vulkan"\n'
+                'command = ["/usr/bin/vkcube", "--wsi", "xcb", "--present_mode", "0", "--c", "4000"]\n'
+                "fps = 480\n"
+            )
         config.write_text(video_config)
         socket_path = directory / "wm.sock"
-        env = dict(os.environ, WM_CONFIG=str(config), WM_SOCKET=str(socket_path), WM_PRIVATE_BUS="1")
+        nested_title = "wm-sctk-shell-test"
+        env = dict(
+            os.environ,
+            WM_CONFIG=str(config),
+            WM_SOCKET=str(socket_path),
+            WM_PRIVATE_BUS="1",
+            WM_NESTED_TITLE=nested_title,
+        )
         process = subprocess.Popen(
             [str(ROOT / "tools/run-nested.sh")], cwd=ROOT, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -108,7 +125,7 @@ def main():
                 f"> {notification_info}",
             ]
             assert request(socket_path, "exec " + json.dumps(argv))["ok"]
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 7
             while not notification_info.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)
             assert "Luma SCTK shell" in notification_info.read_text(), notification_info.read_text()
@@ -197,6 +214,11 @@ def main():
                 socket_path, process,
                 lambda state: any(layer["namespace"] == "wm-notifications" and layer.get("surface_size") for layer in state["layers"]),
             )
+            if screenshot := os.environ.get("WM_CHECK_POPUP_SCREENSHOT"):
+                window = subprocess.check_output(
+                    ["xdotool", "search", "--name", f"^{nested_title}$"], text=True
+                ).strip().splitlines()[-1]
+                subprocess.run(["import", "-window", window, screenshot], check=True)
             notification_close = directory / "notification-close.txt"
             argv = [
                 "sh", "-lc",
@@ -214,7 +236,7 @@ def main():
             notification_monitor_ready = directory / "notification-monitor-ready.txt"
             argv = [
                 "sh", "-lc",
-                "timeout 3s gdbus monitor --session --dest org.freedesktop.Notifications "
+                "timeout 8s stdbuf -oL gdbus monitor --session --dest org.freedesktop.Notifications "
                 "--object-path /org/freedesktop/Notifications "
                 f"> {notification_monitor} 2>&1 & echo ready > {notification_monitor_ready}",
             ]
@@ -229,17 +251,18 @@ def main():
                 "gdbus call --session --dest org.freedesktop.Notifications "
                 "--object-path /org/freedesktop/Notifications "
                 "--method org.freedesktop.Notifications.Notify "
-                "luma 0 '' 'SCTK expiry' 'one-shot timer' [] '{}' 150 "
+                "luma 0 '' 'SCTK expiry' 'five-second popup' [] '{}' 0 "
                 f"> {notification_expiry_reply} 2>&1",
             ]
             assert request(socket_path, "exec " + json.dumps(argv))["ok"]
-            deadline = time.monotonic() + 5
+            expiry_started = time.monotonic()
+            deadline = expiry_started + 7
             while not notification_expiry_reply.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)
             expiry_reply = notification_expiry_reply.read_text()
             expiry_id = re.search(r"uint32 (\d+)", expiry_reply)
             assert expiry_id, expiry_reply
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + 7
             while time.monotonic() < deadline:
                 monitor_text = notification_monitor.read_text() if notification_monitor.exists() else ""
                 if re.search(
@@ -251,14 +274,75 @@ def main():
                 time.sleep(0.05)
             else:
                 raise AssertionError(
-                    "short-lived notification did not emit NotificationClosed reason 1: "
+                    "five-second notification did not emit NotificationClosed reason 1: "
                     + (notification_monitor.read_text() if notification_monitor.exists() else "")
                 )
+            assert time.monotonic() - expiry_started >= 4.5
+            wait_for(
+                socket_path, process,
+                lambda state: any(
+                    layer["namespace"] == "wm-notifications"
+                    and layer.get("surface_size") == [1, 1]
+                    for layer in state["layers"]
+                ),
+            )
+            assert request(socket_path, "recorder")["ok"]
+            wait_for(
+                socket_path, process,
+                lambda state: any(
+                    layer["namespace"] == "wm-recorder"
+                    and layer.get("surface_size", [0, 0])[0] > 100
+                    for layer in state["layers"]
+                ),
+            )
+            window = None
+            recorder_cycles = int(os.environ.get("WM_CHECK_RECORDER_CYCLES", "0"))
+            if recorder_cycles:
+                window = subprocess.check_output(
+                    ["xdotool", "search", "--name", f"^{nested_title}$"], text=True
+                ).strip().splitlines()[-1]
+                subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
+                for _ in range(recorder_cycles):
+                    subprocess.run(["xdotool", "key", "Right"], check=True)
+                    time.sleep(0.1)
+            time.sleep(1.5)
+            if screenshot := os.environ.get("WM_CHECK_RECORDER_SCREENSHOT"):
+                if window is None:
+                    window = subprocess.check_output(
+                        ["xdotool", "search", "--name", f"^{nested_title}$"], text=True
+                    ).strip().splitlines()[-1]
+                subprocess.run(["import", "-window", window, screenshot], check=True)
+            if os.environ.get("WM_CHECK_RECORDER_START"):
+                if window is None:
+                    window = subprocess.check_output(
+                        ["xdotool", "search", "--name", f"^{nested_title}$"], text=True
+                    ).strip().splitlines()[-1]
+                    subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
+                subprocess.run(["xdotool", "key", "Return"], check=True)
+                capture_directory = directory / "captures"
+                deadline = time.monotonic() + 20
+                captures = []
+                while time.monotonic() < deadline:
+                    captures = list(capture_directory.glob("*.mp4"))
+                    if captures and captures[0].stat().st_size > 0:
+                        probe = subprocess.run(
+                            [
+                                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                                "-count_packets", "-show_entries", "stream=nb_read_packets",
+                                "-of", "default=nw=1:nk=1", str(captures[0]),
+                            ],
+                            capture_output=True, text=True,
+                        )
+                        if probe.returncode == 0 and probe.stdout.strip().isdigit() and int(probe.stdout) > 0:
+                            break
+                    time.sleep(0.1)
+                else:
+                    raise AssertionError("native Vulkan recorder UI did not produce a video")
             launcher_requested = time.monotonic()
             assert request(socket_path, "launcher")["ok"]
             wait_for(socket_path, process, lambda state: any(layer["namespace"] == "wm-launcher" for layer in state["layers"]))
             assert time.monotonic() - launcher_requested < 2, "launcher surface took too long to appear"
-            print("PASS: SCTK bar, video wallpaper, launcher, notification, and tray D-Bus services work without GTK")
+            print("PASS: SCTK bar, video wallpaper, launcher, recorder, notification, and tray D-Bus services work without GTK")
         finally:
             process.terminate()
             try:

@@ -5,13 +5,24 @@ use smithay::{
     backend::{
         allocator::{Buffer, Fourcc, dmabuf::Dmabuf},
         renderer::{
-            Bind, ExportMem, Offscreen, TextureMapping,
+            Bind, ExportMem, Frame as _, Offscreen, Renderer as _, TextureMapping,
             damage::OutputDamageTracker,
-            element::{AsRenderElements, memory::MemoryRenderBuffer},
+            element::{
+                AsRenderElements,
+                memory::MemoryRenderBuffer,
+                surface::WaylandSurfaceRenderElement,
+                utils::{
+                    ConstrainAlign, ConstrainScaleBehavior, CropRenderElement,
+                    RelocateRenderElement, RescaleRenderElement,
+                },
+            },
             gles::{GlesRenderer, GlesTexture},
         },
     },
-    desktop::Space,
+    desktop::{
+        Space,
+        space::{ConstrainBehavior, ConstrainReference, constrain_space_element},
+    },
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     output::Output,
     reexports::wayland_server::protocol::{wl_buffer::WlBuffer, wl_shm},
@@ -333,6 +344,7 @@ pub fn render_window_texture(
                 blur: retained.map(|(program, _, _, _)| program.clone()),
                 blur_strength: retained.map(|(_, _, strength, _)| *strength).unwrap_or(0.0),
                 blur_alpha: retained.map(|(_, _, _, alpha)| *alpha).unwrap_or(1.0),
+                opacity: 1.0,
                 backdrop: retained.map(|(_, backdrop, _, _)| backdrop.clone()),
                 frozen_backdrop: true,
                 geometry_override,
@@ -456,6 +468,111 @@ pub fn render_dmabuf(
         false,
     )
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+type ConstrainedSurfaceElement = CropRenderElement<
+    RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
+>;
+
+/// Render a single application's client surface and its popups. Using the
+/// underlying Smithay window intentionally leaves Luma's server-side frame out.
+pub fn render_window_dmabuf(
+    renderer: &mut GlesRenderer,
+    window: &WindowElement,
+    output: &Output,
+    dmabuf: &mut Dmabuf,
+) -> Result<(), String> {
+    let size = output
+        .current_transform()
+        .transform_size(output.current_mode().ok_or("output mode")?.size);
+    if dmabuf.size().w != size.w || dmabuf.size().h != size.h {
+        return Err("capture DMA-BUF has the wrong size".into());
+    }
+    let scale = output.current_scale().fractional_scale();
+    let logical_size = size.to_f64().to_logical(scale).to_i32_round();
+    let constrain = Rectangle::from_size(logical_size);
+    let elements: Vec<ConstrainedSurfaceElement> = constrain_space_element(
+        renderer,
+        &window.0,
+        (0, 0),
+        1.0,
+        scale,
+        constrain,
+        ConstrainBehavior {
+            reference: ConstrainReference::BoundingBox,
+            behavior: ConstrainScaleBehavior::Fit,
+            align: ConstrainAlign::CENTER,
+        },
+    )
+    .collect();
+    let mut target = renderer.bind(dmabuf).map_err(|e| e.to_string())?;
+    let mut damage = OutputDamageTracker::new(size, scale, Transform::Normal);
+    damage
+        .render_output(
+            renderer,
+            &mut target,
+            0,
+            &elements,
+            smithay::backend::renderer::Color32F::BLACK,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Crop a logical output region and scale it into the recorder's fixed canvas.
+/// The intermediate image remains a GPU texture; no CPU readback is involved.
+pub fn render_region_dmabuf(
+    renderer: &mut GlesRenderer,
+    space: &Space<WindowElement>,
+    output: &Output,
+    cursor: Option<&CaptureCursor>,
+    region: wm_core::Rect,
+    dmabuf: &mut Dmabuf,
+) -> Result<(), String> {
+    let output_size = output
+        .current_transform()
+        .transform_size(output.current_mode().ok_or("output mode")?.size);
+    if dmabuf.size().w != output_size.w || dmabuf.size().h != output_size.h {
+        return Err("capture DMA-BUF has the wrong size".into());
+    }
+    let output_geo = space
+        .output_geometry(output)
+        .ok_or("output has no geometry")?;
+    let requested =
+        Rectangle::<i32, Logical>::new((region.x, region.y).into(), (region.w, region.h).into());
+    let local = requested
+        .intersection(output_geo)
+        .ok_or("capture region does not intersect the selected output")?;
+    let local = Rectangle::new(local.loc - output_geo.loc, local.size);
+    let scale = output.current_scale().fractional_scale();
+    let output_logical_size = output_size.to_f64().to_logical(scale);
+    let source = local
+        .to_f64()
+        .to_buffer(scale, Transform::Normal, &output_logical_size);
+    let texture = render_texture(renderer, space, output, cursor)?;
+    let mut target = renderer.bind(dmabuf).map_err(|e| e.to_string())?;
+    let mut frame = renderer
+        .render(&mut target, output_size, Transform::Normal)
+        .map_err(|e| e.to_string())?;
+    let full = Rectangle::from_size(output_size);
+    frame
+        .clear(smithay::backend::renderer::Color32F::BLACK, &[full])
+        .map_err(|e| e.to_string())?;
+    frame
+        .render_texture_from_to(
+            &texture,
+            source,
+            full,
+            &[full],
+            &[full],
+            Transform::Normal,
+            1.0,
+            None,
+            &[],
+        )
+        .map_err(|e| e.to_string())?;
+    let _sync = frame.finish().map_err(|e| e.to_string())?;
     Ok(())
 }
 

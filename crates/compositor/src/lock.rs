@@ -84,6 +84,12 @@ impl<B: Backend + 'static> SessionLockHandler for AnvilState<B> {
             return;
         }
         self.lock.locked = true;
+        self.stop_capture_boost();
+        if self.desktop.recorder.is_running() {
+            self.desktop
+                .recorder
+                .abort("recording stopped because the session locked");
+        }
         // Stop existing streams before changing input focus or presenting lock
         // content. Unlock requires clients to request new capture sessions.
         self.capture_sessions.clear();

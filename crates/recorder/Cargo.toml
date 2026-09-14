@@ -1,0 +1,20 @@
+[package]
+name = "luma-recorder-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gbm = "0.18"
+drm-fourcc = "2"
+gstreamer = { version = "0.24", features = ["v1_24"] }
+gstreamer-allocators = { version = "0.24", features = ["v1_24"] }
+gstreamer-video = { version = "0.24", features = ["v1_24"] }
+libc = "0.2"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+
+[[bin]]
+name = "luma-recorder-engine"
+path = "src/main.rs"

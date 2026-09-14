@@ -1938,6 +1938,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "luma-game-capture-muxer"
+version = "0.1.0"
+dependencies = [
+ "gstreamer",
+ "libc",
+ "luma-game-capture-protocol",
+]
+
+[[package]]
+name = "luma-game-capture-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "luma-recorder-engine"
+version = "0.1.0"
+dependencies = [
+ "drm-fourcc",
+ "gbm",
+ "gstreamer",
+ "gstreamer-allocators",
+ "gstreamer-video",
+ "libc",
+ "wayland-client",
+ "wayland-protocols",
+]
+
+[[package]]
 name = "lz4_flex"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -50,13 +50,14 @@ use smithay_client_toolkit::{
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
-use wm_core::{Config, Snapshot};
+use wm_core::{Config, RecorderState, Snapshot};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     Bar,
     Wallpaper,
     Launcher,
+    Recorder,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,8 +65,146 @@ enum SurfaceKind {
     Bar,
     Wallpaper,
     Launcher,
+    Recorder,
     Notifications,
     TrayMenu,
+    Controls,
+}
+
+/// The native equivalents of GTK's bar popovers.  Keeping the selected panel
+/// in the shell means the SCTK backend remains usable without a GTK process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlPanel {
+    Audio,
+    Network,
+    Bluetooth,
+    Media,
+    Notifications,
+    Power,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PowerAction {
+    LogOut,
+    Reboot,
+    Shutdown,
+}
+
+impl PowerAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LogOut => "Log out",
+            Self::Reboot => "Reboot",
+            Self::Shutdown => "Shut down",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecorderCaptureMode {
+    Screen,
+    XwaylandDirect,
+    OpenGlInject,
+    OpenGlGame,
+    VulkanGame,
+}
+
+impl RecorderCaptureMode {
+    const ALL: [Self; 5] = [
+        Self::Screen,
+        Self::XwaylandDirect,
+        Self::OpenGlInject,
+        Self::OpenGlGame,
+        Self::VulkanGame,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Screen => "Screen (low-lag)",
+            Self::XwaylandDirect => "Xwayland Zero-Copy",
+            Self::OpenGlInject => "OpenGL API Inject",
+            Self::OpenGlGame => "OpenGL Launch Profile",
+            Self::VulkanGame => "Vulkan API Layer",
+        }
+    }
+
+    fn cycle(self, forward: bool) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|mode| *mode == self)
+            .expect("capture mode is listed");
+        let next = if forward {
+            (index + 1) % Self::ALL.len()
+        } else {
+            (index + Self::ALL.len() - 1) % Self::ALL.len()
+        };
+        Self::ALL[next]
+    }
+}
+
+fn recorder_attach_targets() -> Vec<RecorderAttachTarget> {
+    use std::os::unix::fs::MetadataExt;
+
+    let own_uid = match std::fs::metadata("/proc/self") {
+        Ok(metadata) => metadata.uid(),
+        Err(_) => return Vec::new(),
+    };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !entry
+            .metadata()
+            .is_ok_and(|metadata| metadata.uid() == own_uid)
+        {
+            continue;
+        }
+        let proc = entry.path();
+        let Ok(maps) = std::fs::read_to_string(proc.join("maps")) else {
+            continue;
+        };
+        let opengl = maps.lines().any(|line| {
+            line.contains("/libGL.so")
+                || line.contains("/libGLX.so")
+                || line.contains("/libOpenGL.so")
+                || line.contains("/libEGL.so")
+        });
+        if !opengl || pid == std::process::id() {
+            continue;
+        }
+        // Never read /proc/PID/cmdline here: Minecraft launch arguments can
+        // contain access tokens. `comm` is enough for a safe picker label.
+        let comm = std::fs::read_to_string(proc.join("comm"))
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "java".into());
+        if matches!(comm.as_str(), "wm" | "wm-shell" | "wm-shell-sctk") {
+            continue;
+        }
+        targets.push(RecorderAttachTarget {
+            pid,
+            comm,
+            api: "OpenGL",
+        });
+    }
+    targets.sort_by_key(|target| target.pid);
+    targets
+}
+
+#[derive(Clone, Debug)]
+struct RecorderAttachTarget {
+    pid: u32,
+    comm: String,
+    api: &'static str,
 }
 
 impl Mode {
@@ -74,6 +213,8 @@ impl Mode {
             Self::Wallpaper
         } else if std::env::args().any(|arg| arg == "--launcher") {
             Self::Launcher
+        } else if std::env::args().any(|arg| arg == "--recorder") {
+            Self::Recorder
         } else {
             Self::Bar
         }
@@ -105,6 +246,14 @@ struct Notification {
 }
 
 const CONFIG_ERROR_NOTIFICATION_ID: u32 = u32::MAX;
+/// Keep the status widgets clear of the rounded panel edge and visibly left
+/// of the screen edge without desynchronising their pointer hitboxes.
+const BAR_RIGHT_INSET: u32 = 44;
+const NOTIFICATION_LIFETIME: Duration = Duration::from_secs(5);
+
+fn application_notification_expiry(now: Instant) -> Instant {
+    now + NOTIFICATION_LIFETIME
+}
 
 fn config_error_notification(error: &str) -> Notification {
     Notification {
@@ -146,6 +295,7 @@ impl Default for AudioState {
 #[derive(Clone, PartialEq, Eq)]
 struct NetworkState {
     label: String,
+    networking_enabled: bool,
     wireless_enabled: bool,
 }
 
@@ -459,8 +609,63 @@ fn spawn_tray_item_monitor(
     sender: channel::Sender<TrayEvent>,
     items: Arc<Mutex<Vec<String>>>,
 ) {
+    let owner_id = id.clone();
+    let owner_service = service.clone();
+    let owner_sender = sender.clone();
+    let owner_items = items.clone();
     thread::spawn(move || {
         let Ok(connection) = zbus::blocking::Connection::session() else {
+            remove_tray_item(&owner_id, &owner_sender, &owner_items);
+            return;
+        };
+        let Ok(bus) = zbus::blocking::Proxy::new(
+            &connection,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        ) else {
+            remove_tray_item(&owner_id, &owner_sender, &owner_items);
+            return;
+        };
+        let Ok(signals) = bus.receive_signal("NameOwnerChanged") else {
+            remove_tray_item(&owner_id, &owner_sender, &owner_items);
+            return;
+        };
+        let Ok(owner) = bus.call::<_, _, String>("GetNameOwner", &(owner_service.as_str(),)) else {
+            remove_tray_item(&owner_id, &owner_sender, &owner_items);
+            return;
+        };
+        // The match rule is installed before querying the owner. Re-check it
+        // afterwards so an application that exits in that small window cannot
+        // leave a permanent icon behind.
+        if bus
+            .call::<_, _, String>("GetNameOwner", &(owner_service.as_str(),))
+            .ok()
+            .as_deref()
+            != Some(owner.as_str())
+        {
+            remove_tray_item(&owner_id, &owner_sender, &owner_items);
+            return;
+        }
+        for signal in signals {
+            let removed = signal
+                .body()
+                .deserialize::<(String, String, String)>()
+                .ok()
+                .is_some_and(|(name, old_owner, new_owner)| {
+                    tray_service_owner_lost(&name, &old_owner, &new_owner, &owner_service, &owner)
+                });
+            if removed {
+                remove_tray_item(&owner_id, &owner_sender, &owner_items);
+                return;
+            }
+        }
+        remove_tray_item(&owner_id, &owner_sender, &owner_items);
+    });
+
+    thread::spawn(move || {
+        let Ok(connection) = zbus::blocking::Connection::session() else {
+            remove_tray_item(&id, &sender, &items);
             return;
         };
         let Ok(item) = zbus::blocking::Proxy::new(
@@ -469,9 +674,11 @@ fn spawn_tray_item_monitor(
             path.as_str(),
             "org.kde.StatusNotifierItem",
         ) else {
+            remove_tray_item(&id, &sender, &items);
             return;
         };
         let Ok(signals) = item.receive_all_signals() else {
+            remove_tray_item(&id, &sender, &items);
             return;
         };
         for signal in signals {
@@ -489,12 +696,36 @@ fn spawn_tray_item_monitor(
                 return;
             }
         }
-        items
-            .lock()
-            .expect("tray item list poisoned")
-            .retain(|registered| registered != &id);
-        let _ = sender.send(TrayEvent::Remove(id));
+        remove_tray_item(&id, &sender, &items);
     });
+}
+
+fn remove_tray_item(
+    id: &str,
+    sender: &channel::Sender<TrayEvent>,
+    items: &Arc<Mutex<Vec<String>>>,
+) {
+    let removed = {
+        let mut registered = items.lock().expect("tray item list poisoned");
+        let Some(index) = registered.iter().position(|known| known == id) else {
+            return;
+        };
+        registered.remove(index);
+        true
+    };
+    if removed {
+        let _ = sender.send(TrayEvent::Remove(id.to_owned()));
+    }
+}
+
+fn tray_service_owner_lost(
+    name: &str,
+    old_owner: &str,
+    new_owner: &str,
+    service: &str,
+    owner: &str,
+) -> bool {
+    name == service && old_owner == owner && new_owner != owner
 }
 
 fn tray_signal_needs_refresh(member: Option<&str>) -> bool {
@@ -667,7 +898,7 @@ impl NotificationServer {
         body: String,
         actions: Vec<String>,
         _hints: BTreeMap<String, zbus::zvariant::OwnedValue>,
-        expire_timeout: i32,
+        _expire_timeout: i32,
     ) -> u32 {
         let id = if replaces_id == 0 {
             self.next_id
@@ -677,13 +908,7 @@ impl NotificationServer {
         } else {
             replaces_id
         };
-        let expires_at = match expire_timeout {
-            timeout if timeout > 0 => {
-                Some(std::time::Instant::now() + Duration::from_millis(timeout as u64))
-            }
-            0 => None,
-            _ => Some(std::time::Instant::now() + Duration::from_secs(6)),
-        };
+        let expires_at = Some(application_notification_expiry(Instant::now()));
         let _ = self.sender.send(NotificationEvent::Upsert(Notification {
             id,
             icon: load_notification_icon(&app_icon),
@@ -779,6 +1004,11 @@ struct App {
     apps_loaded: bool,
     launcher_query: String,
     launcher_selected: usize,
+    recorder_selected: usize,
+    recorder_capture_mode: RecorderCaptureMode,
+    recorder_game_profile_selected: usize,
+    recorder_attach_selected: usize,
+    recorder_xwayland_selected: usize,
     notifications: VecDeque<Notification>,
     notification_timers: BTreeMap<u32, RegistrationToken>,
     notification_events: Option<channel::Sender<NotificationEvent>>,
@@ -793,6 +1023,8 @@ struct App {
     network: NetworkState,
     media: MediaState,
     bluetooth: BluetoothState,
+    control_panel: Option<ControlPanel>,
+    pending_power_action: Option<PowerAction>,
     tray: Vec<TrayItem>,
     tray_menu: Option<TrayMenuState>,
     tray_menu_events: Option<channel::Sender<TrayMenuEvent>>,
@@ -864,6 +1096,11 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
         apps_loaded: false,
         launcher_query: String::new(),
         launcher_selected: 0,
+        recorder_selected: 0,
+        recorder_capture_mode: RecorderCaptureMode::Screen,
+        recorder_game_profile_selected: 0,
+        recorder_attach_selected: 0,
+        recorder_xwayland_selected: 0,
         notifications: VecDeque::new(),
         notification_timers: BTreeMap::new(),
         notification_events: None,
@@ -877,6 +1114,7 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
         audio: AudioState::default(),
         network: NetworkState {
             label: "NET —".into(),
+            networking_enabled: false,
             wireless_enabled: false,
         },
         media: MediaState {
@@ -886,6 +1124,8 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
             label: "BT —".into(),
             powered: None,
         },
+        control_panel: None,
+        pending_power_action: None,
         tray: Vec::new(),
         tray_menu: None,
         tray_menu_events: None,
@@ -939,8 +1179,15 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                             Mode::Bar => bar_snapshot_changed(&app.snapshot, &snapshot),
                             Mode::Wallpaper => false,
                             Mode::Launcher => false,
+                            Mode::Recorder => {
+                                app.snapshot.recorder != snapshot.recorder
+                                    || app.snapshot.outputs != snapshot.outputs
+                                    || app.snapshot.windows != snapshot.windows
+                            }
                         };
                         app.snapshot = snapshot;
+                        app.recorder_selected =
+                            app.recorder_selected.min(app.snapshot.windows.len());
                         if config_error_changed {
                             if let Some(error) = app.snapshot.error.as_deref() {
                                 if let Some(sender) = app.notification_events.as_ref() {
@@ -1022,7 +1269,6 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                         NotificationEvent::Upsert(notification) => {
                             let id = notification.id;
                             let expiry = notification.expires_at;
-                            let critical = notification.critical;
                             if let Some(timer) = app.notification_timers.remove(&id) {
                                 notification_timer_handle.remove(timer);
                             }
@@ -1044,9 +1290,6 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                                 }
                             }
                             app.notification_offset = 0;
-                            if critical || !app.do_not_disturb.load(Ordering::Relaxed) {
-                                app.ensure_notification_surface(&notification_timer_qh);
-                            }
                             if let Some(expiry) = expiry {
                                 let qh = notification_timer_qh.clone();
                                 let timer = notification_timer_handle.insert_source(
@@ -1054,6 +1297,8 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                                     move |_, _, app| {
                                         app.notification_timers.remove(&id);
                                         if expire_notifications(app, Instant::now()) {
+                                            app.clamp_notification_offset();
+                                            app.sync_notification_surface(&qh);
                                             app.redraw_all(&qh);
                                         }
                                         TimeoutAction::Drop
@@ -1091,6 +1336,7 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                             app.clamp_notification_offset();
                         }
                     }
+                    app.sync_notification_surface(&notification_timer_qh);
                     app.redraw_all(&notification_timer_qh);
                 }
             })
@@ -1203,6 +1449,10 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                 };
                 let notifications_changed = expire_notifications(app, now);
                 if clock_changed || battery_changed || notifications_changed {
+                    if notifications_changed {
+                        app.clamp_notification_offset();
+                        app.sync_notification_surface(&qh);
+                    }
                     app.redraw_all(&qh);
                 }
                 TimeoutAction::ToDuration(next_bar_maintenance_delay(app, Instant::now()))
@@ -1255,7 +1505,7 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     spawn_config_watcher(sender);
 
-    if mode == Mode::Launcher {
+    if matches!(mode, Mode::Launcher | Mode::Recorder) {
         app.add_surface(&qh, None);
     }
 
@@ -1475,6 +1725,7 @@ fn read_network_state(proxy: &zbus::blocking::Proxy<'_>) -> NetworkState {
     if !networking {
         return NetworkState {
             label: "NET OFF".into(),
+            networking_enabled: false,
             wireless_enabled: false,
         };
     }
@@ -1505,12 +1756,14 @@ fn read_network_state(proxy: &zbus::blocking::Proxy<'_>) -> NetworkState {
                         "NET"
                     }
                 ),
+                networking_enabled: true,
                 wireless_enabled: wireless,
             };
         }
     }
     NetworkState {
         label: if wireless { "WIFI" } else { "NET" }.into(),
+        networking_enabled: true,
         wireless_enabled: wireless,
     }
 }
@@ -1542,6 +1795,7 @@ fn spawn_network_monitor(sender: channel::Sender<NetworkState>) {
             if sender
                 .send(NetworkState {
                     label: "NET —".into(),
+                    networking_enabled: false,
                     wireless_enabled: false,
                 })
                 .is_err()
@@ -2336,6 +2590,247 @@ impl App {
         });
     }
 
+    fn recorder_source_label(&self) -> String {
+        if self.recorder_selected == 0 {
+            "Monitor / region portal picker".into()
+        } else {
+            self.snapshot
+                .windows
+                .get(self.recorder_selected - 1)
+                .map(|window| format!("Window {}: {}", window.id, window.title))
+                .unwrap_or_else(|| "Monitor / region portal picker".into())
+        }
+    }
+
+    fn recorder_capture_label(&self) -> String {
+        self.recorder_capture_mode.label().into()
+    }
+
+    fn recorder_game_profile_count(&self) -> usize {
+        let api = match self.recorder_capture_mode {
+            RecorderCaptureMode::OpenGlGame => "opengl",
+            RecorderCaptureMode::VulkanGame => "vulkan",
+            RecorderCaptureMode::Screen
+            | RecorderCaptureMode::XwaylandDirect
+            | RecorderCaptureMode::OpenGlInject => return 0,
+        };
+        self.config
+            .recorder
+            .game_profiles
+            .iter()
+            .filter(|profile| profile.api == api)
+            .count()
+    }
+
+    fn selected_recorder_game_profile(&self) -> Option<&wm_core::GameCaptureProfile> {
+        let api = match self.recorder_capture_mode {
+            RecorderCaptureMode::OpenGlGame => "opengl",
+            RecorderCaptureMode::VulkanGame => "vulkan",
+            RecorderCaptureMode::Screen
+            | RecorderCaptureMode::XwaylandDirect
+            | RecorderCaptureMode::OpenGlInject => return None,
+        };
+        self.config
+            .recorder
+            .game_profiles
+            .iter()
+            .filter(|profile| profile.api == api)
+            .nth(self.recorder_game_profile_selected)
+    }
+
+    fn recorder_selection_heading(&self) -> &'static str {
+        match self.recorder_capture_mode {
+            RecorderCaptureMode::Screen => "SOURCE",
+            RecorderCaptureMode::XwaylandDirect => "WINDOW",
+            RecorderCaptureMode::OpenGlInject => "PROCESS",
+            RecorderCaptureMode::OpenGlGame | RecorderCaptureMode::VulkanGame => "PROFILE",
+        }
+    }
+
+    fn recorder_selection_label(&self) -> String {
+        match self.recorder_capture_mode {
+            RecorderCaptureMode::Screen => self.recorder_source_label(),
+            RecorderCaptureMode::XwaylandDirect => self
+                .selected_recorder_xwayland_window()
+                .map(|window| {
+                    format!(
+                        "XID {:#x}  ·  {}",
+                        window.x11_window.expect("filtered Xwayland window"),
+                        window.title
+                    )
+                })
+                .unwrap_or_else(|| "No Xwayland window found".into()),
+            RecorderCaptureMode::OpenGlInject => self
+                .selected_recorder_attach_target()
+                .map(|target| format!("PID {}  ·  {}  ·  {}", target.pid, target.comm, target.api))
+                .unwrap_or_else(|| "No running OpenGL process found".into()),
+            RecorderCaptureMode::OpenGlGame | RecorderCaptureMode::VulkanGame => self
+                .selected_recorder_game_profile()
+                .map(|profile| format!("{}  ·  {} FPS", profile.name, profile.fps))
+                .unwrap_or_else(|| "No matching game profile configured".into()),
+        }
+    }
+
+    fn recorder_capture_note(&self) -> &'static str {
+        match self.recorder_capture_mode {
+            RecorderCaptureMode::Screen => {
+                "GAME CAPTURE  inject into a running graphics process or launch a profile"
+            }
+            RecorderCaptureMode::XwaylandDirect => {
+                "XWAYLAND  commit-paced compositor DMA-BUF copy; no injection or CPU pixels"
+            }
+            RecorderCaptureMode::OpenGlInject => {
+                "OPENGL INJECT  hooks resolved GLX/EGL presents; stopping leaves the game running"
+            }
+            RecorderCaptureMode::OpenGlGame => {
+                "OPENGL  starts the selected Luma launch profile and game hook"
+            }
+            RecorderCaptureMode::VulkanGame => {
+                "VULKAN  launches through a DMA-BUF present layer and external GPU encoder"
+            }
+        }
+    }
+
+    fn recorder_can_start(&self) -> bool {
+        match self.recorder_capture_mode {
+            RecorderCaptureMode::Screen => true,
+            RecorderCaptureMode::XwaylandDirect => {
+                self.config.recorder.codec == "h264"
+                    && self.selected_recorder_xwayland_window().is_some()
+            }
+            RecorderCaptureMode::OpenGlInject => {
+                self.config.recorder.codec == "h264"
+                    && self.selected_recorder_attach_target().is_some()
+            }
+            RecorderCaptureMode::OpenGlGame | RecorderCaptureMode::VulkanGame => {
+                self.config.recorder.codec == "h264"
+                    && self.selected_recorder_game_profile().is_some()
+            }
+        }
+    }
+
+    fn recorder_start_command(&self) -> Option<String> {
+        match self.recorder_capture_mode {
+            RecorderCaptureMode::Screen => Some(self.recorder_command("start")),
+            RecorderCaptureMode::XwaylandDirect => self
+                .selected_recorder_xwayland_window()
+                .and_then(|window| window.x11_window)
+                .map(|window| format!("recorder xwayland-start {window}")),
+            RecorderCaptureMode::OpenGlInject => self
+                .selected_recorder_attach_target()
+                .map(|target| format!("recorder game-attach {}", target.pid)),
+            RecorderCaptureMode::OpenGlGame | RecorderCaptureMode::VulkanGame => self
+                .selected_recorder_game_profile()
+                .map(|profile| format!("recorder game-start {}", profile.name)),
+        }
+    }
+
+    fn recorder_display_fps(&self) -> u32 {
+        match self.recorder_capture_mode {
+            RecorderCaptureMode::Screen => self.config.recorder.screen_fps,
+            RecorderCaptureMode::XwaylandDirect => self.config.recorder.fps,
+            RecorderCaptureMode::OpenGlInject => self.config.recorder.fps,
+            RecorderCaptureMode::OpenGlGame | RecorderCaptureMode::VulkanGame => self
+                .selected_recorder_game_profile()
+                .map(|profile| profile.fps)
+                .unwrap_or(self.config.recorder.fps),
+        }
+    }
+
+    fn move_recorder_selection(&mut self, forward: bool) {
+        if self.recorder_capture_mode == RecorderCaptureMode::Screen {
+            if forward {
+                self.recorder_selected =
+                    (self.recorder_selected + 1).min(self.snapshot.windows.len());
+            } else {
+                self.recorder_selected = self.recorder_selected.saturating_sub(1);
+            }
+            return;
+        }
+        if self.recorder_capture_mode == RecorderCaptureMode::XwaylandDirect {
+            let count = self
+                .snapshot
+                .windows
+                .iter()
+                .filter(|window| window.x11_window.is_some())
+                .count();
+            if count == 0 {
+                self.recorder_xwayland_selected = 0;
+            } else if forward {
+                self.recorder_xwayland_selected =
+                    (self.recorder_xwayland_selected + 1).min(count - 1);
+            } else {
+                self.recorder_xwayland_selected = self.recorder_xwayland_selected.saturating_sub(1);
+            }
+            return;
+        }
+        if self.recorder_capture_mode == RecorderCaptureMode::OpenGlInject {
+            let count = recorder_attach_targets().len();
+            if count == 0 {
+                self.recorder_attach_selected = 0;
+            } else if forward {
+                self.recorder_attach_selected = (self.recorder_attach_selected + 1).min(count - 1);
+            } else {
+                self.recorder_attach_selected = self.recorder_attach_selected.saturating_sub(1);
+            }
+            return;
+        }
+        let count = self.recorder_game_profile_count();
+        if count == 0 {
+            self.recorder_game_profile_selected = 0;
+        } else if forward {
+            self.recorder_game_profile_selected =
+                (self.recorder_game_profile_selected + 1).min(count - 1);
+        } else {
+            self.recorder_game_profile_selected =
+                self.recorder_game_profile_selected.saturating_sub(1);
+        }
+    }
+
+    fn cycle_recorder_capture_mode(&mut self, forward: bool) {
+        self.recorder_capture_mode = self.recorder_capture_mode.cycle(forward);
+        let count = self.recorder_game_profile_count();
+        self.recorder_game_profile_selected = self
+            .recorder_game_profile_selected
+            .min(count.saturating_sub(1));
+        let attach_count = recorder_attach_targets().len();
+        self.recorder_attach_selected = self
+            .recorder_attach_selected
+            .min(attach_count.saturating_sub(1));
+        let xwayland_count = self
+            .snapshot
+            .windows
+            .iter()
+            .filter(|window| window.x11_window.is_some())
+            .count();
+        self.recorder_xwayland_selected = self
+            .recorder_xwayland_selected
+            .min(xwayland_count.saturating_sub(1));
+    }
+
+    fn selected_recorder_attach_target(&self) -> Option<RecorderAttachTarget> {
+        recorder_attach_targets()
+            .into_iter()
+            .nth(self.recorder_attach_selected)
+    }
+
+    fn selected_recorder_xwayland_window(&self) -> Option<&wm_core::WindowInfo> {
+        self.snapshot
+            .windows
+            .iter()
+            .filter(|window| window.x11_window.is_some())
+            .nth(self.recorder_xwayland_selected)
+    }
+
+    fn recorder_command(&self, action: &str) -> String {
+        self.snapshot
+            .windows
+            .get(self.recorder_selected.saturating_sub(1))
+            .filter(|_| self.recorder_selected > 0)
+            .map(|window| format!("recorder {action} window {}", window.id))
+            .unwrap_or_else(|| format!("recorder {action} output"))
+    }
+
     fn bar_module_at(&self, surface: &wl_surface::WlSurface, x: f64) -> Option<&'static str> {
         let width = self
             .surfaces
@@ -2378,6 +2873,10 @@ impl App {
                 .iter()
                 .any(|module| module == "notifications")
                 .then(|| ("notifications", format!("NOT {}", self.notifications.len()))),
+            modules
+                .iter()
+                .any(|module| module == "power")
+                .then(|| ("power", "POWER".to_string())),
         ]
         .into_iter()
         .flatten()
@@ -2431,8 +2930,12 @@ impl App {
                 .iter()
                 .any(|module| module == "notifications")
                 .then(|| format!("NOT {}", self.notifications.len())),
+            modules
+                .iter()
+                .any(|module| module == "power")
+                .then(|| "POWER".to_string()),
         ];
-        let mut right = surface.width.saturating_sub(12);
+        let mut right = surface.width.saturating_sub(BAR_RIGHT_INSET);
         for (index, value) in values.into_iter().enumerate().rev() {
             let Some(value) = value else {
                 continue;
@@ -2493,6 +2996,23 @@ impl App {
         });
     }
 
+    fn set_networking(enabled: bool) {
+        thread::spawn(move || {
+            let Ok(connection) = zbus::blocking::Connection::system() else {
+                return;
+            };
+            let Ok(network_manager) = zbus::blocking::Proxy::new(
+                &connection,
+                "org.freedesktop.NetworkManager",
+                "/org/freedesktop/NetworkManager",
+                "org.freedesktop.NetworkManager",
+            ) else {
+                return;
+            };
+            let _ = network_manager.set_property("NetworkingEnabled", enabled);
+        });
+    }
+
     fn set_bluetooth_powered(enabled: bool) {
         thread::spawn(move || {
             let Ok(connection) = zbus::blocking::Connection::system() else {
@@ -2526,6 +3046,54 @@ impl App {
                 return;
             };
             let _ = adapter.set_property("Powered", enabled);
+        });
+    }
+
+    fn set_bluetooth_discovery(enabled: bool) {
+        thread::spawn(move || {
+            let Ok(connection) = zbus::blocking::Connection::system() else {
+                return;
+            };
+            let Ok(manager) = zbus::blocking::Proxy::new(
+                &connection,
+                "org.bluez",
+                "/",
+                "org.freedesktop.DBus.ObjectManager",
+            ) else {
+                return;
+            };
+            let Ok(objects) = manager.call::<_, _, BluezManagedObjects>("GetManagedObjects", &())
+            else {
+                return;
+            };
+            let Some(path) = objects.into_iter().find_map(|(path, interfaces)| {
+                interfaces
+                    .contains_key("org.bluez.Adapter1")
+                    .then_some(path)
+            }) else {
+                return;
+            };
+            if let Ok(adapter) = zbus::blocking::Proxy::new(
+                &connection,
+                "org.bluez",
+                path.as_str(),
+                "org.bluez.Adapter1",
+            ) {
+                let _ = adapter.call::<_, _, ()>(
+                    if enabled {
+                        "StartDiscovery"
+                    } else {
+                        "StopDiscovery"
+                    },
+                    &(),
+                );
+            }
+        });
+    }
+
+    fn spawn_desktop_tool(program: &'static str) {
+        thread::spawn(move || {
+            let _ = std::process::Command::new(program).spawn();
         });
     }
 
@@ -2851,10 +3419,16 @@ impl App {
             || x >= 12.0 + 25.0 * self.config.layout.workspaces as f64
         {
             match (self.bar_module_at(surface, x), button) {
-                (Some("audio"), 0x110) => {
-                    Self::change_audio(&["set-sink-mute", "@DEFAULT_SINK@", "toggle"]);
+                (Some("audio"), 0x110) => self.show_controls(ControlPanel::Audio, surface, qh),
+                (Some("network"), 0x110) => self.show_controls(ControlPanel::Network, surface, qh),
+                (Some("bluetooth"), 0x110) => {
+                    self.show_controls(ControlPanel::Bluetooth, surface, qh)
                 }
-                (Some("media"), 0x110) => Self::change_media("PlayPause"),
+                (Some("media"), 0x110) => self.show_controls(ControlPanel::Media, surface, qh),
+                (Some("notifications"), 0x110) => {
+                    self.show_controls(ControlPanel::Notifications, surface, qh)
+                }
+                (Some("power"), 0x110) => self.show_controls(ControlPanel::Power, surface, qh),
                 (Some("media"), 0x111) => Self::change_media("Previous"),
                 (Some("media"), 0x112) => Self::change_media("Next"),
                 (Some("network"), 0x112) => {
@@ -2866,10 +3440,8 @@ impl App {
                     }
                 }
                 (Some("notifications"), 0x112) => {
-                    let was_enabled = self.do_not_disturb.fetch_xor(true, Ordering::Relaxed);
-                    if was_enabled && !self.notifications.is_empty() {
-                        self.ensure_notification_surface(qh);
-                    }
+                    self.do_not_disturb.fetch_xor(true, Ordering::Relaxed);
+                    self.sync_notification_surface(qh);
                     self.redraw_all(qh);
                 }
                 _ => {}
@@ -2972,6 +3544,7 @@ impl App {
         } else {
             return;
         }
+        self.sync_notification_surface(qh);
         self.redraw_all(qh);
     }
 
@@ -3026,14 +3599,11 @@ impl App {
             || self.config.wallpaper.kind != config.wallpaper.kind
             || self.config.wallpaper.outputs != config.wallpaper.outputs;
         let font_changed = self.config.theme.font != config.theme.font;
-        let dnd_disabled = self.config.shell.do_not_disturb && !config.shell.do_not_disturb;
         self.config = config;
         self.do_not_disturb
             .store(self.config.shell.do_not_disturb, Ordering::Relaxed);
         self.update_video_wallpaper_playback();
-        if dnd_disabled && !self.notifications.is_empty() {
-            self.ensure_notification_surface(qh);
-        }
+        self.sync_notification_surface(qh);
         if wallpaper_changed && self.mode == Mode::Wallpaper {
             self.wallpapers = load_wallpapers(&self.config);
             if let Some(previous) = self.video_frame.take() {
@@ -3080,17 +3650,228 @@ impl App {
             Mode::Bar => SurfaceKind::Bar,
             Mode::Wallpaper => SurfaceKind::Wallpaper,
             Mode::Launcher => SurfaceKind::Launcher,
+            Mode::Recorder => SurfaceKind::Recorder,
         };
         self.add_kind_surface(qh, kind, output);
     }
 
     fn ensure_notification_surface(&mut self, qh: &QueueHandle<Self>) {
-        if !self
+        if let Some(index) = self
             .surfaces
             .iter()
-            .any(|surface| surface.kind == SurfaceKind::Notifications)
+            .position(|surface| surface.kind == SurfaceKind::Notifications)
         {
+            let surface = &self.surfaces[index];
+            surface.layer.set_anchor(Anchor::TOP | Anchor::RIGHT);
+            surface.layer.set_margin(48, 12, 0, 0);
+            surface.layer.set_size(380, 320);
+            surface.layer.commit();
+            if surface.configured {
+                self.draw(index, qh);
+            }
+        } else {
             self.add_kind_surface(qh, SurfaceKind::Notifications, None);
+        }
+    }
+
+    fn hide_notification_surface(&mut self, qh: &QueueHandle<Self>) {
+        let Some(index) = self
+            .surfaces
+            .iter()
+            .position(|surface| surface.kind == SurfaceKind::Notifications)
+        else {
+            return;
+        };
+        let surface = &self.surfaces[index];
+        surface.layer.set_size(1, 1);
+        surface.layer.set_margin(0, 0, 0, 0);
+        surface.layer.commit();
+        if surface.configured {
+            self.draw(index, qh);
+        }
+    }
+
+    fn sync_notification_surface(&mut self, qh: &QueueHandle<Self>) {
+        let muted = self.do_not_disturb.load(Ordering::Relaxed);
+        if self
+            .notifications
+            .iter()
+            .any(|notification| notification.critical || !muted)
+        {
+            self.ensure_notification_surface(qh);
+        } else {
+            self.hide_notification_surface(qh);
+        }
+    }
+
+    fn show_controls(
+        &mut self,
+        panel: ControlPanel,
+        source: &wl_surface::WlSurface,
+        qh: &QueueHandle<Self>,
+    ) {
+        self.control_panel = Some(panel);
+        self.pending_power_action = None;
+        let output = self
+            .surfaces
+            .iter()
+            .find(|surface| surface.layer.wl_surface() == source)
+            .and_then(|surface| surface.output.clone());
+        if let Some(index) = self
+            .surfaces
+            .iter()
+            .position(|surface| surface.kind == SurfaceKind::Controls && surface.output == output)
+        {
+            let surface = &self.surfaces[index];
+            let below = self.config.shell.position != "bottom";
+            surface.layer.set_anchor(if below {
+                Anchor::TOP | Anchor::RIGHT
+            } else {
+                Anchor::BOTTOM | Anchor::RIGHT
+            });
+            surface.layer.set_margin(
+                if below { self.config.shell.height } else { 0 },
+                12,
+                if below { 0 } else { self.config.shell.height },
+                0,
+            );
+            surface.layer.set_size(380, 300);
+            surface.layer.commit();
+            if surface.configured {
+                self.draw(index, qh);
+            }
+        } else {
+            self.add_kind_surface(qh, SurfaceKind::Controls, output);
+        }
+    }
+
+    fn hide_controls(&mut self, qh: &QueueHandle<Self>) {
+        self.control_panel = None;
+        self.pending_power_action = None;
+        for index in 0..self.surfaces.len() {
+            if self.surfaces[index].kind == SurfaceKind::Controls {
+                let surface = &self.surfaces[index];
+                surface.layer.set_size(1, 1);
+                surface.layer.set_margin(0, 0, 0, 0);
+                surface.layer.commit();
+                if surface.configured {
+                    self.draw(index, qh);
+                }
+            }
+        }
+    }
+
+    fn click_controls(&mut self, x: f64, y: f64, button: u32, qh: &QueueHandle<Self>) {
+        if button != 0x110 {
+            self.hide_controls(qh);
+            return;
+        }
+        let Some(panel) = self.control_panel else {
+            return;
+        };
+        match panel {
+            ControlPanel::Audio => {
+                if (58.0..=92.0).contains(&y) {
+                    let value = ((x - 24.0) / 332.0 * 100.0).round().clamp(0.0, 100.0);
+                    Self::change_audio(&[
+                        "set-sink-volume",
+                        "@DEFAULT_SINK@",
+                        &format!("{value}%"),
+                    ]);
+                } else if (104.0..140.0).contains(&y) {
+                    Self::change_audio(&["set-sink-mute", "@DEFAULT_SINK@", "toggle"]);
+                } else if (152.0..188.0).contains(&y) {
+                    Self::spawn_desktop_tool("pavucontrol");
+                }
+            }
+            ControlPanel::Network => {
+                if (56.0..92.0).contains(&y) {
+                    Self::set_networking(!self.network.networking_enabled);
+                } else if (100.0..136.0).contains(&y) {
+                    Self::set_wireless(!self.network.wireless_enabled);
+                } else if (152.0..188.0).contains(&y) {
+                    Self::spawn_desktop_tool("nm-connection-editor");
+                }
+            }
+            ControlPanel::Bluetooth => {
+                if (56.0..92.0).contains(&y) {
+                    if let Some(powered) = self.bluetooth.powered {
+                        Self::set_bluetooth_powered(!powered);
+                    }
+                } else if (100.0..136.0).contains(&y) {
+                    Self::set_bluetooth_discovery(true);
+                } else if (152.0..188.0).contains(&y) {
+                    Self::spawn_desktop_tool("blueman-manager");
+                }
+            }
+            ControlPanel::Media => {
+                if (60.0..104.0).contains(&y) {
+                    if x < 126.0 {
+                        Self::change_media("Previous");
+                    } else if x < 252.0 {
+                        Self::change_media("PlayPause");
+                    } else {
+                        Self::change_media("Next");
+                    }
+                } else if (116.0..152.0).contains(&y) {
+                    Self::change_media("Stop");
+                }
+            }
+            ControlPanel::Notifications => {
+                if (56.0..92.0).contains(&y) {
+                    self.do_not_disturb.fetch_xor(true, Ordering::Relaxed);
+                    self.sync_notification_surface(qh);
+                } else if (100.0..136.0).contains(&y) {
+                    for notification in &self.notifications {
+                        let _ = self.notification_signals.send(NotificationSignal::Closed {
+                            id: notification.id,
+                            reason: 2,
+                        });
+                    }
+                    self.notifications.clear();
+                    self.notification_offset = 0;
+                    self.sync_notification_surface(qh);
+                }
+            }
+            ControlPanel::Power => {
+                if let Some(action) = self.pending_power_action {
+                    if (76.0..=110.0).contains(&y) {
+                        self.hide_controls(qh);
+                        Self::perform_power_action(action);
+                        return;
+                    }
+                    if (120.0..=154.0).contains(&y) {
+                        self.pending_power_action = None;
+                    }
+                } else if (56.0..=92.0).contains(&y) {
+                    self.pending_power_action = Some(PowerAction::LogOut);
+                } else if (100.0..=136.0).contains(&y) {
+                    self.pending_power_action = Some(PowerAction::Reboot);
+                } else if (144.0..=180.0).contains(&y) {
+                    self.pending_power_action = Some(PowerAction::Shutdown);
+                }
+            }
+        }
+        self.redraw_all(qh);
+    }
+
+    fn perform_power_action(action: PowerAction) {
+        match action {
+            PowerAction::LogOut => Self::run_command("quit".into()),
+            PowerAction::Reboot => {
+                thread::spawn(|| {
+                    let _ = std::process::Command::new("systemctl")
+                        .arg("reboot")
+                        .status();
+                });
+            }
+            PowerAction::Shutdown => {
+                thread::spawn(|| {
+                    let _ = std::process::Command::new("systemctl")
+                        .arg("poweroff")
+                        .status();
+                });
+            }
         }
     }
 
@@ -3112,8 +3893,10 @@ impl App {
             SurfaceKind::Bar => (Layer::Top, "wm-bar"),
             SurfaceKind::Wallpaper => (Layer::Background, "wm-wallpaper"),
             SurfaceKind::Launcher => (Layer::Overlay, "wm-launcher"),
+            SurfaceKind::Recorder => (Layer::Overlay, "wm-recorder"),
             SurfaceKind::Notifications => (Layer::Overlay, "wm-notifications"),
             SurfaceKind::TrayMenu => (Layer::Overlay, "wm-tray-menu"),
+            SurfaceKind::Controls => (Layer::Overlay, "wm-controls"),
         };
         let layer = self.layer_shell.create_layer_surface(
             qh,
@@ -3148,6 +3931,11 @@ impl App {
                 layer.set_size(680, 420);
                 layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
             }
+            SurfaceKind::Recorder => {
+                layer.set_anchor(Anchor::empty());
+                layer.set_size(720, 500);
+                layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            }
             SurfaceKind::Notifications => {
                 layer.set_anchor(Anchor::TOP | Anchor::RIGHT);
                 layer.set_margin(48, 12, 0, 0);
@@ -3158,6 +3946,22 @@ impl App {
                 layer.set_anchor(Anchor::TOP | Anchor::LEFT);
                 layer.set_size(1, 1);
                 layer.set_exclusive_zone(-1);
+                layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+            }
+            SurfaceKind::Controls => {
+                let below = self.config.shell.position != "bottom";
+                layer.set_anchor(if below {
+                    Anchor::TOP | Anchor::RIGHT
+                } else {
+                    Anchor::BOTTOM | Anchor::RIGHT
+                });
+                layer.set_margin(
+                    if below { self.config.shell.height } else { 0 },
+                    12,
+                    if below { 0 } else { self.config.shell.height },
+                    0,
+                );
+                layer.set_size(380, 300);
                 layer.set_keyboard_interactivity(KeyboardInteractivity::None);
             }
         }
@@ -3272,6 +4076,19 @@ impl App {
                     },
                 )
             });
+        let power = modules
+            .iter()
+            .any(|module| module == "power")
+            .then_some("POWER");
+        let recorder = match self.snapshot.recorder.state {
+            RecorderState::Recording | RecorderState::Starting => {
+                Some(format!("REC {}", self.snapshot.recorder.requested_fps))
+            }
+            RecorderState::Paused => Some("REC PAUSED".into()),
+            RecorderState::Replay => Some("REPLAY".into()),
+            RecorderState::Error => Some("REC ERR".into()),
+            RecorderState::Idle => None,
+        };
         let notification_rows = self
             .notifications
             .iter()
@@ -3286,6 +4103,9 @@ impl App {
         let tray_menu = (kind == SurfaceKind::TrayMenu)
             .then(|| self.tray_menu.clone())
             .flatten();
+        let controls = (kind == SurfaceKind::Controls)
+            .then_some(self.control_panel)
+            .flatten();
         let wallpaper_output_name = self.surfaces[index]
             .output
             .as_ref()
@@ -3299,6 +4119,22 @@ impl App {
                 .and_then(|name| self.wallpapers.get(name))
                 .or_else(|| self.wallpapers.get(""))
         };
+        let recorder_selection_label = (kind == SurfaceKind::Recorder)
+            .then(|| self.recorder_selection_label())
+            .unwrap_or_default();
+        let recorder_selection_heading = (kind == SurfaceKind::Recorder)
+            .then(|| self.recorder_selection_heading())
+            .unwrap_or_default();
+        let recorder_capture_label = (kind == SurfaceKind::Recorder)
+            .then(|| self.recorder_capture_label())
+            .unwrap_or_default();
+        let recorder_capture_note = (kind == SurfaceKind::Recorder)
+            .then(|| self.recorder_capture_note())
+            .unwrap_or_default();
+        let recorder_can_start = (kind == SurfaceKind::Recorder) && self.recorder_can_start();
+        let recorder_display_fps = (kind == SurfaceKind::Recorder)
+            .then(|| self.recorder_display_fps())
+            .unwrap_or(self.config.recorder.screen_fps);
         let surface = &mut self.surfaces[index];
         let width = surface.width;
         let height = surface.height;
@@ -3336,6 +4172,8 @@ impl App {
                 &self.tray,
                 tray.as_deref(),
                 notifications.as_deref(),
+                recorder.as_deref(),
+                power,
             ),
             SurfaceKind::Wallpaper => draw_wallpaper(
                 canvas,
@@ -3358,6 +4196,23 @@ impl App {
                 self.launcher_selected,
                 self.apps_loaded,
             ),
+            SurfaceKind::Recorder => draw_recorder(
+                canvas,
+                width,
+                height,
+                colors,
+                self.config.theme.radius.round().clamp(0.0, 100.0) as u32,
+                font.as_ref(),
+                font_size,
+                &self.config,
+                &self.snapshot,
+                &recorder_capture_label,
+                recorder_selection_heading,
+                &recorder_selection_label,
+                &recorder_capture_note,
+                recorder_can_start,
+                recorder_display_fps,
+            ),
             SurfaceKind::Notifications => draw_notifications(
                 canvas,
                 width,
@@ -3378,6 +4233,22 @@ impl App {
                 font.as_ref(),
                 font_size,
                 tray_menu.as_ref(),
+            ),
+            SurfaceKind::Controls => draw_controls(
+                canvas,
+                width,
+                height,
+                colors,
+                font.as_ref(),
+                font_size,
+                controls,
+                self.pending_power_action,
+                &self.audio,
+                &self.network,
+                &self.media,
+                &self.bluetooth,
+                self.do_not_disturb.load(Ordering::Relaxed),
+                self.notifications.len(),
             ),
         }
         surface
@@ -3622,6 +4493,8 @@ fn draw_bar(
     tray_items: &[TrayItem],
     tray: Option<&str>,
     notifications: Option<&str>,
+    recorder: Option<&str>,
+    power: Option<&str>,
 ) {
     fill(canvas, 0);
     let margin = 4.min(height.saturating_sub(1) / 2);
@@ -3676,7 +4549,7 @@ fn draw_bar(
         54,
     );
     let title_x = workspace_width + 82;
-    let right_reserved = 220;
+    let right_reserved = 252;
     let available = width.saturating_sub(title_x + right_reserved) as usize;
     if has("title") {
         title_text(
@@ -3691,7 +4564,7 @@ fn draw_bar(
             font_size,
         );
     }
-    let mut right = width.saturating_sub(12);
+    let mut right = width.saturating_sub(BAR_RIGHT_INSET);
     let mut tray_bounds = None;
     for value in [
         clock,
@@ -3702,6 +4575,8 @@ fn draw_bar(
         bluetooth,
         tray,
         notifications,
+        recorder,
+        power,
     ]
     .into_iter()
     .flatten()
@@ -3974,6 +4849,213 @@ fn draw_launcher(
     }
 }
 
+fn draw_recorder(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    colors: Colors,
+    radius: u32,
+    font: Option<&FontArc>,
+    font_size: u32,
+    config: &Config,
+    snapshot: &Snapshot,
+    capture_label: &str,
+    selection_heading: &str,
+    selection_label: &str,
+    capture_note: &str,
+    can_start: bool,
+    capture_fps: u32,
+) {
+    fill(canvas, 0);
+    let panel_w = width.min(720);
+    let panel_h = height.min(500);
+    let x = (width - panel_w) / 2;
+    let y = (height - panel_h) / 2;
+    rounded_rect(
+        canvas,
+        width,
+        x,
+        y,
+        panel_w,
+        panel_h,
+        radius,
+        colors.background,
+    );
+    text(
+        canvas,
+        width,
+        font,
+        x + 32,
+        y + 42,
+        "Luma Recorder",
+        font_size + 5,
+        colors.accent,
+        panel_w.saturating_sub(64),
+    );
+    let state = format!("STATUS  {:?}", snapshot.recorder.state).to_uppercase();
+    text(
+        canvas,
+        width,
+        font,
+        x + 32,
+        y + 76,
+        &state,
+        font_size,
+        if snapshot.recorder.state == RecorderState::Error {
+            0xffff_7777
+        } else {
+            colors.foreground
+        },
+        panel_w.saturating_sub(64),
+    );
+    rect(
+        canvas,
+        width,
+        x + 32,
+        y + 94,
+        panel_w.saturating_sub(64),
+        2,
+        colors.accent,
+    );
+    let lines = [
+        format!("CAPTURE  {capture_label}  [LEFT/RIGHT]"),
+        format!("{selection_heading:<8}{selection_label}  [UP/DOWN]"),
+        format!(
+            "VIDEO    {}x{}  ·  up to {} FPS",
+            config.recorder.output_width, config.recorder.output_height, capture_fps
+        ),
+        format!(
+            "ENCODER  {} / NVENC performance  ·  quality {}",
+            config.recorder.codec.to_uppercase(),
+            config.recorder.quality
+        ),
+        if capture_label != "Screen (low-lag)" {
+            "AUDIO    direct game capture is video-only".into()
+        } else {
+            format!(
+                "AUDIO    desktop: {}  ·  mic: {}",
+                config.recorder.desktop_audio, config.recorder.microphone
+            )
+        },
+        capture_note.into(),
+        format!(
+            "LIVE     source {:.1}  ·  encoded {:.1}  ·  dropped {}",
+            snapshot.recorder.source_fps,
+            snapshot.recorder.encoded_fps,
+            snapshot.recorder.dropped_frames
+        ),
+    ];
+    for (index, line) in lines.iter().enumerate() {
+        text(
+            canvas,
+            width,
+            font,
+            x + 32,
+            y + 124 + index as u32 * 31,
+            line,
+            font_size,
+            if index == 6 {
+                colors.foreground
+            } else {
+                colors.muted
+            },
+            panel_w.saturating_sub(64),
+        );
+    }
+    if let Some(error) = snapshot.recorder.error.as_deref() {
+        text(
+            canvas,
+            width,
+            font,
+            x + 32,
+            y + 341,
+            error,
+            font_size,
+            0xffff_7777,
+            panel_w.saturating_sub(64),
+        );
+    }
+    let running = !matches!(
+        snapshot.recorder.state,
+        RecorderState::Idle | RecorderState::Error
+    );
+    rounded_rect(
+        canvas,
+        width,
+        x + 24,
+        y + 370,
+        panel_w.saturating_sub(48),
+        42,
+        8,
+        colors.accent,
+    );
+    text(
+        canvas,
+        width,
+        font,
+        x + 44,
+        y + 397,
+        if running {
+            "STOP RECORDING  [ENTER]"
+        } else if !matches!(capture_label, "Screen (low-lag)" | "Xwayland Zero-Copy")
+            && config.recorder.codec != "h264"
+        {
+            "DIRECT API CAPTURE REQUIRES H.264"
+        } else if !can_start {
+            if capture_label == "OpenGL API Inject" {
+                "NO RUNNING OPENGL PROCESS FOUND"
+            } else {
+                "NO MATCHING API PROFILE CONFIGURED"
+            }
+        } else if capture_label == "Xwayland Zero-Copy" {
+            "START XWAYLAND CAPTURE  [ENTER]"
+        } else if capture_label == "OpenGL API Inject" {
+            "INJECT INTO RUNNING GAME  [ENTER]"
+        } else if capture_label == "OpenGL Launch Profile" {
+            "START OPENGL GAME CAPTURE  [ENTER]"
+        } else if capture_label == "Vulkan API Layer" {
+            "START VULKAN GAME CAPTURE  [ENTER]"
+        } else {
+            "START RECORDING  [ENTER]"
+        },
+        font_size,
+        colors.background,
+        panel_w.saturating_sub(88),
+    );
+    rounded_rect(
+        canvas,
+        width,
+        x + 24,
+        y + 420,
+        panel_w.saturating_sub(48),
+        38,
+        8,
+        0x3300_0000,
+    );
+    text(
+        canvas,
+        width,
+        font,
+        x + 44,
+        y + 445,
+        "INSTANT REPLAY COMING LATER  ·  DIRECT API CAPTURE IS EXPERIMENTAL",
+        font_size,
+        colors.foreground,
+        panel_w.saturating_sub(88),
+    );
+    text(
+        canvas,
+        width,
+        font,
+        x + panel_w.saturating_sub(180),
+        y + 488,
+        "ESC TO CLOSE",
+        font_size,
+        colors.muted,
+        150,
+    );
+}
+
 fn draw_notifications(
     canvas: &mut [u8],
     width: u32,
@@ -4103,6 +5185,272 @@ fn draw_notifications(
             );
         }
     }
+}
+
+fn draw_controls(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    colors: Colors,
+    font: Option<&FontArc>,
+    font_size: u32,
+    panel: Option<ControlPanel>,
+    pending_power_action: Option<PowerAction>,
+    audio: &AudioState,
+    network: &NetworkState,
+    media: &MediaState,
+    bluetooth: &BluetoothState,
+    dnd: bool,
+    notification_count: usize,
+) {
+    fill(canvas, 0);
+    let Some(panel) = panel else {
+        return;
+    };
+    rounded_rect(canvas, width, 0, 0, width, height, 14, colors.background);
+    let content_width = width.saturating_sub(48);
+    let heading = match panel {
+        ControlPanel::Audio => "Audio",
+        ControlPanel::Network => "Network & Wi-Fi",
+        ControlPanel::Bluetooth => "Bluetooth",
+        ControlPanel::Media => "Media",
+        ControlPanel::Notifications => "Notifications",
+        ControlPanel::Power => "Session",
+    };
+    text(
+        canvas,
+        width,
+        font,
+        24,
+        30,
+        heading,
+        font_size + 2,
+        colors.foreground,
+        content_width,
+    );
+    let button = |canvas: &mut [u8], y: u32, label: &str, active: bool| {
+        rounded_rect(
+            canvas,
+            width,
+            18,
+            y,
+            width.saturating_sub(36),
+            34,
+            7,
+            if active { colors.accent } else { 0x331b_1d21 },
+        );
+        text(
+            canvas,
+            width,
+            font,
+            30,
+            y + 22,
+            label,
+            font_size,
+            if active {
+                colors.background
+            } else {
+                colors.foreground
+            },
+            width.saturating_sub(60),
+        );
+    };
+    match panel {
+        ControlPanel::Audio => {
+            text(
+                canvas,
+                width,
+                font,
+                24,
+                52,
+                &audio.label,
+                font_size,
+                colors.muted,
+                content_width,
+            );
+            rect(
+                canvas,
+                width,
+                24,
+                72,
+                width.saturating_sub(48),
+                6,
+                0x551b_1d21,
+            );
+            let volume = audio
+                .label
+                .strip_prefix("VOL ")
+                .and_then(|value| value.strip_suffix('%'))
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(100);
+            rect(
+                canvas,
+                width,
+                24,
+                72,
+                width.saturating_sub(48) * volume / 100,
+                6,
+                colors.accent,
+            );
+            button(canvas, 104, "Mute / unmute", audio.label == "MUTED");
+            button(canvas, 152, "Sound settings…", false);
+        }
+        ControlPanel::Network => {
+            text(
+                canvas,
+                width,
+                font,
+                24,
+                52,
+                &network.label,
+                font_size,
+                colors.muted,
+                content_width,
+            );
+            button(
+                canvas,
+                56,
+                if network.networking_enabled {
+                    "Networking: on"
+                } else {
+                    "Networking: off"
+                },
+                network.networking_enabled,
+            );
+            button(
+                canvas,
+                100,
+                if network.wireless_enabled {
+                    "Wi-Fi: on"
+                } else {
+                    "Wi-Fi: off"
+                },
+                network.wireless_enabled,
+            );
+            button(canvas, 152, "Connection settings…", false);
+        }
+        ControlPanel::Bluetooth => {
+            text(
+                canvas,
+                width,
+                font,
+                24,
+                52,
+                &bluetooth.label,
+                font_size,
+                colors.muted,
+                content_width,
+            );
+            button(
+                canvas,
+                56,
+                if bluetooth.powered == Some(true) {
+                    "Bluetooth: on"
+                } else {
+                    "Bluetooth: off"
+                },
+                bluetooth.powered == Some(true),
+            );
+            button(canvas, 100, "Find devices", false);
+            button(canvas, 152, "Bluetooth settings…", false);
+        }
+        ControlPanel::Media => {
+            text(
+                canvas,
+                width,
+                font,
+                24,
+                52,
+                &media.label,
+                font_size,
+                colors.muted,
+                content_width,
+            );
+            for (x, label) in [(18, "Previous"), (136, "Play / pause"), (254, "Next")] {
+                rounded_rect(canvas, width, x, 60, 108, 44, 7, 0x331b_1d21);
+                text(
+                    canvas,
+                    width,
+                    font,
+                    x + 8,
+                    87,
+                    label,
+                    font_size.saturating_sub(2).max(9),
+                    colors.foreground,
+                    92,
+                );
+            }
+            button(canvas, 116, "Stop playback", false);
+        }
+        ControlPanel::Notifications => {
+            text(
+                canvas,
+                width,
+                font,
+                24,
+                52,
+                &format!("{notification_count} notification(s)"),
+                font_size,
+                colors.muted,
+                content_width,
+            );
+            button(
+                canvas,
+                56,
+                if dnd {
+                    "Do Not Disturb: on"
+                } else {
+                    "Do Not Disturb: off"
+                },
+                dnd,
+            );
+            button(canvas, 100, "Clear notifications", false);
+        }
+        ControlPanel::Power => {
+            if let Some(action) = pending_power_action {
+                text(
+                    canvas,
+                    width,
+                    font,
+                    24,
+                    52,
+                    &format!("Confirm {}?", action.label()),
+                    font_size,
+                    colors.muted,
+                    content_width,
+                );
+                button(canvas, 76, &format!("Confirm {}", action.label()), true);
+                button(canvas, 120, "Cancel", false);
+            } else {
+                text(
+                    canvas,
+                    width,
+                    font,
+                    24,
+                    52,
+                    "Choose a session action",
+                    font_size,
+                    colors.muted,
+                    content_width,
+                );
+                button(canvas, 56, "Log out", false);
+                button(canvas, 100, "Reboot", false);
+                button(canvas, 144, "Shut down", false);
+            }
+        }
+    }
+    text(
+        canvas,
+        width,
+        font,
+        24,
+        height.saturating_sub(16),
+        "Right-click outside a control to close",
+        font_size.saturating_sub(3).max(9),
+        colors.muted,
+        content_width,
+    );
 }
 
 fn draw_tray_menu(
@@ -4341,7 +5689,7 @@ fn right_module_at(
     values: &[(&'static str, String)],
     x: f64,
 ) -> Option<&'static str> {
-    let mut right = width.saturating_sub(12);
+    let mut right = width.saturating_sub(BAR_RIGHT_INSET);
     for (module, value) in values.iter().rev() {
         let value_width = text_width(font, value, font_size).min(right.saturating_sub(12));
         let left = right.saturating_sub(value_width);
@@ -4560,7 +5908,7 @@ impl OutputHandler for App {
         &mut self.output_state
     }
     fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
-        if self.mode != Mode::Launcher {
+        if !matches!(self.mode, Mode::Launcher | Mode::Recorder) {
             self.add_surface(qh, Some(output));
         }
     }
@@ -4602,8 +5950,10 @@ impl LayerShellHandler for App {
                 SurfaceKind::Bar => self.config.shell.height as u32,
                 SurfaceKind::Wallpaper => 1,
                 SurfaceKind::Launcher => 480,
+                SurfaceKind::Recorder => 500,
                 SurfaceKind::Notifications => 320,
                 SurfaceKind::TrayMenu => 1,
+                SurfaceKind::Controls => 300,
             };
             surface.height =
                 NonZeroU32::new(configure.new_size.1).map_or(default_height, NonZeroU32::get);
@@ -4640,7 +5990,7 @@ impl SeatHandler for App {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if self.mode == Mode::Launcher
+        if matches!(self.mode, Mode::Launcher | Mode::Recorder)
             && capability == Capability::Keyboard
             && self.keyboard.is_none()
         {
@@ -4702,6 +6052,36 @@ impl KeyboardHandler for App {
     ) {
         if event.keysym == Keysym::Escape {
             self.exit = true;
+            return;
+        }
+        if self.mode == Mode::Recorder {
+            match event.keysym {
+                Keysym::Return => {
+                    if self.snapshot.recorder.state != RecorderState::Idle
+                        && self.snapshot.recorder.state != RecorderState::Error
+                    {
+                        Self::run_command("recorder stop".into());
+                        self.exit = true;
+                    } else if self.recorder_can_start() {
+                        if let Some(command) = self.recorder_start_command() {
+                            Self::run_command(command);
+                            self.exit = true;
+                        }
+                    }
+                }
+                Keysym::Left => self.cycle_recorder_capture_mode(false),
+                Keysym::Right => self.cycle_recorder_capture_mode(true),
+                Keysym::Up => {
+                    self.move_recorder_selection(false);
+                }
+                Keysym::Down => {
+                    self.move_recorder_selection(true);
+                }
+                Keysym::space => Self::run_command("recorder pause".into()),
+                Keysym::r | Keysym::R => {}
+                _ => {}
+            }
+            self.redraw_all(qh);
             return;
         }
         if self.mode != Mode::Launcher {
@@ -4794,6 +6174,31 @@ impl PointerHandler for App {
                     Some(SurfaceKind::TrayMenu) => {
                         self.click_tray_menu(event.position.1, button, qh);
                     }
+                    Some(SurfaceKind::Controls) => {
+                        self.click_controls(event.position.0, event.position.1, button, qh);
+                    }
+                    Some(SurfaceKind::Recorder) if button == 0x110 => {
+                        let y = event.position.1;
+                        let command = if y >= 370.0 && y < 420.0 {
+                            if self.snapshot.recorder.state == RecorderState::Idle
+                                || self.snapshot.recorder.state == RecorderState::Error
+                            {
+                                self.recorder_can_start()
+                                    .then(|| self.recorder_start_command())
+                                    .flatten()
+                            } else {
+                                Some("recorder stop".into())
+                            }
+                        } else if y >= 420.0 {
+                            None
+                        } else {
+                            None
+                        };
+                        if let Some(command) = command {
+                            Self::run_command(command);
+                            self.exit = true;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -4855,6 +6260,26 @@ impl ProvidesRegistryState for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorder_capture_modes_cycle_without_treating_game_capture_as_screen_capture() {
+        assert_eq!(
+            RecorderCaptureMode::Screen.cycle(true),
+            RecorderCaptureMode::XwaylandDirect
+        );
+        assert_eq!(
+            RecorderCaptureMode::XwaylandDirect.cycle(true),
+            RecorderCaptureMode::OpenGlInject
+        );
+        assert_eq!(
+            RecorderCaptureMode::OpenGlInject.cycle(true),
+            RecorderCaptureMode::OpenGlGame
+        );
+        assert_eq!(
+            RecorderCaptureMode::OpenGlGame.cycle(true),
+            RecorderCaptureMode::VulkanGame
+        );
+    }
 
     #[test]
     fn contain_wallpaper_centers_and_preserves_image_pixels() {
@@ -4939,6 +6364,38 @@ mod tests {
     }
 
     #[test]
+    fn tray_owner_monitor_removes_items_when_their_original_owner_exits() {
+        assert!(tray_service_owner_lost(
+            "org.example.App",
+            ":1.42",
+            "",
+            "org.example.App",
+            ":1.42",
+        ));
+        assert!(tray_service_owner_lost(
+            "org.example.App",
+            ":1.42",
+            ":1.99",
+            "org.example.App",
+            ":1.42",
+        ));
+        assert!(!tray_service_owner_lost(
+            "org.example.Other",
+            ":1.42",
+            "",
+            "org.example.App",
+            ":1.42",
+        ));
+        assert!(!tray_service_owner_lost(
+            "org.example.App",
+            ":1.99",
+            "",
+            "org.example.App",
+            ":1.42",
+        ));
+    }
+
+    #[test]
     fn native_tray_menu_parses_visible_actions_and_submenus() {
         use zbus::zvariant::{OwnedValue, Str, Structure};
 
@@ -4991,6 +6448,7 @@ mod tests {
         assert!(!video_wallpaper_is_suspended(&snapshot, false, true));
         snapshot.windows.push(wm_core::WindowInfo {
             id: 1,
+            x11_window: None,
             title: "Fullscreen".into(),
             app_id: "test".into(),
             workspace: 1,
@@ -5011,6 +6469,7 @@ mod tests {
         previous.focused = Some(1);
         previous.windows.push(wm_core::WindowInfo {
             id: 1,
+            x11_window: None,
             title: "Terminal".into(),
             app_id: "terminal".into(),
             workspace: 1,
@@ -5060,17 +6519,14 @@ mod tests {
             ("media", "MEDIA".to_string()),
             ("clock", "CLOCK".to_string()),
         ];
-        // The renderer reverses this list: clock is nearest the right edge,
+        // The renderer reverses this list: clock is nearest the right group edge,
         // then media, then audio. Keep hit-testing aligned with those pixels.
         assert_eq!(
-            right_module_at(200, None, 12, &values, 180.0),
+            right_module_at(200, None, 12, &values, 140.0),
             Some("clock")
         );
-        assert_eq!(
-            right_module_at(200, None, 12, &values, 130.0),
-            Some("media")
-        );
-        assert_eq!(right_module_at(200, None, 12, &values, 80.0), Some("audio"));
+        assert_eq!(right_module_at(200, None, 12, &values, 90.0), Some("media"));
+        assert_eq!(right_module_at(200, None, 12, &values, 45.0), Some("audio"));
         assert_eq!(right_module_at(200, None, 12, &values, 20.0), None);
     }
 
@@ -5109,6 +6565,15 @@ mod tests {
         assert_eq!(notification.body, "invalid binding: Supers+space");
         assert!(notification.critical);
         assert!(notification.expires_at.is_none());
+    }
+
+    #[test]
+    fn application_notifications_expire_after_five_seconds() {
+        let now = Instant::now();
+        assert_eq!(
+            application_notification_expiry(now).duration_since(now),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]
@@ -5294,6 +6759,8 @@ mod tests {
             &[],
             None,
             None,
+            None,
+            None,
         );
         let pixel = |x: usize, y: usize| {
             u32::from_le_bytes(
@@ -5304,6 +6771,64 @@ mod tests {
         };
         assert_eq!(pixel(0, 0), 0);
         assert_ne!(pixel(100, 20), 0);
+    }
+
+    #[test]
+    fn native_control_panels_paint_real_controls() {
+        let colors = Colors {
+            background: 0xff11_2233,
+            foreground: 0xffee_eeee,
+            accent: 0xff88_aaff,
+            muted: 0xff88_8899,
+            radius: 10,
+        };
+        let audio = AudioState {
+            label: "VOL 50%".into(),
+        };
+        let network = NetworkState {
+            label: "WIFI Luma".into(),
+            networking_enabled: true,
+            wireless_enabled: true,
+        };
+        let media = MediaState {
+            label: "MEDIA Track".into(),
+        };
+        let bluetooth = BluetoothState {
+            label: "BT 1".into(),
+            powered: Some(true),
+        };
+        for panel in [
+            ControlPanel::Audio,
+            ControlPanel::Network,
+            ControlPanel::Bluetooth,
+            ControlPanel::Media,
+            ControlPanel::Notifications,
+            ControlPanel::Power,
+        ] {
+            let mut canvas = vec![0; 380 * 300 * 4];
+            draw_controls(
+                &mut canvas,
+                380,
+                300,
+                colors,
+                None,
+                13,
+                Some(panel),
+                None,
+                &audio,
+                &network,
+                &media,
+                &bluetooth,
+                false,
+                2,
+            );
+            let center = u32::from_le_bytes(
+                canvas[(150 * 380 + 190) * 4..(150 * 380 + 191) * 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_ne!(center, 0, "{panel:?} panel should not be blank");
+        }
     }
 
     #[test]

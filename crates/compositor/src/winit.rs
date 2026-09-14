@@ -126,6 +126,33 @@ impl Backend for WinitData {
         crate::capture::render_dmabuf(self.backend.renderer(), space, output, cursor, &mut dmabuf)
     }
 
+    fn capture_window_dmabuf(
+        &mut self,
+        window: &crate::shell::WindowElement,
+        output: &Output,
+        mut dmabuf: Dmabuf,
+    ) -> Result<(), String> {
+        crate::capture::render_window_dmabuf(self.backend.renderer(), window, output, &mut dmabuf)
+    }
+
+    fn capture_region_dmabuf(
+        &mut self,
+        space: &smithay::desktop::Space<crate::shell::WindowElement>,
+        output: &Output,
+        cursor: Option<&crate::capture::CaptureCursor>,
+        region: wm_core::Rect,
+        mut dmabuf: Dmabuf,
+    ) -> Result<(), String> {
+        crate::capture::render_region_dmabuf(
+            self.backend.renderer(),
+            space,
+            output,
+            cursor,
+            region,
+            &mut dmabuf,
+        )
+    }
+
     fn seat_name(&self) -> String {
         String::from("winit")
     }
@@ -498,6 +525,7 @@ pub fn run_winit() {
                 Err(err) => warn!("Rendering error: {}", err),
             }
             if capture_changed {
+                state.capture_generation = state.capture_generation.wrapping_add(1).max(1);
                 crate::screencopy::process_pending(&mut state);
                 state.process_pending_capture_frames(&output);
             }

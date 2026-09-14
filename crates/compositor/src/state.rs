@@ -3,7 +3,7 @@ use std::os::unix::io::OwnedFd;
 use std::{
     collections::HashMap,
     sync::{Arc, atomic::AtomicBool},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tracing::{info, warn};
@@ -35,7 +35,11 @@ use smithay::{
     },
     output::Output,
     reexports::{
-        calloop::{Interest, LoopHandle, Mode, PostAction, generic::Generic},
+        calloop::{
+            Interest, LoopHandle, Mode, PostAction,
+            generic::Generic,
+            timer::{TimeoutAction, Timer},
+        },
         wayland_protocols::xdg::decoration::{
             self as xdg_decoration,
             zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode,
@@ -186,6 +190,15 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub capture_sessions: Vec<Session>,
     pub cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
     pub(crate) capture_cursor: crate::capture::CaptureCursor,
+    pub(crate) capture_generation: u64,
+    pub(crate) capture_boost_fps: Option<u32>,
+    pub(crate) capture_boost_timer: Option<smithay::reexports::calloop::RegistrationToken>,
+    capture_recorder_session_pending: bool,
+    pub(crate) capture_override: RecorderCaptureSource,
+    /// Complete recorder frames only after the selected client commits a new
+    /// buffer. The boost timer may still send frame callbacks at the requested
+    /// rate, but it must not manufacture captures from an unchanged surface.
+    pub(crate) capture_commit_driven: bool,
 
     pub dnd_icon: Option<DndIcon>,
 
@@ -214,6 +227,16 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 #[derive(Debug, Default)]
 struct CaptureSessionState {
     has_captured: AtomicBool,
+    last_generation: std::sync::atomic::AtomicU64,
+    recorder: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RecorderCaptureSource {
+    #[default]
+    Output,
+    Window(u64),
+    Region(wm_core::Rect),
 }
 
 #[derive(Debug)]
@@ -701,7 +724,11 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
         {
             session
                 .user_data()
-                .insert_if_missing(CaptureSessionState::default);
+                .insert_if_missing(|| CaptureSessionState {
+                    recorder: self.capture_recorder_session_pending,
+                    ..CaptureSessionState::default()
+                });
+            self.capture_recorder_session_pending = false;
             self.capture_sessions.push(session);
         }
     }
@@ -778,22 +805,63 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             );
         }
         let cursor = session.draw_cursor().then_some(&self.capture_cursor);
-        let result = if let Some(dmabuf) = dmabuf {
-            tracing::debug!(output = %output.name(), "capturing output into DMA-BUF");
-            self.backend_data
-                .capture_output_dmabuf(&self.space, &output, cursor, dmabuf)
-        } else {
-            tracing::debug!(output = %output.name(), "capturing output into shared memory");
-            self.backend_data
-                .capture_output(&self.space, &output, cursor)
-                .and_then(|pixels| crate::capture::write(&buffer, size.w, size.h, &pixels))
-        };
+        let recorder = session
+            .user_data()
+            .get::<CaptureSessionState>()
+            .is_some_and(|state| state.recorder);
+        let result =
+            if recorder && self.capture_override != RecorderCaptureSource::Output {
+                let Some(dmabuf) = dmabuf else {
+                    frame.fail(
+                    smithay::wayland::image_copy_capture::CaptureFailureReason::BufferConstraints,
+                );
+                    return;
+                };
+                match self.capture_override {
+                    RecorderCaptureSource::Window(id) => {
+                        let Some(window) = self
+                            .desktop
+                            .windows
+                            .iter()
+                            .find(|managed| managed.id == id)
+                            .map(|managed| managed.window.clone())
+                        else {
+                            frame.fail(
+                                smithay::wayland::image_copy_capture::CaptureFailureReason::Stopped,
+                            );
+                            return;
+                        };
+                        self.backend_data
+                            .capture_window_dmabuf(&window, &output, dmabuf)
+                    }
+                    RecorderCaptureSource::Region(region) => self
+                        .backend_data
+                        .capture_region_dmabuf(&self.space, &output, cursor, region, dmabuf),
+                    RecorderCaptureSource::Output => unreachable!(),
+                }
+            } else if let Some(dmabuf) = dmabuf {
+                tracing::debug!(output = %output.name(), "capturing output into DMA-BUF");
+                self.backend_data
+                    .capture_output_dmabuf(&self.space, &output, cursor, dmabuf)
+            } else {
+                tracing::debug!(output = %output.name(), "capturing output into shared memory");
+                self.backend_data
+                    .capture_output(&self.space, &output, cursor)
+                    .and_then(|pixels| crate::capture::write(&buffer, size.w, size.h, &pixels))
+            };
         match result {
             Ok(()) => {
+                if recorder {
+                    self.desktop.recorder.note_source_frame();
+                }
                 if let Some(state) = session.user_data().get::<CaptureSessionState>() {
                     state
                         .has_captured
                         .store(true, std::sync::atomic::Ordering::Release);
+                    state.last_generation.store(
+                        self.capture_generation,
+                        std::sync::atomic::Ordering::Release,
+                    );
                 }
                 let damage = smithay::utils::Rectangle::<i32, smithay::utils::Buffer>::from_size(
                     (size.w, size.h).into(),
@@ -822,10 +890,186 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 .and_then(|weak| weak.upgrade())
                 .is_some_and(|captured| captured == *output);
             if matches_output {
-                self.complete_capture_frame(&pending_frame.session, pending_frame.frame);
+                let changed = pending_frame
+                    .session
+                    .user_data()
+                    .get::<CaptureSessionState>()
+                    .is_none_or(|state| {
+                        if state.recorder {
+                            // Recorder requests may be completed by either a real
+                            // output repaint or the capture boost. Real repaints
+                            // carry useful game commits and materially increase
+                            // source throughput above the boost-only path.
+                            return true;
+                        }
+                        let current = self.capture_generation;
+                        state
+                            .last_generation
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            != current
+                    });
+                if changed {
+                    self.complete_capture_frame(&pending_frame.session, pending_frame.frame);
+                } else {
+                    self.pending_capture_frames.push(pending_frame);
+                }
             } else {
                 self.pending_capture_frames.push(pending_frame);
             }
+        }
+    }
+
+    pub(crate) fn start_capture_boost(&mut self, fps: u32) -> Result<(), String> {
+        let fps = fps.clamp(30, 480);
+        if let Some(token) = self.capture_boost_timer.take() {
+            self.handle.remove(token);
+        }
+        let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+        let token = self
+            .handle
+            .insert_source(Timer::from_duration(interval), move |deadline, _, state| {
+                state.capture_boost_tick(interval);
+                let scheduled = deadline + interval;
+                let now = Instant::now();
+                TimeoutAction::ToInstant(if now.saturating_duration_since(scheduled) > interval {
+                    now + interval
+                } else {
+                    scheduled
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        self.capture_boost_fps = Some(fps);
+        self.capture_recorder_session_pending = true;
+        self.capture_boost_timer = Some(token);
+        Ok(())
+    }
+
+    pub(crate) fn stop_capture_boost(&mut self) {
+        if let Some(token) = self.capture_boost_timer.take() {
+            self.handle.remove(token);
+        }
+        self.capture_boost_fps = None;
+        self.capture_recorder_session_pending = false;
+        self.capture_override = RecorderCaptureSource::Output;
+        self.capture_commit_driven = false;
+    }
+
+    fn capture_boost_tick(&mut self, interval: Duration) {
+        if self.lock.locked || !self.desktop.active || self.pending_capture_frames.is_empty() {
+            return;
+        }
+        let now: Duration = self.clock.now().into();
+        let outputs: Vec<_> = self
+            .space
+            .outputs()
+            .filter(|output| {
+                self.pending_capture_frames.iter().any(|pending| {
+                    pending
+                        .session
+                        .source()
+                        .user_data()
+                        .get::<smithay::output::WeakOutput>()
+                        .and_then(|weak| weak.upgrade())
+                        .is_some_and(|captured| captured == **output)
+                })
+            })
+            .cloned()
+            .collect();
+        let target_window = match self.capture_override {
+            RecorderCaptureSource::Window(id) => self
+                .desktop
+                .windows
+                .iter()
+                .find(|managed| managed.id == id)
+                .map(|managed| managed.window.clone()),
+            _ => None,
+        };
+        for output in outputs {
+            self.pre_capture(&output, target_window.as_ref(), now + interval);
+            self.space.elements().for_each(|window| {
+                if self.space.outputs_for_element(window).contains(&output)
+                    && target_window.as_ref().is_none_or(|target| target == window)
+                {
+                    window.send_frame(&output, now, None, surface_primary_scanout_output);
+                }
+            });
+            if !self.capture_commit_driven {
+                self.process_pending_capture_frames(&output);
+            }
+        }
+    }
+
+    pub(crate) fn process_commit_driven_capture(&mut self, window: &WindowElement) {
+        if !self.capture_commit_driven || self.pending_capture_frames.is_empty() {
+            return;
+        }
+        let RecorderCaptureSource::Window(target_id) = self.capture_override else {
+            return;
+        };
+        let Some(managed) = self
+            .desktop
+            .windows
+            .iter()
+            .find(|managed| managed.id == target_id && managed.window == *window)
+        else {
+            return;
+        };
+        let output_name = managed.output.clone();
+        let Some(output) = self
+            .space
+            .outputs()
+            .find(|output| output.name() == output_name)
+            .cloned()
+        else {
+            return;
+        };
+        self.process_pending_capture_frames(&output);
+    }
+
+    fn pre_capture(
+        &mut self,
+        output: &Output,
+        target_window: Option<&WindowElement>,
+        frame_target: impl Into<Time<Monotonic>>,
+    ) {
+        let frame_target = frame_target.into();
+        #[allow(clippy::mutable_key_type)]
+        let mut clients: HashMap<ClientId, Client> = HashMap::new();
+        self.space.elements().for_each(|window| {
+            if !self.space.outputs_for_element(window).contains(output)
+                || target_window.is_some_and(|target| target != window)
+            {
+                return;
+            }
+            window.with_surfaces(|surface, states| {
+                if let Some(mut commit_timer_state) = states
+                    .data_map
+                    .get::<CommitTimerBarrierStateUserData>()
+                    .map(|commit_timer| commit_timer.lock().unwrap())
+                {
+                    commit_timer_state.signal_until(frame_target);
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
+                }
+                if let Some(fifo_barrier) = states
+                    .cached_state
+                    .get::<FifoBarrierCachedState>()
+                    .current()
+                    .barrier
+                    .take()
+                {
+                    fifo_barrier.signal();
+                    if let Some(client) = surface.client() {
+                        clients.insert(client.id(), client);
+                    }
+                }
+            });
+        });
+        let dh = self.display_handle.clone();
+        for client in clients.into_values() {
+            self.client_compositor_state(&client)
+                .blocker_cleared(self, &dh);
         }
     }
 
@@ -1010,6 +1254,12 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             capture_sessions: Vec::new(),
             cursor_shape_state,
             capture_cursor: crate::capture::CaptureCursor::default(),
+            capture_generation: 1,
+            capture_boost_fps: None,
+            capture_boost_timer: None,
+            capture_recorder_session_pending: false,
+            capture_override: RecorderCaptureSource::Output,
+            capture_commit_driven: false,
             dnd_icon: None,
             suppressed_keys: Vec::new(),
             super_tap_pending: false,
@@ -1550,6 +1800,24 @@ pub trait Backend {
         _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
     ) -> Result<(), String> {
         Err("DMA-BUF capture unavailable on backend".into())
+    }
+    fn capture_window_dmabuf(
+        &mut self,
+        _window: &crate::shell::WindowElement,
+        _output: &smithay::output::Output,
+        _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+    ) -> Result<(), String> {
+        Err("window DMA-BUF capture unavailable on backend".into())
+    }
+    fn capture_region_dmabuf(
+        &mut self,
+        _space: &Space<WindowElement>,
+        _output: &smithay::output::Output,
+        _cursor: Option<&crate::capture::CaptureCursor>,
+        _region: wm_core::Rect,
+        _dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+    ) -> Result<(), String> {
+        Err("region DMA-BUF capture unavailable on backend".into())
     }
 
     const SUPPORTS_SESSION_LOCK: bool = false;

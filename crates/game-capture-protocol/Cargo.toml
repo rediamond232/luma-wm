@@ -1,0 +1,10 @@
+[package]
+name = "luma-game-capture-protocol"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Versioned local IPC protocol for Luma game-capture hooks"
+publish = false
+
+[lib]
+path = "src/lib.rs"
