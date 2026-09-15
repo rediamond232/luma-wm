@@ -1222,7 +1222,7 @@ impl<B: Backend + 'static> AnvilState<B> {
                         })
                         .filter_map(|rule| rule.blur)
                         .last()
-                        .unwrap_or(false);
+                        .unwrap_or(self.desktop.config.theme.blur);
                 w.window
                     .0
                     .user_data()
@@ -1242,7 +1242,7 @@ impl<B: Backend + 'static> AnvilState<B> {
                     self.desktop.redraw = true;
                 }
                 drop(previous_blur);
-                let opacity = if w.fullscreen || self.desktop.config.rules.is_empty() {
+                let opacity = if w.fullscreen {
                     1.0
                 } else {
                     self.desktop
@@ -1255,7 +1255,7 @@ impl<B: Backend + 'static> AnvilState<B> {
                         })
                         .filter_map(|rule| rule.opacity)
                         .last()
-                        .unwrap_or(1.0)
+                        .unwrap_or(self.desktop.config.theme.opacity)
                 };
                 w.window
                     .0

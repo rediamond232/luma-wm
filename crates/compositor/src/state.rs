@@ -1023,7 +1023,25 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         else {
             return;
         };
-        self.process_pending_capture_frames(&output);
+        let Some(index) = self.pending_capture_frames.iter().position(|pending| {
+            let matches_output = pending
+                .session
+                .source()
+                .user_data()
+                .get::<smithay::output::WeakOutput>()
+                .and_then(|weak| weak.upgrade())
+                .is_some_and(|captured| captured == output);
+            let recorder = pending
+                .session
+                .user_data()
+                .get::<CaptureSessionState>()
+                .is_some_and(|state| state.recorder);
+            matches_output && recorder
+        }) else {
+            return;
+        };
+        let pending = self.pending_capture_frames.remove(index);
+        self.complete_capture_frame(&pending.session, pending.frame);
     }
 
     fn pre_capture(

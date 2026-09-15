@@ -1,5 +1,14 @@
 # Implementation status
 
+### OBS-style recorder audio mix (2026-09-15)
+
+- Screen and Xwayland recordings now contain one `audiomixer` Opus track,
+  combining desktop audio and microphone for ordinary players and editors.
+  Inactive inputs do not block the other source, and the mixer timeline begins
+  at its first real input buffer instead of the compositor's monotonic uptime.
+- Audio EOS begins concurrently with the final video drain, so pressing Stop
+  does not extend the audio while CFR frames finish encoding.
+
 ### Injection-free Xwayland game capture (2026-09-12)
 
 - **Xwayland Zero-Copy** now captures at the compositor's surface-commit point.
@@ -13,13 +22,18 @@
   cannot create repeated captures of an unchanged surface. The compositor still
   validates the X11 window against its managed-window list, and stopping the
   native recorder never stops the game.
-- Commit-paced recorder timestamps assign every admitted surface update exactly
-  one CFR slot; wall-clock scheduling jitter no longer creates a skipped real
-  frame followed by a padded duplicate. An isolated nested GLX test captured
-  1,815/1,815 frames with zero duplicates, skips, unfilled slots, or timestamp
-  gaps; source telemetry settled at 479.64 FPS, and the first 480 decoded frame
-  hashes were all distinct. This validates the control, compositor-copy, and
-  mux path at 640x360 output, not full-resolution physical Minecraft/NVIDIA.
+- The recorder now keeps capture submission independent from its wall-clock CFR
+  worker. The worker always consumes newly completed DMA-BUFs before overdue
+  encode ticks and pads only output ticks for which no newer source image is
+  available. On stop it finishes the elapsed-time frame count, preventing the
+  old failure where a roughly 386-FPS physical capture was timestamped as 480
+  distinct frames and played about 1.24x fast.
+- A nested GLX regression run held source telemetry at 480.47 FPS with no
+  dropped capture requests and a maximum stale run of two ticks. The resulting
+  480/1 stream contained 2,337 frames over 4.86875 seconds; 2,331 decoded frame
+  hashes were distinct and only six adjacent hashes were exactly equal. This
+  validates scheduling and muxing at the nested window's 1140x1386 capture
+  size, not full-resolution physical Minecraft/NVIDIA throughput.
 - The superseded external X11 path reached about 438 FPS at 1140x338 in its
   controlled physical NVIDIA test. That result remains a baseline until the new
   build is tested with Minecraft at the configured 2560x1440 output size.

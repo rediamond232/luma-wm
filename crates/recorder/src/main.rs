@@ -9,7 +9,7 @@ use std::{
     fs::{File, OpenOptions},
     io::BufRead,
     os::{
-        fd::{AsFd, AsRawFd},
+        fd::{AsFd, AsRawFd, OwnedFd},
         unix::fs::MetadataExt,
     },
     path::{Path, PathBuf},
@@ -258,10 +258,94 @@ struct CaptureBuffer {
     wl_buffer: wl_buffer::WlBuffer,
 }
 
+struct EncodeFrame {
+    fd: OwnedFd,
+    size: usize,
+    width: u32,
+    height: u32,
+    offset: usize,
+    stride: i32,
+    slot: usize,
+    presentation_ns: u64,
+}
+
+impl EncodeFrame {
+    fn new(buffer: &CaptureBuffer, slot: usize, presentation_ns: u64) -> Result<Self, String> {
+        let size = usize::try_from(buffer.bo.stride())
+            .ok()
+            .and_then(|stride| stride.checked_mul(buffer.bo.height() as usize))
+            .ok_or("capture DMA-BUF size overflow")?;
+        Ok(Self {
+            fd: buffer
+                .bo
+                .fd()
+                .map_err(|_| "failed to export capture DMA-BUF")?,
+            size,
+            width: buffer.bo.width(),
+            height: buffer.bo.height(),
+            offset: buffer.bo.offset(0) as usize,
+            stride: buffer.bo.stride_for_plane(0) as i32,
+            slot,
+            presentation_ns,
+        })
+    }
+}
+
+enum EncoderCommand {
+    Frame(EncodeFrame),
+    Pause(bool),
+    Finish,
+}
+
+#[derive(Debug, Default)]
+struct EncoderStats {
+    encoded_frames: u64,
+    duplicated_frames: u64,
+    unfilled_frames: u64,
+    skipped_captures: u64,
+    maximum_gap: u64,
+}
+
 struct BufferRelease {
-    remaining: AtomicUsize,
+    in_flight: AtomicUsize,
+    retired: std::sync::atomic::AtomicBool,
+    returned: std::sync::atomic::AtomicBool,
     sender: mpsc::Sender<usize>,
     slot: usize,
+}
+
+impl BufferRelease {
+    fn new(sender: mpsc::Sender<usize>, slot: usize) -> Arc<Self> {
+        Arc::new(Self {
+            in_flight: AtomicUsize::new(0),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            returned: std::sync::atomic::AtomicBool::new(false),
+            sender,
+            slot,
+        })
+    }
+
+    fn retain(self: &Arc<Self>) -> Arc<Self> {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.clone()
+    }
+
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.maybe_return();
+    }
+
+    fn maybe_return(&self) {
+        if self.retired.load(Ordering::Acquire)
+            && self.in_flight.load(Ordering::Acquire) == 0
+            && self
+                .returned
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let _ = self.sender.send(self.slot);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -278,15 +362,16 @@ unsafe extern "C" fn encoder_buffer_finalized(
     _mini_object: *mut gst::ffi::GstMiniObject,
 ) {
     let release = unsafe { Arc::from_raw(data.cast::<BufferRelease>()) };
-    if release.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-        let _ = release.sender.send(release.slot);
-    }
+    release.in_flight.fetch_sub(1, Ordering::AcqRel);
+    release.maybe_return();
 }
 
 struct Encoder {
     pipeline: gst::Pipeline,
     appsrc: gst::Element,
     audio_sources: Vec<gst::Element>,
+    audio_ended: bool,
+    audio_eos: Vec<thread::JoinHandle<bool>>,
     muxer: Child,
     muxer_stdin: Option<ChildStdin>,
     allocator: DmaBufAllocator,
@@ -295,6 +380,8 @@ struct Encoder {
     paused_at: Option<Instant>,
     fps: u32,
     last_frame_index: Option<u64>,
+    commit_paced: bool,
+    commit_rebasing: bool,
 }
 
 impl Encoder {
@@ -337,13 +424,24 @@ impl Encoder {
             options.quality,
             parser,
         );
-        for (index, source) in [&options.desktop_audio, &options.microphone]
+        let enabled_audio = [&options.desktop_audio, &options.microphone]
             .into_iter()
             .enumerate()
-        {
-            if source == "disabled" || source.is_empty() {
-                continue;
-            }
+            .filter(|(_, source)| source.as_str() != "disabled" && !source.is_empty())
+            .collect::<Vec<_>>();
+        if !enabled_audio.is_empty() {
+            // Keep one OBS-style program mix. Starting at the first real input
+            // buffer avoids treating the compositor's monotonic uptime as
+            // thousands of seconds of leading silence.
+            pipeline.push_str(
+                " audiomixer name=audio_mix start-time-selection=first ignore-inactive-pads=true latency=20000000 \
+                 ! queue ! audioconvert ! audioresample \
+                 ! audio/x-raw,format=S16LE,rate=48000,channels=2 \
+                 ! opusenc bitrate=256000 audio-type=restricted-lowdelay \
+                 ! queue ! mux.audio_0",
+            );
+        }
+        for (source_index, source) in &enabled_audio {
             let device = match source.as_str() {
                 "default_output" => "@DEFAULT_MONITOR@",
                 "default_input" => "@DEFAULT_SOURCE@",
@@ -351,11 +449,10 @@ impl Encoder {
             };
             pipeline.push_str(&format!(
                 " pulsesrc name=audio_source_{} device={} do-timestamp=true ! queue ! audioconvert ! audioresample \
-                 ! audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=256000 audio-type=restricted-lowdelay \
-                 ! queue ! mux.audio_{}",
-                index,
+                 ! audio/x-raw,format=S16LE,rate=48000,channels=2 \
+                 ! audiorate skip-to-first=true tolerance=20000000 ! queue ! audio_mix.",
+                source_index,
                 gst_quote(Path::new(device)),
-                index,
             ));
         }
         let pipeline = gst::parse::launch(&pipeline)
@@ -371,36 +468,43 @@ impl Encoder {
         let transport_sink = pipeline
             .by_name("transport_sink")
             .ok_or("hybrid MP4 transport sink is missing")?;
-        let mut muxer = Command::new("ffmpeg")
-            .args([
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-fflags",
-                "+genpts",
-                "-f",
-                "mp4",
-                "-i",
-                "pipe:0",
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a?",
-                "-c",
-                "copy",
-                "-movflags",
-                "+hybrid_fragmented",
-                "-frag_duration",
-                "1000000",
-                "-flush_packets",
-                "1",
-                "-avoid_negative_ts",
-                "make_zero",
-                "-y",
-                "-f",
-                "mp4",
-            ])
+        let mut muxer_command = Command::new("ffmpeg");
+        muxer_command.args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-fflags",
+            "+genpts",
+            "-f",
+            "mp4",
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            "-movflags",
+            "+hybrid_fragmented",
+            "-frag_duration",
+            "1000000",
+            "-flush_packets",
+            "1",
+            "-avoid_negative_ts",
+            "make_zero",
+        ]);
+        if !enabled_audio.is_empty() {
+            muxer_command.args([
+                "-metadata:s:a:0",
+                "handler_name=Desktop + Microphone",
+                "-disposition:a:0",
+                "default",
+            ]);
+        }
+        let mut muxer = muxer_command
+            .args(["-y", "-f", "mp4"])
             .arg(&options.output)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -431,6 +535,8 @@ impl Encoder {
             pipeline,
             appsrc,
             audio_sources,
+            audio_ended: false,
+            audio_eos: Vec::new(),
             muxer,
             muxer_stdin: Some(muxer_stdin),
             allocator: DmaBufAllocator::new(),
@@ -439,21 +545,44 @@ impl Encoder {
             paused_at: None,
             fps: options.fps,
             last_frame_index: None,
+            commit_paced: options.commit_paced,
+            commit_rebasing: options.commit_paced,
         })
     }
 
     fn push_latest(
         &mut self,
-        buffer: &CaptureBuffer,
-        slot: usize,
+        input: &EncodeFrame,
         release_sender: &mpsc::Sender<usize>,
-        presentation_ns: u64,
     ) -> Result<PushOutcome, String> {
-        let origin_ns = *self.presentation_origin_ns.get_or_insert(presentation_ns);
-        let elapsed_ns = presentation_ns
-            .saturating_sub(origin_ns)
-            .saturating_sub(self.paused_ns);
-        let frame_index = frame_index_at(u128::from(elapsed_ns), self.fps);
+        let presentation_ns = input.presentation_ns;
+        let frame_index = if self.commit_paced && self.commit_rebasing {
+            // NVENC and its downstream transport can take tens of milliseconds
+            // to accept their first buffers. Do not interpret that one-time
+            // initialization as missing game frames: keep the first small run
+            // consecutive and continuously align the wall-clock origin to it.
+            let next = self
+                .last_frame_index
+                .map(|previous| previous.saturating_add(1))
+                .unwrap_or(0);
+            let (pts, _) = frame_times(next, self.fps);
+            self.presentation_origin_ns = Some(
+                presentation_ns
+                    .saturating_sub(self.paused_ns)
+                    .saturating_sub(pts),
+            );
+            next
+        } else {
+            let origin_ns = *self.presentation_origin_ns.get_or_insert(presentation_ns);
+            let elapsed_ns = presentation_ns
+                .saturating_sub(origin_ns)
+                .saturating_sub(self.paused_ns);
+            paced_frame_index(
+                frame_index_at(u128::from(elapsed_ns), self.fps),
+                self.last_frame_index,
+                self.commit_paced,
+            )
+        };
         if self
             .last_frame_index
             .is_some_and(|previous| frame_index <= previous)
@@ -475,14 +604,11 @@ impl Encoder {
         let (first_index, duplicates, unfilled) =
             cfr_span(previous, frame_index, maximum_duplicates);
         let push_count = duplicates + 1;
-        let release = Arc::new(BufferRelease {
-            remaining: AtomicUsize::new(push_count as usize),
-            sender: release_sender.clone(),
-            slot,
-        });
+        let release = BufferRelease::new(release_sender.clone(), input.slot);
         for index in first_index..=frame_index {
-            self.push_one(buffer, index, &release)?;
+            self.push_one(input, index, &release)?;
         }
+        release.retire();
         self.last_frame_index = Some(frame_index);
         Ok(PushOutcome {
             written: push_count,
@@ -495,20 +621,16 @@ impl Encoder {
 
     fn push_one(
         &mut self,
-        buffer: &CaptureBuffer,
+        input: &EncodeFrame,
         frame_index: u64,
         release: &Arc<BufferRelease>,
     ) -> Result<(), String> {
-        let fd = buffer
-            .bo
-            .fd()
-            .map_err(|_| "failed to export capture DMA-BUF")?;
-        let size = usize::try_from(buffer.bo.stride())
-            .ok()
-            .and_then(|stride| stride.checked_mul(buffer.bo.height() as usize))
-            .ok_or("capture DMA-BUF size overflow")?;
-        let memory =
-            unsafe { self.allocator.alloc_dmabuf(fd, size) }.map_err(|error| error.to_string())?;
+        let fd = input
+            .fd
+            .try_clone()
+            .map_err(|error| format!("failed to duplicate capture DMA-BUF: {error}"))?;
+        let memory = unsafe { self.allocator.alloc_dmabuf(fd, input.size) }
+            .map_err(|error| error.to_string())?;
         let mut gst_buffer = gst::Buffer::new();
         {
             let writable = gst_buffer
@@ -519,10 +641,10 @@ impl Encoder {
                 writable,
                 gstreamer_video::VideoFrameFlags::empty(),
                 VideoFormat::DmaDrm,
-                buffer.bo.width(),
-                buffer.bo.height(),
-                &[buffer.bo.offset(0) as usize],
-                &[buffer.bo.stride_for_plane(0) as i32],
+                input.width,
+                input.height,
+                &[input.offset],
+                &[input.stride],
             )
             .map_err(|error| error.to_string())?;
             let (pts, next_pts) = frame_times(frame_index, self.fps);
@@ -533,7 +655,7 @@ impl Encoder {
             gst::ffi::gst_mini_object_weak_ref(
                 gst_buffer.make_mut().upcast_mut().as_mut_ptr(),
                 Some(encoder_buffer_finalized),
-                Arc::into_raw(release.clone()).cast_mut().cast(),
+                Arc::into_raw(release.retain()).cast_mut().cast(),
             );
         }
         let result = self
@@ -560,6 +682,39 @@ impl Encoder {
             self.pipeline
                 .set_state(gst::State::Playing)
                 .map_err(|error| format!("failed to resume encoder: {error:?}"))?;
+            if self.commit_paced {
+                self.commit_rebasing = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_audio_eos(&mut self) -> Result<(), String> {
+        if self.audio_ended {
+            return Ok(());
+        }
+        self.audio_eos = self
+            .audio_sources
+            .iter()
+            .map(|source| {
+                source
+                    .static_pad("src")
+                    .ok_or("audio source pad is missing".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|pad| thread::spawn(move || pad.push_event(gst::event::Eos::new())))
+            .collect::<Vec<_>>();
+        self.audio_ended = true;
+        Ok(())
+    }
+
+    fn finish_audio_eos(&mut self) -> Result<(), String> {
+        self.begin_audio_eos()?;
+        for result in self.audio_eos.drain(..) {
+            if !result.join().unwrap_or(false) {
+                return Err("audio encoder rejected end-of-stream".into());
+            }
         }
         Ok(())
     }
@@ -573,23 +728,7 @@ impl Encoder {
                 "video encoder rejected end-of-stream: {video_eos:?}"
             ));
         }
-        let audio_eos = self
-            .audio_sources
-            .iter()
-            .map(|source| {
-                source
-                    .static_pad("src")
-                    .ok_or("audio source pad is missing".to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|pad| thread::spawn(move || pad.push_event(gst::event::Eos::new())))
-            .collect::<Vec<_>>();
-        for result in audio_eos {
-            if !result.join().unwrap_or(false) {
-                return Err("audio encoder rejected end-of-stream".into());
-            }
-        }
+        self.finish_audio_eos()?;
         let mut finalized = false;
         if let Some(bus) = self.pipeline.bus() {
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -888,7 +1027,7 @@ fn run() -> Result<(), String> {
     // Allocate every capture target before starting audio or the recording
     // clock. GBM allocation can otherwise create a visible startup timestamp
     // hole in an otherwise healthy high-rate recording.
-    let mut encoder = Encoder::new(
+    let encoder = Encoder::new(
         &options,
         format as u32,
         u64::from(modifier),
@@ -896,17 +1035,14 @@ fn run() -> Result<(), String> {
         state.height,
     )?;
     let (release_sender, release_receiver) = mpsc::channel();
+    let (encoder_sender, encoder_receiver) = mpsc::sync_channel(8);
+    let encoder_thread =
+        thread::spawn(move || run_encoder_worker(encoder, encoder_receiver, release_sender));
     let mut available_slots: VecDeque<_> = (0..CAPTURE_BUFFER_POOL_SIZE).collect();
     let interval = Duration::from_secs_f64(1.0 / f64::from(options.fps));
     let mut next_frame = Instant::now();
     let mut captured_frames = 0u64;
-    let mut encoded_frames = 0u64;
-    let mut duplicated_frames = 0u64;
-    let mut unfilled_frames = 0u64;
-    let mut skipped_captures = 0u64;
-    let mut maximum_gap = 0u64;
     let mut paused = false;
-    let mut commit_pacing_origin = None;
     'recording: loop {
         let (stop, toggle_pause) = drain_commands(&command_rx);
         if stop {
@@ -914,7 +1050,9 @@ fn run() -> Result<(), String> {
         }
         if toggle_pause {
             paused = !paused;
-            encoder.set_paused(paused)?;
+            encoder_sender
+                .send(EncoderCommand::Pause(paused))
+                .map_err(|_| "encoder worker stopped while changing pause state")?;
             next_frame = Instant::now();
         }
         if paused {
@@ -922,7 +1060,9 @@ fn run() -> Result<(), String> {
                 Ok(command) if command.trim() == "stop" => break,
                 Ok(command) if command.trim() == "pause" => {
                     paused = false;
-                    encoder.set_paused(false)?;
+                    encoder_sender
+                        .send(EncoderCommand::Pause(false))
+                        .map_err(|_| "encoder worker stopped while resuming")?;
                     next_frame = Instant::now();
                 }
                 Ok(command) => eprintln!("ignored recorder command: {}", command.trim()),
@@ -936,10 +1076,6 @@ fn run() -> Result<(), String> {
             thread::sleep(Duration::from_micros(250));
             continue;
         };
-        // Limit capture requests to the configured rate while allowing either
-        // the next real output repaint or the capture boost to satisfy them.
-        // This preserves useful game commits without submitting hundreds of
-        // redundant requests above the requested FPS.
         let now = Instant::now();
         if now < next_frame {
             thread::sleep(next_frame - now);
@@ -948,13 +1084,12 @@ fn run() -> Result<(), String> {
         if Instant::now().saturating_duration_since(next_frame) > interval.saturating_mul(4) {
             next_frame = Instant::now();
         }
-        let capture_buffer = &capture_buffers[slot];
         state.frame_ready = false;
         state.frame_failed = None;
         state.presentation_ns = None;
         state.ready_slot = None;
         let frame = session.create_frame(&qh, 0);
-        frame.attach_buffer(&capture_buffer.wl_buffer);
+        frame.attach_buffer(&capture_buffers[slot].wl_buffer);
         frame.damage_buffer(0, 0, state.width as i32, state.height as i32);
         frame.capture();
         while !state.frame_ready && state.frame_failed.is_none() && !state.stopped {
@@ -977,45 +1112,38 @@ fn run() -> Result<(), String> {
         if let Some(reason) = state.frame_failed.take() {
             return Err(format!("capture frame failed: {reason}"));
         }
-        let source_presentation_ns = state
+        let presentation_ns = state
             .presentation_ns
             .ok_or("capture frame omitted its presentation timestamp")?;
-        // A commit-paced source has already admitted exactly one fresh surface
-        // for this request. Number those admitted frames consecutively so
-        // sub-millisecond scheduler jitter cannot turn a real frame into a
-        // skip followed by a synthetic duplicate. This intentionally favors a
-        // fully real CFR stream for frame-indexed interpolation tools.
-        let presentation_ns = if options.commit_paced {
-            let origin = *commit_pacing_origin.get_or_insert(source_presentation_ns);
-            origin
-                .saturating_add(encoder.paused_ns)
-                .saturating_add(sequence_elapsed_ns(captured_frames, options.fps))
-        } else {
-            source_presentation_ns
-        };
-        let outcome =
-            encoder.push_latest(capture_buffer, slot, &release_sender, presentation_ns)?;
-        if outcome.written == 0 {
-            available_slots.push_back(slot);
-        }
+        let input = EncodeFrame::new(&capture_buffers[slot], slot, presentation_ns)?;
+        encoder_sender
+            .send(EncoderCommand::Frame(input))
+            .map_err(|_| "encoder worker stopped while accepting a capture frame")?;
         captured_frames = captured_frames.saturating_add(1);
-        encoded_frames = encoded_frames.saturating_add(outcome.written);
-        duplicated_frames = duplicated_frames.saturating_add(outcome.duplicated);
-        unfilled_frames = unfilled_frames.saturating_add(outcome.unfilled);
-        skipped_captures = skipped_captures.saturating_add(u64::from(outcome.skipped));
-        maximum_gap = maximum_gap.max(outcome.maximum_gap);
         if paused {
-            encoder.set_paused(true)?;
+            encoder_sender
+                .send(EncoderCommand::Pause(true))
+                .map_err(|_| "encoder worker stopped while pausing")?;
         }
     }
-    encoder.stop()?;
+    encoder_sender
+        .send(EncoderCommand::Finish)
+        .map_err(|_| "encoder worker stopped before finalization")?;
+    let stats = encoder_thread
+        .join()
+        .map_err(|_| "encoder worker panicked")??;
     for buffer in capture_buffers {
         buffer.wl_buffer.destroy();
     }
     session.destroy();
     source.destroy();
     eprintln!(
-        "direct capture received {captured_frames} frames and wrote {encoded_frames} frames (duplicated {duplicated_frames}, skipped {skipped_captures}, unfilled {unfilled_frames}, maximum gap {maximum_gap}) at {}x{} and up to {} fps to {} ({})",
+        "direct capture received {captured_frames} frames and wrote {} frames (duplicated {}, skipped {}, unfilled {}, maximum gap {}) at {}x{} and up to {} fps to {} ({})",
+        stats.encoded_frames,
+        stats.duplicated_frames,
+        stats.skipped_captures,
+        stats.unfilled_frames,
+        stats.maximum_gap,
         state.width,
         state.height,
         options.fps,
@@ -1023,6 +1151,218 @@ fn run() -> Result<(), String> {
         options.codec
     );
     Ok(())
+}
+
+fn run_encoder_worker(
+    mut encoder: Encoder,
+    commands: mpsc::Receiver<EncoderCommand>,
+    release_sender: mpsc::Sender<usize>,
+) -> Result<EncoderStats, String> {
+    if encoder.commit_paced {
+        return run_commit_clock_worker(encoder, commands, release_sender);
+    }
+    let mut stats = EncoderStats::default();
+    while let Ok(command) = commands.recv() {
+        match command {
+            EncoderCommand::Frame(input) => {
+                let slot = input.slot;
+                let outcome = encoder.push_latest(&input, &release_sender)?;
+                if outcome.written == 0 {
+                    let _ = release_sender.send(slot);
+                }
+                stats.encoded_frames = stats.encoded_frames.saturating_add(outcome.written);
+                stats.duplicated_frames =
+                    stats.duplicated_frames.saturating_add(outcome.duplicated);
+                stats.unfilled_frames = stats.unfilled_frames.saturating_add(outcome.unfilled);
+                stats.skipped_captures = stats
+                    .skipped_captures
+                    .saturating_add(u64::from(outcome.skipped));
+                stats.maximum_gap = stats.maximum_gap.max(outcome.maximum_gap);
+            }
+            EncoderCommand::Pause(paused) => encoder.set_paused(paused)?,
+            EncoderCommand::Finish => break,
+        }
+    }
+    encoder.stop()?;
+    Ok(stats)
+}
+
+fn run_commit_clock_worker(
+    mut encoder: Encoder,
+    commands: mpsc::Receiver<EncoderCommand>,
+    release_sender: mpsc::Sender<usize>,
+) -> Result<EncoderStats, String> {
+    let interval = Duration::from_secs_f64(1.0 / f64::from(encoder.fps));
+    let mut stats = EncoderStats::default();
+    let mut latest: Option<(EncodeFrame, Arc<BufferRelease>)> = None;
+    let mut fresh = false;
+    let mut paused = false;
+    let clock_origin = Instant::now();
+    let mut paused_total = Duration::ZERO;
+    let mut pause_started = None;
+    let mut next_tick = Some(clock_origin);
+    let mut frame_index = 0u64;
+    let mut duplicate_run = 0u64;
+    let mut finishing = false;
+    let mut finish_target = None;
+
+    loop {
+        // Always consume completed captures before servicing an overdue clock
+        // tick. At 480 Hz even a tiny encoder delay can leave the clock late;
+        // prioritising that late tick indefinitely would retain every DMA-BUF,
+        // repeat one stale image and stop the capture producer completely.
+        loop {
+            match commands.try_recv() {
+                Ok(EncoderCommand::Frame(input)) if !finishing => {
+                    let release = BufferRelease::new(release_sender.clone(), input.slot);
+                    if let Some((_, old_release)) = latest.replace((input, release)) {
+                        old_release.retire();
+                    }
+                    fresh = true;
+                }
+                Ok(EncoderCommand::Frame(input)) => {
+                    let _ = release_sender.send(input.slot);
+                }
+                Ok(EncoderCommand::Pause(value)) if !finishing => {
+                    if let Err(error) = encoder.set_paused(value) {
+                        if let Some((_, release)) = latest.take() {
+                            release.retire();
+                        }
+                        return Err(error);
+                    }
+                    let now = Instant::now();
+                    if value && !paused {
+                        pause_started = Some(now);
+                    } else if !value && paused {
+                        if let Some(started) = pause_started.take() {
+                            paused_total = paused_total.saturating_add(now.duration_since(started));
+                        }
+                    }
+                    paused = value;
+                    if !paused {
+                        next_tick = Some(now);
+                    }
+                }
+                Ok(EncoderCommand::Pause(_)) => {}
+                Ok(EncoderCommand::Finish) | Err(mpsc::TryRecvError::Disconnected) => {
+                    finishing = true;
+                    let now = Instant::now();
+                    let current_pause = pause_started
+                        .map(|started| now.duration_since(started))
+                        .unwrap_or_default();
+                    let active = now
+                        .duration_since(clock_origin)
+                        .saturating_sub(paused_total)
+                        .saturating_sub(current_pause);
+                    finish_target = Some(frames_for_elapsed(active, encoder.fps));
+                    if let Err(error) = encoder.begin_audio_eos() {
+                        if let Some((_, release)) = latest.take() {
+                            release.retire();
+                        }
+                        return Err(error);
+                    }
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        if finishing
+            && (latest.is_none() || finish_target.is_some_and(|target| frame_index >= target))
+        {
+            break;
+        }
+
+        if (finishing
+            || (!paused
+                && latest.is_some()
+                && next_tick.is_some_and(|deadline| Instant::now() >= deadline)))
+            && latest.is_some()
+        {
+            let (input, release) = latest.as_ref().expect("checked above");
+            if let Err(error) = encoder.push_one(input, frame_index, release) {
+                if let Some((_, release)) = latest.take() {
+                    release.retire();
+                }
+                return Err(error);
+            }
+            stats.encoded_frames = stats.encoded_frames.saturating_add(1);
+            if fresh {
+                fresh = false;
+                duplicate_run = 0;
+            } else {
+                stats.duplicated_frames = stats.duplicated_frames.saturating_add(1);
+                duplicate_run = duplicate_run.saturating_add(1);
+                stats.maximum_gap = stats.maximum_gap.max(duplicate_run);
+            }
+            frame_index = frame_index.saturating_add(1);
+            if !finishing {
+                next_tick = next_tick.map(|deadline| deadline + interval);
+            }
+            continue;
+        }
+
+        let timeout = if paused || latest.is_none() {
+            Duration::from_millis(100)
+        } else {
+            next_tick
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_default()
+        };
+        match commands.recv_timeout(timeout) {
+            Ok(EncoderCommand::Frame(input)) => {
+                let release = BufferRelease::new(release_sender.clone(), input.slot);
+                if let Some((_, old_release)) = latest.replace((input, release)) {
+                    old_release.retire();
+                }
+                fresh = true;
+            }
+            Ok(EncoderCommand::Pause(value)) => {
+                if let Err(error) = encoder.set_paused(value) {
+                    if let Some((_, release)) = latest.take() {
+                        release.retire();
+                    }
+                    return Err(error);
+                }
+                let now = Instant::now();
+                if value && !paused {
+                    pause_started = Some(now);
+                } else if !value && paused {
+                    if let Some(started) = pause_started.take() {
+                        paused_total = paused_total.saturating_add(now.duration_since(started));
+                    }
+                }
+                paused = value;
+                if !paused {
+                    next_tick = Some(now);
+                }
+            }
+            Ok(EncoderCommand::Finish) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                finishing = true;
+                let now = Instant::now();
+                let current_pause = pause_started
+                    .map(|started| now.duration_since(started))
+                    .unwrap_or_default();
+                let active = now
+                    .duration_since(clock_origin)
+                    .saturating_sub(paused_total)
+                    .saturating_sub(current_pause);
+                finish_target = Some(frames_for_elapsed(active, encoder.fps));
+                if let Err(error) = encoder.begin_audio_eos() {
+                    if let Some((_, release)) = latest.take() {
+                        release.retire();
+                    }
+                    return Err(error);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    if let Some((_, release)) = latest {
+        release.retire();
+    }
+    encoder.stop()?;
+    Ok(stats)
 }
 
 fn drain_commands(receiver: &mpsc::Receiver<String>) -> (bool, bool) {
@@ -1046,16 +1386,25 @@ fn frame_times(frame: u64, fps: u32) -> (u64, u64) {
     (pts, next)
 }
 
+fn frames_for_elapsed(elapsed: Duration, fps: u32) -> u64 {
+    let numerator = elapsed.as_nanos().saturating_mul(u128::from(fps));
+    let frames = numerator.saturating_add(999_999_999) / 1_000_000_000;
+    u64::try_from(frames).unwrap_or(u64::MAX)
+}
+
 fn frame_index_at(elapsed_ns: u128, fps: u32) -> u64 {
     let index = elapsed_ns.saturating_mul(u128::from(fps)) / 1_000_000_000;
     u64::try_from(index).unwrap_or(u64::MAX)
 }
 
-fn sequence_elapsed_ns(frame: u64, fps: u32) -> u64 {
-    let numerator = u128::from(frame).saturating_mul(1_000_000_000);
-    let denominator = u128::from(fps);
-    let elapsed = numerator.div_ceil(denominator);
-    u64::try_from(elapsed).unwrap_or(u64::MAX)
+fn paced_frame_index(wall_index: u64, previous: Option<u64>, preserve_commits: bool) -> u64 {
+    if preserve_commits {
+        previous
+            .map(|previous| wall_index.max(previous.saturating_add(1)))
+            .unwrap_or(wall_index)
+    } else {
+        wall_index
+    }
 }
 
 fn cfr_span(previous: Option<u64>, target: u64, maximum_duplicates: u64) -> (u64, u64, u64) {
@@ -1101,15 +1450,21 @@ mod tests {
     }
 
     #[test]
-    fn commit_sequence_maps_every_real_frame_to_one_cfr_slot() {
-        for fps in [30, 60, 120, 240, 480] {
-            for frame in 0..u64::from(fps) * 10 {
-                assert_eq!(
-                    frame_index_at(u128::from(sequence_elapsed_ns(frame, fps)), fps),
-                    frame
-                );
-            }
-        }
+    fn elapsed_recording_duration_rounds_up_to_a_complete_cfr_frame() {
+        assert_eq!(frames_for_elapsed(Duration::ZERO, 480), 0);
+        assert_eq!(frames_for_elapsed(Duration::from_nanos(1), 480), 1);
+        assert_eq!(frames_for_elapsed(Duration::from_nanos(2_083_333), 480), 1);
+        assert_eq!(frames_for_elapsed(Duration::from_nanos(2_083_334), 480), 2);
+        assert_eq!(frames_for_elapsed(Duration::from_secs(5), 480), 2_400);
+    }
+
+    #[test]
+    fn commit_pacing_preserves_early_frames_but_not_real_source_gaps() {
+        assert_eq!(paced_frame_index(10, None, true), 10);
+        assert_eq!(paced_frame_index(10, Some(10), true), 11);
+        assert_eq!(paced_frame_index(10, Some(11), true), 12);
+        assert_eq!(paced_frame_index(20, Some(12), true), 20);
+        assert_eq!(paced_frame_index(10, Some(10), false), 10);
     }
 
     #[test]

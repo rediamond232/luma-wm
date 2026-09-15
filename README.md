@@ -431,8 +431,12 @@ Luma exposes four deliberately separate capture modes.
   The 480 Hz pacing timer only releases Xwayland frame callbacks; it never
   records an unchanged surface. This removes per-frame X Composite naming,
   DRI3 export, and EGL re-import while keeping client-buffer reuse safe. No
-  frame pixels cross CPU memory. Each admitted commit occupies exactly one CFR
-  slot, so scheduler jitter cannot replace real frames with synthetic padding.
+  frame pixels cross CPU memory. Capture and encoding run independently: each
+  output tick uses the newest completed commit, and repeats it only if no newer
+  commit arrived. This keeps the video clock at real elapsed time instead of
+  speeding up a sub-480-FPS source. The recorder log reports received and
+  duplicated counts separately, because 480-FPS metadata is not proof of 480
+  distinct game images.
 - **OpenGL API capture** hooks GLX/EGL presentation, independent of the game.
   A launch profile loads the hook before the renderer starts; **OpenGL API
   Inject** uses a matching x86-64 helper to load it into an already-running,
@@ -528,9 +532,10 @@ stop` releases the injected GL/NVENC state on the next present, finalizes the
 MP4, and leaves the application running. Re-injection into the same process is
 currently unsupported; restart it before a second injected recording.
 
-The **Screen** profile targets 2560x1440 at up to 240 FPS by default, H.264 in
-Hybrid MP4, NVENC's performance tune, with separate desktop and microphone
-tracks. Encoded tracks stream through a small internal fragmented-MP4 transport
+The **Screen** and **Xwayland Zero-Copy** profiles put an OBS-style desktop plus
+microphone mix in one audio track, so normal players and editors hear both
+without selecting or combining tracks. Encoded tracks stream through a small
+internal fragmented-MP4 transport
 into FFmpeg's `hybrid_fragmented` muxer: completed fragments remain recoverable
 after an interruption, while a clean stop finalizes the file as a normal indexed
 MP4.

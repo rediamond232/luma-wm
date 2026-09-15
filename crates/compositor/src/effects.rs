@@ -172,7 +172,7 @@ impl Element for EffectElement {
         }
         // The compositor blends this element with what is already on the
         // output. It consequently cannot occlude anything beneath it.
-        if self.opacity < 1.0 {
+        if self.alpha() < 1.0 {
             return OpaqueRegions::default();
         }
         if self.radius > 0.0 {
