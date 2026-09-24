@@ -18,6 +18,7 @@ libluma_vk_dmabuf_capture.so: luma_vk_dmabuf_capture_layer.c luma_vk_export_prot
 
 luma-vulkan-capture-receiver: luma_vk_capture_receiver.cpp luma_vk_export_protocol.h \
 		../game-capture-gl/src/luma_nvenc_direct.cpp \
+		../game-capture-gl/src/luma_gl_shared_memory.h \
 		../game-capture-gl/src/luma_nvenc_direct.h
 	$(CXX) $(CXXFLAGS) luma_vk_capture_receiver.cpp \
 		../game-capture-gl/src/luma_nvenc_direct.cpp -o $@ -lEGL -lGL -ldl -pthread

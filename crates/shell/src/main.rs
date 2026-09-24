@@ -62,12 +62,43 @@ thread_local! {
 }
 fn css(config: &Config) {
     let t = &config.theme;
+    let bar_content_height = (config.shell.height - 8 - 2 * config.theme.border).max(8);
+    let bar_launcher_height = bar_content_height.min(24);
+    let bar_workspace_height = bar_content_height.min(26);
+    let bar_radius = t.radius.min(bar_content_height as f32 / 2.0);
+    let workspace_font_size = t
+        .font_size
+        .saturating_sub(2)
+        .max(6)
+        .min((bar_content_height as u32).saturating_sub(6).max(6));
+    let launcher_font_size = t
+        .font_size
+        .min((bar_content_height as u32).saturating_sub(4).max(6));
     let css = format!(
         r#"
 window {{ background: transparent; color: {fg}; font-family: "{font}"; font-size: {size}px; }}
-.panel, .launcher, .notification {{ background: alpha({bg}, {opacity}); border: {border}px solid alpha({accent}, .35); border-radius: {radius}px; padding: 6px 12px; }}
+.panel, .launcher, .notification {{ background: alpha({bg}, {opacity}); border: {border}px solid alpha({muted}, .28); border-radius: {radius}px; padding: 6px 12px; }}
+.bar-root {{ background: transparent; border: 0; padding: 4px; }}
+.bar-island {{ background: alpha({bg}, {opacity}); border: {border}px solid alpha({muted}, .28); border-radius: {bar_radius}px; min-height: {bar_content_height}px; padding: 0 6px; }}
+.bar-left {{ padding: 0 4px; }}
+.bar-chip {{ background: alpha({bg}, {opacity}); border: {border}px solid alpha({muted}, .2); border-radius: 8px; min-height: {bar_content_height}px; padding: 0 3px; }}
+.bar-chip > label {{ color: {muted}; padding: 0 4px; }}
+.bar-chip button {{ min-height: 26px; padding: 2px 4px; border-radius: 6px; }}
+.bar-title {{ padding: 0 12px; }}
+.bar-title-label {{ color: {fg}; }}
+.title-indicator {{ background: {accent}; border-radius: 3px; min-width: 6px; min-height: 6px; }}
 button {{ background: transparent; color: {muted}; border: 0; box-shadow: none; border-radius: 7px; padding: 4px 10px; min-height: 18px; }}
 button label, button image, button arrow {{ color: {muted}; }}
+button.bar-launcher {{ background: {accent}; color: {bg}; font-size: {launcher_font_size}px; font-weight: bold; border-radius: 8px; min-width: 26px; min-height: {bar_launcher_height}px; padding: 0; }}
+button.bar-launcher label {{ color: {bg}; }}
+button.bar-launcher:hover {{ background: alpha({accent}, .88); color: {bg}; }}
+button.bar-workspace {{ background: alpha({muted}, .12); color: {muted}; border-radius: 8px; min-width: 24px; min-height: {bar_workspace_height}px; padding: 0 4px; }}
+button.bar-workspace .bar-workspace-label {{ color: {muted}; font-size: {workspace_font_size}px; }}
+button.bar-workspace .bar-workspace-marker {{ background: transparent; border-radius: 1px; min-width: 8px; min-height: 2px; }}
+button.bar-workspace:hover {{ background: alpha({accent}, .15); color: {fg}; }}
+button.bar-workspace.active {{ background: {accent}; color: {bg}; }}
+button.bar-workspace.active .bar-workspace-label {{ color: {bg}; }}
+button.bar-workspace.active .bar-workspace-marker {{ background: alpha({bg}, .72); }}
 tooltip {{ background: {bg}; color: {fg}; border: 1px solid alpha({accent}, .35); border-radius: 8px; padding: 6px 8px; }}
 tooltip label {{ color: {fg}; }}
 popover button, popover button label, popover button image {{ color: {fg}; }}
@@ -102,9 +133,21 @@ row {{ padding: 8px; border-radius: 8px; }}
         size = t.font_size,
         opacity = t.opacity,
         border = t.border,
-        radius = t.radius
+        radius = t.radius,
+        bar_radius = bar_radius,
+        bar_content_height = bar_content_height,
+        bar_launcher_height = bar_launcher_height,
+        bar_workspace_height = bar_workspace_height,
+        workspace_font_size = workspace_font_size,
+        launcher_font_size = launcher_font_size
     );
     STYLE.with(|provider| provider.load_from_string(&css));
+}
+fn bar_chip<W: IsA<gtk::Widget>>(child: &W) -> gtk::Box {
+    let chip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    chip.add_css_class("bar-chip");
+    chip.append(child);
+    chip
 }
 fn layer_window(
     app: &gtk::Application,
@@ -222,13 +265,24 @@ fn shell(app: &gtk::Application, c: &Config) {
                 w.auto_exclusive_zone_enable();
                 w.set_height_request(c.shell.height);
                 let root = gtk::CenterBox::new();
-                root.add_css_class("panel");
-                let left = gtk::Box::new(gtk::Orientation::Horizontal, 3);
-                let right = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                root.add_css_class("bar-root");
+                let left = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+                left.add_css_class("bar-island");
+                left.add_css_class("bar-left");
+                let right = gtk::Box::new(gtk::Orientation::Horizontal, 6);
                 let mut buttons = vec![];
                 if c.shell.modules.iter().any(|m| m == "workspaces") {
                     for n in 1..=c.layout.workspaces {
-                        let b = gtk::Button::with_label(&n.to_string());
+                        let b = gtk::Button::new();
+                        b.add_css_class("bar-workspace");
+                        let cell = gtk::Box::new(gtk::Orientation::Vertical, 1);
+                        let label = gtk::Label::new(Some(&n.to_string()));
+                        label.add_css_class("bar-workspace-label");
+                        let marker = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                        marker.add_css_class("bar-workspace-marker");
+                        cell.append(&label);
+                        cell.append(&marker);
+                        b.set_child(Some(&cell));
                         let output = name.clone();
                         b.connect_clicked(move |_| command(format!("workspace {n} {output}")));
                         left.append(&b);
@@ -238,36 +292,51 @@ fn shell(app: &gtk::Application, c: &Config) {
                 let title = gtk::Label::new(None);
                 title.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 title.set_max_width_chars(55);
+                title.add_css_class("bar-title-label");
                 if c.shell.modules.iter().any(|m| m == "title") {
-                    root.set_center_widget(Some(&title));
+                    let title_island = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                    title_island.add_css_class("bar-island");
+                    title_island.add_css_class("bar-title");
+                    let indicator = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+                    indicator.add_css_class("title-indicator");
+                    title_island.append(&indicator);
+                    title_island.append(&title);
+                    root.set_center_widget(Some(&title_island));
                 }
-                if c.shell.modules.iter().any(|m| m == "audio") {
-                    right.append(&audio::widget());
-                }
-                if c.shell.modules.iter().any(|m| m == "network") {
-                    right.append(&network::button());
-                }
-                if c.shell.modules.iter().any(|m| m == "bluetooth") {
-                    right.append(&bluetooth::button());
+                if c.shell.modules.iter().any(|m| m == "battery") {
+                    right.append(&bar_chip(&battery::widget()));
                 }
                 if c.shell.modules.iter().any(|m| m == "media") {
-                    right.append(&media::widget());
+                    right.append(&bar_chip(&media::widget()));
+                }
+                if c.shell.modules.iter().any(|m| m == "bluetooth") {
+                    right.append(&bar_chip(&bluetooth::button()));
                 }
                 if c.shell.modules.iter().any(|m| m == "tray") {
                     let geometry = monitor.geometry();
-                    right.append(&tray::widget((
+                    right.append(&bar_chip(&tray::widget((
                         geometry.x(),
                         geometry.y(),
                         geometry.height(),
                         c.shell.position == "bottom",
-                    )));
+                    ))));
                 }
-                if c.shell.modules.iter().any(|m| m == "battery") {
-                    right.append(&battery::widget());
+                if c.shell.modules.iter().any(|m| m == "notifications") {
+                    let button = gtk::Button::with_label("Notifications");
+                    let center = notification_center.clone();
+                    let application = app.clone();
+                    button.connect_clicked(move |_| center.show(&application));
+                    right.append(&bar_chip(&button));
+                }
+                if c.shell.modules.iter().any(|m| m == "network") {
+                    right.append(&bar_chip(&network::button()));
+                }
+                if c.shell.modules.iter().any(|m| m == "audio") {
+                    right.append(&bar_chip(&audio::widget()));
                 }
                 if c.shell.modules.iter().any(|m| m == "clock") {
                     let l = gtk::Label::new(None);
-                    right.append(&l);
+                    right.append(&bar_chip(&l));
                     let update = move || {
                         if let Ok(now) = glib::DateTime::now_local() {
                             if let Ok(s) = now.format("%a  %H:%M") {
@@ -283,14 +352,9 @@ fn shell(app: &gtk::Application, c: &Config) {
                             glib::ControlFlow::Continue
                         }));
                 }
-                if c.shell.modules.iter().any(|m| m == "notifications") {
-                    let button = gtk::Button::with_label("Notifications");
-                    let center = notification_center.clone();
-                    let application = app.clone();
-                    button.connect_clicked(move |_| center.show(&application));
-                    right.append(&button);
-                }
-                let launch = gtk::Button::with_label("⌕");
+                let launch = gtk::Button::with_label("L");
+                launch.add_css_class("bar-launcher");
+                launch.set_tooltip_text(Some("Open launcher"));
                 launch.connect_clicked(|_| command("launcher".into()));
                 left.prepend(&launch);
                 root.set_start_widget(Some(&left));

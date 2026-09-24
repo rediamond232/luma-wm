@@ -13,13 +13,74 @@ use smithay::{
     utils::{IsAlive, Rectangle, SERIAL_COUNTER},
     wayland::{compositor::with_states, seat::WaylandFocus, shell::xdg::XdgToplevelSurfaceData},
 };
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     process::{Child, Command},
     sync::{Arc, Mutex},
     time::Duration,
 };
 use wm_core::{Config, OutputInfo, Rect, Snapshot, WindowInfo};
+
+/// Find the standalone lock theme shipped with Luma. Do not let hyprlock
+/// implicitly load a user's Hyprland config: its `source` directives and
+/// wallpaper commands are unrelated to this compositor session.
+fn lock_theme_config_path() -> Result<PathBuf, String> {
+    let mut candidates = Vec::with_capacity(3);
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(directory) = exe.parent() {
+            // Release archives install the config beside `luma-wm`.
+            candidates.push(directory.join("hyprlock.conf"));
+            // System packages install shared configuration under /usr/share.
+            candidates.push(directory.join("../share/luma-wm/hyprlock.conf"));
+        }
+    }
+    // Developer builds use the repository config without depending on cwd.
+    candidates
+        .push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/luma-hyprlock.conf"));
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .ok_or_else(|| "Luma hyprlock.conf is missing; reinstall the compositor package".into())
+}
+
+fn executable_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+}
+
+fn session_lock_command() -> Result<Vec<String>, String> {
+    if let Some(hyprlock) = executable_in_path("hyprlock") {
+        match lock_theme_config_path() {
+            Ok(config) => {
+                return Ok(vec![
+                    hyprlock.to_string_lossy().into_owned(),
+                    "--config".into(),
+                    config.to_string_lossy().into_owned(),
+                    "--grace".into(),
+                    "0".into(),
+                    "--no-fade-in".into(),
+                    "--immediate-render".into(),
+                ]);
+            }
+            Err(error) => tracing::warn!(%error, "Luma theme unavailable; trying swaylock"),
+        }
+    }
+    if let Some(swaylock) = executable_in_path("swaylock") {
+        tracing::warn!("hyprlock unavailable; using swaylock fallback");
+        return Ok(vec![swaylock.to_string_lossy().into_owned()]);
+    }
+    Err("no session locker is available; install hyprlock or swaylock".into())
+}
+
 #[derive(Debug)]
 pub struct Managed {
     pub window: WindowElement,
@@ -66,6 +127,9 @@ pub struct Desktop {
     pub installed: bool,
     pub watcher: Option<notify::RecommendedWatcher>,
     pub recorder: RecorderController,
+    /// Session-only override selected through wmctl. Configuration reloads do
+    /// not overwrite it; `auto` explicitly returns to configured automation.
+    performance_profile_override: Option<String>,
     animation_timer: Option<smithay::reexports::calloop::RegistrationToken>,
 }
 impl Default for Desktop {
@@ -90,8 +154,17 @@ impl Default for Desktop {
             installed: false,
             watcher: None,
             recorder: RecorderController::default(),
+            performance_profile_override: None,
             animation_timer: None,
         }
+    }
+}
+
+impl Desktop {
+    fn configured_performance_profile(&self) -> &str {
+        self.performance_profile_override
+            .as_deref()
+            .unwrap_or(&self.config.performance.profile)
     }
 }
 impl Drop for Desktop {
@@ -136,6 +209,30 @@ pub fn identity(w: &WindowElement) -> (String, String) {
     }
 }
 impl<B: Backend + 'static> AnvilState<B> {
+    fn performance_gaming_outputs(&self) -> Vec<String> {
+        let profile = self.desktop.configured_performance_profile();
+        if profile == "desktop" {
+            return Vec::new();
+        }
+        if profile == "gaming" {
+            return self.space.outputs().map(|output| output.name()).collect();
+        }
+        self.space
+            .outputs()
+            .filter(|output| {
+                let name = output.name();
+                let workspace = self.desktop.outputs.get(&name).copied().unwrap_or(1);
+                self.desktop.windows.iter().any(|window| {
+                    window.output == name
+                        && window.workspace == workspace
+                        && window.fullscreen
+                        && !window.scratchpad
+                })
+            })
+            .map(|output| output.name())
+            .collect()
+    }
+
     pub(crate) fn window_unmapped(
         &mut self,
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -246,14 +343,28 @@ impl<B: Backend + 'static> AnvilState<B> {
             })
             .unwrap();
         self.apply_input_config();
-        if std::env::var_os("WM_PRIVATE_BUS").is_some() {
-            if let Some(socket) = &self.socket_name {
-                let _ = std::process::Command::new("dbus-update-activation-environment")
-                    .args([
-                        format!("WAYLAND_DISPLAY={socket}"),
-                        "XDG_CURRENT_DESKTOP=wm:wlr".into(),
-                    ])
-                    .status();
+        if let Some(socket) = &self.socket_name {
+            let private_bus = std::env::var_os("WM_PRIVATE_BUS").is_some();
+            let mut command = activation_environment_command(socket, private_bus);
+            let published = match command.status() {
+                Ok(status) if !status.success() => {
+                    tracing::warn!(
+                        %status,
+                        "failed to publish the Luma session environment to D-Bus activation"
+                    );
+                    false
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not publish the Luma session environment to D-Bus activation"
+                    );
+                    false
+                }
+                _ => true,
+            };
+            if published && !private_bus {
+                refresh_portal_services();
             }
         }
         for cmd in self.desktop.config.startup.clone() {
@@ -446,6 +557,42 @@ impl<B: Backend + 'static> AnvilState<B> {
             _ => Err("recorder source must be output, window ID, or region X Y W H".into()),
         }
     }
+    fn remembered_recorder_source(
+        &self,
+        config: &wm_core::Recorder,
+    ) -> Result<RecorderCaptureSource, String> {
+        if config.window_app_id.is_empty() && config.window_title.is_empty() {
+            return Ok(RecorderCaptureSource::Output);
+        }
+        let wanted_app = config.window_app_id.to_lowercase();
+        let wanted_title = config.window_title.to_lowercase();
+        self.desktop
+            .windows
+            .iter()
+            .find(|window| {
+                let (app_id, title) = identity(&window.window);
+                let app_id = app_id.to_lowercase();
+                let title = title.to_lowercase();
+                if !wanted_app.is_empty()
+                    && (!app_id.is_empty() && app_id.contains(&wanted_app)
+                        || app_id.is_empty() && title.contains(&wanted_app))
+                {
+                    return true;
+                }
+                !wanted_title.is_empty() && title.contains(&wanted_title)
+            })
+            .map(|window| RecorderCaptureSource::Window(window.id))
+            .ok_or_else(|| {
+                format!(
+                    "remembered window '{}' is not open",
+                    if config.window_app_id.is_empty() {
+                        config.window_title.clone()
+                    } else {
+                        config.window_app_id.clone()
+                    }
+                )
+            })
+    }
     fn recorder_output(&self, source: RecorderCaptureSource) -> Result<String, String> {
         match source {
             RecorderCaptureSource::Output => self
@@ -476,7 +623,7 @@ impl<B: Backend + 'static> AnvilState<B> {
         }
     }
     pub fn desktop_command(&mut self, cmd: &str) -> Result<(), String> {
-        if self.lock.locked && !["status"].contains(&cmd) {
+        if self.lock.locked && cmd != "status" && cmd != "performance status" {
             return Err("session is locked".into());
         }
         let (v, arg) = cmd.split_once(' ').unwrap_or((cmd, ""));
@@ -484,6 +631,40 @@ impl<B: Backend + 'static> AnvilState<B> {
         let focused = self.focused_index();
         match v {
             "status" => return Ok(()),
+            "performance" => {
+                let mut parts = arg.split_whitespace();
+                match parts.next().unwrap_or("status") {
+                    "status" if parts.next().is_none() => {
+                        self.publish_snapshot();
+                        return Ok(());
+                    }
+                    "reset" if parts.next().is_none() => {
+                        self.backend_data.reset_performance_metrics();
+                    }
+                    "profile" => {
+                        let profile = parts
+                            .next()
+                            .ok_or("performance profile requires auto, desktop, or gaming")?;
+                        if parts.next().is_some()
+                            || !["auto", "desktop", "gaming"].contains(&profile)
+                        {
+                            return Err(
+                                "performance profile requires auto, desktop, or gaming".into()
+                            );
+                        }
+                        self.desktop.performance_profile_override = Some(profile.into());
+                        self.desktop.redraw = true;
+                    }
+                    _ => {
+                        return Err(
+                            "performance requires status, reset, or profile auto|desktop|gaming"
+                                .into(),
+                        );
+                    }
+                }
+                self.desktop.dirty = true;
+                return Ok(());
+            }
             "terminal" => {
                 return self.spawn_app(&self.desktop.config.terminal.clone());
             }
@@ -514,7 +695,11 @@ impl<B: Backend + 'static> AnvilState<B> {
                 match action {
                     "start" => {
                         let config = self.desktop.config.recorder.clone();
-                        let source = self.recorder_source(source_arg)?;
+                        let source = if source_arg.trim() == "remembered" {
+                            self.remembered_recorder_source(&config)?
+                        } else {
+                            self.recorder_source(source_arg)?
+                        };
                         let capture_output = self.recorder_output(source)?;
                         self.capture_override = source;
                         self.capture_commit_driven = false;
@@ -696,10 +881,34 @@ impl<B: Backend + 'static> AnvilState<B> {
                         self.desktop.recorder.toggle_pause()?;
                     }
                     "replay-save" => self.desktop.recorder.save_replay()?,
+                    "set" => {
+                        let (key, value) = source_arg
+                            .trim()
+                            .split_once(' ')
+                            .ok_or("recorder set requires a KEY and VALUE")?;
+                        if key.is_empty() || value.trim().is_empty() {
+                            return Err("recorder set requires a KEY and VALUE".into());
+                        }
+                        // Runtime settings apply to the compositor's recorder
+                        // config immediately and persist to the settings
+                        // overlay file; a running encoding picks them up on
+                        // its next start because the engine consumes its
+                        // options at spawn time.
+                        self.desktop.config.recorder.apply(key.trim(), value)?;
+                        wm_core::write_recorder_settings(&self.desktop.config.recorder)?;
+                    }
+                    "settings-reset" => {
+                        wm_core::clear_recorder_settings()?;
+                        // Reload with the overlay gone; only the recorder
+                        // section is replaced so the rest of the live state
+                        // is untouched.
+                        let base = wm_core::Config::load()?;
+                        self.desktop.config.recorder = base.recorder;
+                    }
                     "status" => return Ok(()),
                     _ => {
                         return Err(
-                            "recorder requires start [source], game-start PROFILE, game-attach PID, xwayland-start WINDOW, replay-start [source], stop, toggle, pause, replay-save, or status"
+                            "recorder requires start [source], game-start PROFILE, game-attach PID, xwayland-start WINDOW, replay-start [source], stop, toggle, pause, replay-save, set KEY VALUE, settings-reset, or status"
                                 .into(),
                         );
                     }
@@ -726,7 +935,12 @@ impl<B: Backend + 'static> AnvilState<B> {
                 return Ok(());
             }
             "lock" => {
-                return self.spawn_app(&["swaylock".into()]);
+                if !B::SUPPORTS_SESSION_LOCK {
+                    return Err(
+                        "session locking is unavailable on this nested compositor backend".into(),
+                    );
+                }
+                return self.spawn_app(&session_lock_command()?);
             }
             "reload" => match Config::load() {
                 Ok(c) => {
@@ -938,6 +1152,18 @@ impl<B: Backend + 'static> AnvilState<B> {
                 self.desktop.dirty = true;
             }
         }
+        let gaming_outputs = self.performance_gaming_outputs();
+        let performance_errors = self.backend_data.apply_performance_policy(
+            &self.desktop.config.performance,
+            &gaming_outputs,
+            &self.desktop.config.outputs,
+        );
+        if let Some(error) = performance_errors.into_iter().next() {
+            if self.desktop.error.as_deref() != Some(&error) {
+                self.desktop.error = Some(error);
+                self.desktop.dirty = true;
+            }
+        }
         let candidates: Vec<_> = self.space.elements().cloned().collect();
         let active = self.active_output().unwrap_or(default_out);
         for window in candidates {
@@ -956,7 +1182,24 @@ impl<B: Backend + 'static> AnvilState<B> {
             let mut output = active.clone();
             let mut workspace = *self.desktop.outputs.get(&output).unwrap_or(&1);
             let mut floating = window.0.toplevel().is_some_and(|t| t.parent().is_some());
+            #[cfg(feature = "xwayland")]
+            let x11_auxiliary = window
+                .0
+                .x11_surface()
+                .is_some_and(crate::shell::x11::is_auxiliary_window);
+            #[cfg(not(feature = "xwayland"))]
+            let x11_auxiliary = false;
+            floating |= x11_auxiliary;
             let mut requested_size = (None, None);
+            if x11_auxiliary {
+                let size = window.0.geometry().size;
+                if size.w > 0 {
+                    requested_size.0 = Some(size.w);
+                }
+                if size.h > 0 {
+                    requested_size.1 = Some(size.h);
+                }
+            }
             for r in &self.desktop.config.rules {
                 if r.app_id.as_ref().is_none_or(|s| s == &app)
                     && r.title.as_ref().is_none_or(|s| title.contains(s))
@@ -1009,7 +1252,9 @@ impl<B: Backend + 'static> AnvilState<B> {
         let mut animating = false;
         let mut animation_refresh = 0;
         let mut scene_moved = false;
-        let animate_movement = !self.lock.locked
+        let gaming_active = !gaming_outputs.is_empty();
+        let animate_movement = !gaming_active
+            && !self.lock.locked
             && self.desktop.active
             && !self.pointer.is_grabbed()
             && !self
@@ -1025,7 +1270,8 @@ impl<B: Backend + 'static> AnvilState<B> {
                 .unwrap_or(60_000);
             if crate::transitions::tick(
                 output,
-                self.desktop.active
+                !gaming_active
+                    && self.desktop.active
                     && !self.lock.locked
                     && !self.desktop.config.theme.reduced_motion
                     && self.desktop.config.theme.animation_ms > 0
@@ -1050,7 +1296,18 @@ impl<B: Backend + 'static> AnvilState<B> {
                 .unwrap()
                 .lock()
                 .unwrap();
-            let next_theme = &self.desktop.config.theme;
+            let mut effective_theme = self.desktop.config.theme.clone();
+            if gaming_outputs.contains(&output.name()) {
+                effective_theme.blur = false;
+                effective_theme.blur_passes = 0;
+                effective_theme.shadow_size = 0;
+                effective_theme.shadow_opacity = 0.0;
+                effective_theme.radius = 0.0;
+                effective_theme.opacity = 1.0;
+                effective_theme.animation_ms = 0;
+                effective_theme.reduced_motion = true;
+            }
+            let next_theme = &effective_theme;
             if output_theme.0.radius != next_theme.radius
                 || output_theme.0.blur != next_theme.blur
                 || output_theme.0.blur_passes != next_theme.blur_passes
@@ -1242,7 +1499,7 @@ impl<B: Backend + 'static> AnvilState<B> {
                     self.desktop.redraw = true;
                 }
                 drop(previous_blur);
-                let opacity = if w.fullscreen {
+                let opacity = if w.fullscreen || gaming_outputs.contains(&w.output) {
                     1.0
                 } else {
                     self.desktop
@@ -1577,11 +1834,23 @@ impl<B: Backend + 'static> AnvilState<B> {
         self.publish_snapshot();
     }
     fn publish_snapshot(&mut self) {
+        let gaming_outputs = self.performance_gaming_outputs();
+        let active_profile = if gaming_outputs.is_empty() {
+            "desktop"
+        } else {
+            "gaming"
+        };
         let mut snapshot = Snapshot {
             version: 1,
             focused: self.focused_index().map(|i| self.desktop.windows[i].id),
             error: self.desktop.error.clone(),
             recorder: self.desktop.recorder.status.clone(),
+            recorder_settings: self.desktop.config.recorder.clone(),
+            performance: wm_core::PerformanceStatus {
+                configured_profile: self.desktop.configured_performance_profile().into(),
+                active_profile: active_profile.into(),
+                outputs: self.backend_data.performance_status(),
+            },
             ..Default::default()
         };
         for w in &self.desktop.windows {
@@ -1658,8 +1927,12 @@ impl<B: Backend + 'static> AnvilState<B> {
             }
         }
         let mut old = self.desktop.snapshot.lock().unwrap();
-        if *old != snapshot {
-            *old = snapshot.clone();
+        // Keep the shared status snapshot current on every maintenance pass so
+        // one-shot `wmctl status` calls see fresh counters. Performance counters
+        // move on every repaint, and recorder telemetry is sampled while
+        // recording; only send either to subscribers on the IPC heartbeat.
+        let ui_changed = update_status_snapshot(&mut old, snapshot.clone());
+        if ui_changed {
             self.desktop.subscribers.lock().unwrap().retain(|tx| {
                 match tx.try_send(snapshot.clone()) {
                     Ok(()) => true,
@@ -1669,6 +1942,27 @@ impl<B: Backend + 'static> AnvilState<B> {
             });
         }
     }
+}
+
+fn same_snapshot_for_immediate_subscribers(left: &Snapshot, right: &Snapshot) -> bool {
+    left.version == right.version
+        && left.windows == right.windows
+        && left.outputs == right.outputs
+        && left.focused == right.focused
+        && left.error == right.error
+        && left.layers == right.layers
+        && left.recorder.state == right.recorder.state
+        && left.recorder.source == right.recorder.source
+        && left.recorder.requested_fps == right.recorder.requested_fps
+        && left.recorder.output_path == right.recorder.output_path
+        && left.recorder.error == right.recorder.error
+        && left.recorder_settings == right.recorder_settings
+}
+
+fn update_status_snapshot(current: &mut Snapshot, latest: Snapshot) -> bool {
+    let ui_changed = !same_snapshot_for_immediate_subscribers(current, &latest);
+    *current = latest;
+    ui_changed
 }
 
 fn binding_action<'a>(bindings: &'a BTreeMap<String, String>, key: &str) -> Option<&'a String> {
@@ -1691,6 +1985,71 @@ fn application_desktop_environment(executable: &str) -> &'static str {
     }
 }
 
+fn activation_environment_command(socket: &str, private_bus: bool) -> Command {
+    let mut command = Command::new("dbus-update-activation-environment");
+    // A display-manager session shares its D-Bus activation environment with
+    // the persistent user systemd manager. Portal backends are systemd user
+    // services, so updating only dbus-daemon leaves them without a display.
+    // Nested/TTY fixtures use dbus-run-session and must not modify the host
+    // user's systemd environment.
+    if !private_bus {
+        command.arg("--systemd");
+    }
+    command.args([
+        format!("WAYLAND_DISPLAY={socket}"),
+        "XDG_CURRENT_DESKTOP=wm:wlr".into(),
+        "XDG_SESSION_DESKTOP=wm".into(),
+        "XDG_SESSION_TYPE=wayland".into(),
+    ]);
+    command
+}
+
+fn refresh_portal_services() {
+    // The user manager survives compositor restarts, and an already-running
+    // portal keeps the environment it was launched with. Refresh active
+    // backends first, clear any old start-limit failures, then restart the
+    // frontend so OpenURI launches inherit this session's Wayland display.
+    // Activation must stay asynchronous: install_desktop runs before the
+    // Wayland event loop, so waiting for a portal that connects to this
+    // compositor deadlocks startup and leaves only the initial black frame.
+    for mut command in portal_refresh_commands() {
+        match command.status() {
+            Ok(status) if !status.success() => {
+                tracing::warn!(%status, ?command, "could not queue desktop portal refresh")
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                ?command,
+                "could not queue desktop portal refresh"
+            ),
+            _ => {}
+        }
+    }
+}
+
+fn portal_refresh_commands() -> [Command; 3] {
+    let mut reset_failed = Command::new("systemctl");
+    reset_failed.args(["--user", "reset-failed", "xdg-desktop-portal-*.service"]);
+
+    let mut restart_backends = Command::new("systemctl");
+    restart_backends.args([
+        "--user",
+        "--no-block",
+        "try-restart",
+        "xdg-desktop-portal-*.service",
+    ]);
+
+    let mut restart_frontend = Command::new("systemctl");
+    restart_frontend.args([
+        "--user",
+        "--no-block",
+        "restart",
+        "xdg-desktop-portal.service",
+    ]);
+
+    [reset_failed, restart_backends, restart_frontend]
+}
+
 fn launch_args(command: &str) -> Result<Vec<String>, String> {
     let args = shlex::split(command).ok_or("launch has an unterminated quote")?;
     if args.is_empty() {
@@ -1710,8 +2069,72 @@ fn screenshot_copy_command() -> [String; 3] {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::{application_desktop_environment, binding_action};
+    use super::{
+        activation_environment_command, application_desktop_environment, binding_action,
+        portal_refresh_commands, same_snapshot_for_immediate_subscribers, update_status_snapshot,
+    };
     use std::collections::BTreeMap;
+    use wm_core::{OutputPerformanceStatus, RecorderState, Snapshot};
+
+    #[test]
+    fn subscriber_updates_suppress_fast_counters_but_keep_latest_status() {
+        let mut current = Snapshot::default();
+        let mut latest = current.clone();
+        latest.performance.outputs.push(OutputPerformanceStatus {
+            empty_frames: 12,
+            ..Default::default()
+        });
+        latest.recorder.source_fps = 60.0;
+        latest.recorder.encoded_fps = 60.0;
+        latest.recorder.elapsed_ms = 2_000;
+        latest.recorder.dropped_frames = 3;
+        latest.recorder.replay_seconds = 1.5;
+        latest.recorder.replay_bytes = 65_536;
+
+        assert!(same_snapshot_for_immediate_subscribers(&current, &latest));
+        assert!(!update_status_snapshot(&mut current, latest));
+        assert_eq!(current.performance.outputs[0].empty_frames, 12);
+        assert_eq!(current.recorder.source_fps, 60.0);
+        assert_eq!(current.recorder.encoded_fps, 60.0);
+        assert_eq!(current.recorder.elapsed_ms, 2_000);
+        assert_eq!(current.recorder.dropped_frames, 3);
+        assert_eq!(current.recorder.replay_seconds, 1.5);
+        assert_eq!(current.recorder.replay_bytes, 65_536);
+
+        let mut changed = current.clone();
+        changed.recorder.state = RecorderState::Recording;
+        assert!(update_status_snapshot(&mut current, changed));
+        assert_eq!(current.recorder.state, RecorderState::Recording);
+
+        let mut changed = current.clone();
+        changed.recorder.source = Some("output:DP-1".into());
+        assert!(update_status_snapshot(&mut current, changed));
+        assert_eq!(current.recorder.source.as_deref(), Some("output:DP-1"));
+
+        let mut changed = current.clone();
+        changed.recorder.requested_fps = 60;
+        assert!(update_status_snapshot(&mut current, changed));
+        assert_eq!(current.recorder.requested_fps, 60);
+
+        let mut changed = current.clone();
+        changed.recorder.output_path = Some("capture.mp4".into());
+        assert!(update_status_snapshot(&mut current, changed));
+        assert_eq!(current.recorder.output_path.as_deref(), Some("capture.mp4"));
+
+        let mut changed = current.clone();
+        changed.recorder.error = Some("test failure".into());
+        assert!(update_status_snapshot(&mut current, changed));
+        assert_eq!(current.recorder.error.as_deref(), Some("test failure"));
+
+        let mut focus_changed = current.clone();
+        focus_changed.focused = Some(42);
+        assert!(!same_snapshot_for_immediate_subscribers(
+            &current,
+            &focus_changed
+        ));
+        assert!(update_status_snapshot(&mut current, focus_changed));
+        assert_eq!(current.focused, Some(42));
+    }
 
     #[test]
     fn binding_lookup_accepts_shifted_keysym_case() {
@@ -1757,5 +2180,62 @@ mod binding_tests {
             "wm:wlr:river"
         );
         assert_eq!(application_desktop_environment("vesktop"), "wm:wlr");
+    }
+
+    #[test]
+    fn real_session_publishes_wayland_environment_to_dbus_and_systemd() {
+        let command = activation_environment_command("wayland-7", false);
+        assert_eq!(command.get_program(), "dbus-update-activation-environment");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "--systemd",
+                "WAYLAND_DISPLAY=wayland-7",
+                "XDG_CURRENT_DESKTOP=wm:wlr",
+                "XDG_SESSION_DESKTOP=wm",
+                "XDG_SESSION_TYPE=wayland",
+            ]
+        );
+    }
+
+    #[test]
+    fn private_test_bus_does_not_replace_host_systemd_environment() {
+        let command = activation_environment_command("wm-nested.sock", true);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "WAYLAND_DISPLAY=wm-nested.sock",
+                "XDG_CURRENT_DESKTOP=wm:wlr",
+                "XDG_SESSION_DESKTOP=wm",
+                "XDG_SESSION_TYPE=wayland",
+            ]
+        );
+    }
+
+    #[test]
+    fn portal_refresh_never_waits_for_wayland_dependent_services() {
+        let commands = portal_refresh_commands();
+        assert_eq!(
+            commands[0].get_args().collect::<Vec<_>>(),
+            ["--user", "reset-failed", "xdg-desktop-portal-*.service",]
+        );
+        assert_eq!(
+            commands[1].get_args().collect::<Vec<_>>(),
+            [
+                "--user",
+                "--no-block",
+                "try-restart",
+                "xdg-desktop-portal-*.service",
+            ]
+        );
+        assert_eq!(
+            commands[2].get_args().collect::<Vec<_>>(),
+            [
+                "--user",
+                "--no-block",
+                "restart",
+                "xdg-desktop-portal.service",
+            ]
+        );
     }
 }

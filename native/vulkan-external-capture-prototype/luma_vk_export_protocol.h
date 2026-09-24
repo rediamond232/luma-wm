@@ -4,10 +4,17 @@
 
 #define LUMA_VK_EXPORT_MAGIC 0x4c564b45u /* LVKE */
 #define LUMA_VK_ACK_MAGIC    0x4c564b41u /* LVKA */
-#define LUMA_VK_PROTOCOL_VERSION 2u
+#define LUMA_VK_PROTOCOL_VERSION 3u
+#define LUMA_EXPORT_COPY_COMPLETE 1u
+#define LUMA_EXPORT_FLIP_Y 2u
+#define LUMA_EXPORT_OPAQUE_MEMORY 4u
 
 /* Sent over SOCK_DGRAM with exactly two SCM_RIGHTS descriptors: DMA-BUF, then
- * sync_file fence.  FDs are transferred, not borrowed. */
+ * sync_file fence. COPY_COMPLETE in reserved omits the fence descriptor;
+ * the sender has already observed GPU completion. FLIP_Y requests a vertical
+ * flip at the receiver. OPAQUE_MEMORY instead sends an opaque memory FD and
+ * one reusable external semaphore FD; allocation_size and device_uuid then
+ * replace DMA-BUF layout fields. FDs are transferred, not borrowed. */
 struct luma_vk_export_message {
     uint32_t magic;
     uint16_t version;
@@ -23,6 +30,8 @@ struct luma_vk_export_message {
     uint32_t pitch;
     uint32_t reserved;
     uint64_t modifier;
+    uint64_t allocation_size;
+    uint8_t device_uuid[16];
 };
 
 struct luma_vk_ack_message {

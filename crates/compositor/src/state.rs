@@ -1781,6 +1781,18 @@ pub fn take_presentation_feedback(
 }
 
 pub trait Backend {
+    fn apply_performance_policy(
+        &mut self,
+        _performance: &wm_core::Performance,
+        _gaming_outputs: &[String],
+        _outputs: &std::collections::BTreeMap<String, wm_core::OutputConfig>,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+    fn performance_status(&self) -> Vec<wm_core::OutputPerformanceStatus> {
+        Vec::new()
+    }
+    fn reset_performance_metrics(&mut self) {}
     fn snapshot_window(
         &mut self,
         _window: &WindowElement,

@@ -87,7 +87,16 @@ struct luma_capture_owner {
 static struct luma_capture_owner capture_owner;
 /* 0 = undecided, 1 = being published, 2 = selected. */
 static _Atomic int capture_owner_state = 0;
+/* Drawable-size cache: glXQueryDrawable/eglQuerySurface are synchronous X
+ * round trips, so the owner path refreshes them every 16th present instead of
+ * every present. A resize is observed within ~16 frames and then disables the
+ * fixed-resolution encoder exactly as before. */
+static _Atomic unsigned long present_tick = 0;
+static unsigned int cached_glx_width = 0, cached_glx_height = 0;
+static int cached_egl_width = 0, cached_egl_height = 0;
 static _Atomic int target_pid = 0; /* 0 uninitialized, -1 disabled. */
+static _Atomic int target_comm_state = 0; /* 0 uninitialized, -1 disabled, 1 ready. */
+static char target_comm[16]; /* Linux task comm is limited to 15 bytes plus NUL. */
 static _Atomic int debug_fd = -2;  /* -2 uninitialized, -1 disabled. */
 static _Atomic int first_glx_hook_seen;
 
@@ -120,6 +129,12 @@ static void debug_message(const char *message) {
     }
 }
 
+/* Native encoder diagnostics share the injection log without coupling the
+ * standalone recorder-side users of luma_nvenc_direct.cpp to this hook. */
+void luma_game_capture_debug_message(const char *message) {
+    debug_message(message);
+}
+
 static int capture_target_process(void) {
     int configured = atomic_load_explicit(&target_pid, memory_order_acquire);
     if (configured == 0) {
@@ -138,7 +153,37 @@ static int capture_target_process(void) {
             configured = selected;
         }
     }
-    return configured == (int)getpid();
+    if (configured > 0) return configured == (int)getpid();
+
+    int comm_state = atomic_load_explicit(&target_comm_state, memory_order_acquire);
+    if (comm_state == 0) {
+        const char *value = getenv("LUMA_GAME_CAPTURE_TARGET_COMM");
+        size_t length = value == NULL ? 0 : strnlen(value, sizeof(target_comm));
+        int valid = length > 0 && length < sizeof(target_comm);
+        for (size_t index = 0; valid && index < length; ++index) {
+            const unsigned char byte = (unsigned char)value[index];
+            valid = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                    (byte >= '0' && byte <= '9') || byte == '_' || byte == '-' || byte == '.';
+        }
+        if (valid) memcpy(target_comm, value, length + 1);
+        int expected = 0;
+        if (!atomic_compare_exchange_strong_explicit(&target_comm_state, &expected,
+                                                     valid ? 1 : -1, memory_order_release,
+                                                     memory_order_acquire)) {
+            comm_state = expected;
+        } else {
+            comm_state = valid ? 1 : -1;
+        }
+    }
+    if (comm_state != 1) return 0;
+    char comm[sizeof(target_comm)] = {0};
+    int fd = open("/proc/self/comm", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t count = read(fd, comm, sizeof(comm) - 1);
+    close(fd);
+    if (count <= 0) return 0;
+    if (comm[count - 1] == '\n') comm[count - 1] = '\0';
+    return strcmp(comm, target_comm) == 0;
 }
 
 static int claim_capture_owner(uint32_t api, uintptr_t display, uintptr_t surface,
@@ -254,15 +299,42 @@ static int direct_capture_requested(void) {
 /*
  * This remains disabled unless both stream settings exist. The direct path
  * copies the current default framebuffer into its own GPU texture before the
- * real present call, then submits that texture to NVENC without CPU readback.
+ * real present call, then exports shared VRAM to a separate NVENC receiver.
+ * No encoder calls or CPU pixel readbacks execute in the game process.
+ *
+ * Repeat recordings on one process need no ptrace: the swap slot already
+ * points here from the first injection, so an installed-but-idle hook notices
+ * the attacher's fresh session config on a later present and hands it to a
+ * worker for re-arming. Recording and installing states never touch the
+ * filesystem here. (Body after injected_hook_worker, where the config
+ * parser it reuses is defined.)
  */
+static void poll_injected_rearm(void);
+
 static void submit_direct_capture(uint32_t width, uint32_t height) {
-    if (injected_control != NULL &&
+    poll_injected_rearm();
+    /* The install gate keeps the re-arm window safe: while a worker swaps the
+     * control mapping (install state 1) no present thread dereferences it. */
+    if (atomic_load_explicit(&injected_install_state, memory_order_acquire) == 2 &&
+        injected_control != NULL &&
         atomic_load_explicit(injected_control, memory_order_acquire) != 0) {
         struct luma_nvenc_direct *capture =
             atomic_load_explicit(&direct_capture, memory_order_acquire);
         if (capture != NULL) {
             luma_nvenc_direct_request_stop(capture);
+        }
+    }
+    /* Release game-side GL objects only on their presenting context. The
+     * receiver owns its own references and drains independently. */
+    {
+        struct luma_nvenc_direct *capture =
+            atomic_load_explicit(&direct_capture, memory_order_acquire);
+        if (capture != NULL && luma_nvenc_direct_torn_down(capture)) {
+            luma_nvenc_direct_release_gl(capture);
+            luma_nvenc_direct_destroy(capture);
+            atomic_store_explicit(&direct_capture, NULL, memory_order_release);
+            atomic_store_explicit(&direct_capture_state, 3, memory_order_release);
+            debug_message("luma-game-capture: stopped and released direct capture resources\n");
         }
     }
     const char *socket_path = injected_stream_socket[0] != '\0'
@@ -305,7 +377,7 @@ static void submit_direct_capture(uint32_t width, uint32_t height) {
             atomic_store_explicit(&direct_capture_state, created != NULL ? 2 : 3,
                                   memory_order_release);
             if (created == NULL) {
-                debug_message("luma-game-capture: direct NVENC setup unavailable; capture disabled\n");
+                debug_message("luma-game-capture: shared GPU export unavailable; capture disabled\n");
             }
         }
     }
@@ -313,28 +385,41 @@ static void submit_direct_capture(uint32_t width, uint32_t height) {
         struct luma_nvenc_direct *capture = atomic_load_explicit(&direct_capture, memory_order_acquire);
         if (capture != NULL) {
             if (luma_nvenc_direct_stop_requested(capture)) {
-                luma_nvenc_direct_finish_on_gl_thread(capture);
-                atomic_store_explicit(&direct_capture_state, 3, memory_order_release);
-                debug_message("luma-game-capture: stopped and released direct capture resources\n");
+                /* Resources are collected at the top on a later present. */
                 return;
             }
-            (void)luma_nvenc_direct_submit(capture, width, height, monotonic_ns());
+            (void)luma_nvenc_direct_submit_async(capture, width, height, monotonic_ns());
         }
     }
 }
 
 typedef void (*glx_swap_buffers_fn)(Display *, GLXDrawable);
 typedef EGLBoolean (*egl_swap_buffers_fn)(EGLDisplay, EGLSurface);
+typedef void (*glfw_swap_buffers_fn)(void *);
+typedef __GLXextFuncPtr (*glx_get_proc_address_fn)(const GLubyte *);
+typedef __eglMustCastToProperFunctionPointerType (*egl_get_proc_address_fn)(const char *);
 
 static glx_swap_buffers_fn real_glx_swap;
 static egl_swap_buffers_fn real_egl_swap;
+static glfw_swap_buffers_fn real_glfw_swap;
+static glx_get_proc_address_fn real_glx_get_proc_address;
+static egl_get_proc_address_fn real_egl_get_proc_address;
 /* A late JVM agent cannot use normal ELF interposition. Its LWJGL2 dispatch
  * slot is patched explicitly and the displaced target is published here
  * before that atomic slot update becomes visible to the presenting thread. */
 static _Atomic(uintptr_t) attached_glx_original;
 static _Atomic(uintptr_t) attached_egl_original;
+static _Atomic(uintptr_t) attached_glx_get_proc_original;
+static _Atomic(uintptr_t) attached_egl_get_proc_original;
 static pthread_once_t glx_swap_once = PTHREAD_ONCE_INIT;
 static pthread_once_t egl_swap_once = PTHREAD_ONCE_INIT;
+static pthread_once_t glx_get_proc_once = PTHREAD_ONCE_INIT;
+static pthread_once_t egl_get_proc_once = PTHREAD_ONCE_INIT;
+static pthread_once_t glfw_swap_once = PTHREAD_ONCE_INIT;
+
+/* Forward declarations used by the proc-address interposers. */
+void glXSwapBuffers(Display *, GLXDrawable);
+EGLBoolean eglSwapBuffers(EGLDisplay, EGLSurface);
 
 static glx_swap_buffers_fn resolve_glx_swap(void) {
     const uintptr_t attached =
@@ -384,6 +469,97 @@ static void initialize_egl_swap(void) {
     }
 }
 
+static void initialize_glfw_swap(void) {
+    void *symbol = dlsym(RTLD_NEXT, "glfwSwapBuffers");
+    memcpy(&real_glfw_swap, &symbol, sizeof(real_glfw_swap));
+}
+
+/* GLFW/LWJGL3 normally obtains the present entry point through the GLX/EGL
+ * proc-address APIs.  In that case there is no call through the application's
+ * ELF PLT for the relocation scanner (or a plain LD_PRELOAD symbol) to catch.
+ * Return our interposer for the present names while leaving every other
+ * extension untouched.  The swap wrapper still resolves and calls the real
+ * driver entry point, so this is API-generic rather than Minecraft-specific. */
+static void initialize_glx_get_proc_address(void) {
+    uintptr_t attached = atomic_load_explicit(&attached_glx_get_proc_original, memory_order_acquire);
+    void *symbol = (void *)attached;
+    if (symbol == NULL) symbol = dlsym(RTLD_NEXT, "glXGetProcAddressARB");
+    memcpy(&real_glx_get_proc_address, &symbol, sizeof(real_glx_get_proc_address));
+}
+
+static void initialize_egl_get_proc_address(void) {
+    uintptr_t attached = atomic_load_explicit(&attached_egl_get_proc_original, memory_order_acquire);
+    void *symbol = (void *)attached;
+    if (symbol == NULL) symbol = dlsym(RTLD_NEXT, "eglGetProcAddress");
+    memcpy(&real_egl_get_proc_address, &symbol, sizeof(real_egl_get_proc_address));
+}
+
+__attribute__((visibility("default")))
+__GLXextFuncPtr glXGetProcAddressARB(const GLubyte *name) {
+    (void)pthread_once(&glx_swap_once, initialize_glx_swap);
+    (void)pthread_once(&egl_swap_once, initialize_egl_swap);
+    if (name != NULL && strcmp((const char *)name, "glXSwapBuffers") == 0) {
+        glx_swap_buffers_fn hook = glXSwapBuffers;
+        __GLXextFuncPtr result = NULL;
+        memcpy(&result, &hook, sizeof(result));
+        return result;
+    }
+    (void)pthread_once(&glx_get_proc_once, initialize_glx_get_proc_address);
+    return real_glx_get_proc_address != NULL ? real_glx_get_proc_address(name) : NULL;
+}
+
+__attribute__((visibility("default")))
+__GLXextFuncPtr glXGetProcAddress(const GLubyte *name) {
+    return glXGetProcAddressARB(name);
+}
+
+__attribute__((visibility("default")))
+__eglMustCastToProperFunctionPointerType eglGetProcAddress(const char *name) {
+    if (name != NULL && strcmp(name, "eglSwapBuffers") == 0) {
+        egl_swap_buffers_fn hook = eglSwapBuffers;
+        __eglMustCastToProperFunctionPointerType result = NULL;
+        memcpy(&result, &hook, sizeof(result));
+        return result;
+    }
+    (void)pthread_once(&egl_get_proc_once, initialize_egl_get_proc_address);
+    return real_egl_get_proc_address != NULL ? real_egl_get_proc_address(name) : NULL;
+}
+
+/* LWJGL3 calls GLFW's public swap function, and GLFW may cache the driver
+ * proc-address result before a late attach.  Interposing this stable API gives
+ * late injection a generic GLFW/OpenGL fallback without depending on the
+ * driver's internal dispatch table. */
+__attribute__((visibility("default")))
+void glfwSwapBuffers(void *window) {
+    (void)pthread_once(&glx_swap_once, initialize_glx_swap);
+    (void)pthread_once(&egl_swap_once, initialize_egl_swap);
+    (void)pthread_once(&glfw_swap_once, initialize_glfw_swap);
+    if (in_hook || real_glfw_swap == NULL) return;
+    if (!capture_target_process()) {
+        real_glfw_swap(window);
+        return;
+    }
+    in_hook = 1;
+    Display *display = glXGetCurrentDisplay();
+    GLXDrawable drawable = glXGetCurrentDrawable();
+    if (display != NULL && drawable != 0) {
+        unsigned int width = 0, height = 0;
+        (void)glXQueryDrawable(display, drawable, GLX_WIDTH, &width);
+        (void)glXQueryDrawable(display, drawable, GLX_HEIGHT, &height);
+        if (claim_capture_owner(LUMA_CAPTURE_API_GLX, (uintptr_t)display,
+                                 (uintptr_t)drawable, (uintptr_t)glXGetCurrentContext())) {
+            submit_direct_capture(width, height);
+            real_glfw_swap(window);
+            emit_present(LUMA_CAPTURE_API_GLX, (uintptr_t)display, (uintptr_t)drawable,
+                         width, height);
+            in_hook = 0;
+            return;
+        }
+    }
+    real_glfw_swap(window);
+    in_hook = 0;
+}
+
 __attribute__((visibility("default")))
 void glXSwapBuffers(Display *display, GLXDrawable drawable) {
     if (atomic_exchange_explicit(&first_glx_hook_seen, 1, memory_order_acq_rel) == 0) {
@@ -421,9 +597,16 @@ void glXSwapBuffers(Display *display, GLXDrawable drawable) {
     }
     if (claim_capture_owner(LUMA_CAPTURE_API_GLX, (uintptr_t)display, (uintptr_t)drawable,
                             (uintptr_t)glXGetCurrentContext())) {
-        if (!needs_initial_size && display != NULL) {
+        if (display != NULL &&
+            (needs_initial_size ||
+             (atomic_fetch_add_explicit(&present_tick, 1, memory_order_relaxed) & 15U) == 0)) {
             (void)glXQueryDrawable(display, drawable, GLX_WIDTH, &width);
             (void)glXQueryDrawable(display, drawable, GLX_HEIGHT, &height);
+            cached_glx_width = width;
+            cached_glx_height = height;
+        } else {
+            width = cached_glx_width;
+            height = cached_glx_height;
         }
         submit_direct_capture(width, height);
         real_glx_swap(display, drawable);
@@ -464,9 +647,15 @@ EGLBoolean eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
     }
     if (claim_capture_owner(LUMA_CAPTURE_API_EGL, (uintptr_t)display, (uintptr_t)surface,
                             (uintptr_t)eglGetCurrentContext())) {
-        if (!needs_initial_size) {
+        if (needs_initial_size ||
+            (atomic_fetch_add_explicit(&present_tick, 1, memory_order_relaxed) & 15U) == 0) {
             (void)eglQuerySurface(display, surface, EGL_WIDTH, &width);
             (void)eglQuerySurface(display, surface, EGL_HEIGHT, &height);
+            cached_egl_width = width;
+            cached_egl_height = height;
+        } else {
+            width = cached_egl_width;
+            height = cached_egl_height;
         }
         submit_direct_capture(width > 0 ? (uint32_t)width : 0, height > 0 ? (uint32_t)height : 0);
         result = real_egl_swap(display, surface);
@@ -637,6 +826,16 @@ static uintptr_t dynamic_address(ElfW(Addr) base, ElfW(Addr) value) {
     return value < base ? (uintptr_t)base + (uintptr_t)value : (uintptr_t)value;
 }
 
+/* A capture shim already sitting in the swap chain (Lunar wraps its JVM with
+ * obs-gamecapture, so the slot points at the shim instead of libGL). Chaining
+ * game -> Luma -> shim -> real driver on the same present thread is safe: the
+ * shim already runs there today, and our hook stays non-blocking and restores
+ * GL state. Returns 1 for the real driver, 2 for a chained shim, 0 to reject. */
+static int capture_shim_target(const char *target_name) {
+    return target_name != NULL &&
+           strncmp(target_name, "libobs_glcapture", sizeof("libobs_glcapture") - 1) == 0;
+}
+
 static int graphics_target(const char *symbol, uintptr_t original) {
     Dl_info info = {0};
     if (original == 0 || dladdr((void *)original, &info) == 0 || info.dli_fname == NULL) {
@@ -645,7 +844,10 @@ static int graphics_target(const char *symbol, uintptr_t original) {
     const char *name = strrchr(info.dli_fname, '/');
     name = name == NULL ? info.dli_fname : name + 1;
     if (strcmp(symbol, "glXSwapBuffers") == 0) {
-        return strncmp(name, "libGL", 5) == 0 || strncmp(name, "libOpenGL", 9) == 0;
+        if (strncmp(name, "libGL", 5) == 0 || strncmp(name, "libOpenGL", 9) == 0) {
+            return 1;
+        }
+        return capture_shim_target(name) ? 2 : 0;
     }
     return strncmp(name, "libEGL", 6) == 0;
 }
@@ -717,10 +919,16 @@ static int patch_graphics_relocations(struct dl_phdr_info *info, size_t size, vo
             const char *name = strings + symbols[ELF64_R_SYM(relocation->r_info)].st_name;
             const int is_glx = strcmp(name, "glXSwapBuffers") == 0;
             const int is_egl = strcmp(name, "eglSwapBuffers") == 0;
-            if (!is_glx && !is_egl) continue;
+            const int is_glx_proc = strcmp(name, "glXGetProcAddressARB") == 0 ||
+                                    strcmp(name, "glXGetProcAddress") == 0;
+            const int is_egl_proc = strcmp(name, "eglGetProcAddress") == 0;
+            if (!is_glx && !is_egl && !is_glx_proc && !is_egl_proc) continue;
             uintptr_t *slot = (uintptr_t *)(info->dlpi_addr + relocation->r_offset);
             const uintptr_t original = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
-            if (!graphics_target(name, original)) continue;
+            const int target_kind = (is_glx_proc || is_egl_proc)
+                                        ? (original != 0 && dladdr((void *)original, &(Dl_info){0}) != 0)
+                                        : graphics_target(name, original);
+            if (target_kind == 0) continue;
             void *hook_pointer = NULL;
             if (is_glx) {
                 glx_swap_buffers_fn hook = glXSwapBuffers;
@@ -728,12 +936,24 @@ static int patch_graphics_relocations(struct dl_phdr_info *info, size_t size, vo
                 uintptr_t expected = 0;
                 (void)atomic_compare_exchange_strong_explicit(&attached_glx_original, &expected,
                     original, memory_order_acq_rel, memory_order_acquire);
-            } else {
+            } else if (is_egl) {
                 egl_swap_buffers_fn hook = eglSwapBuffers;
                 memcpy(&hook_pointer, &hook, sizeof(hook_pointer));
                 uintptr_t expected = 0;
                 (void)atomic_compare_exchange_strong_explicit(&attached_egl_original, &expected,
                     original, memory_order_acq_rel, memory_order_acquire);
+            } else if (is_glx_proc) {
+                glx_get_proc_address_fn hook = glXGetProcAddressARB;
+                memcpy(&hook_pointer, &hook, sizeof(hook_pointer));
+                uintptr_t expected = 0;
+                (void)atomic_compare_exchange_strong_explicit(&attached_glx_get_proc_original,
+                    &expected, original, memory_order_acq_rel, memory_order_acquire);
+            } else {
+                egl_get_proc_address_fn hook = eglGetProcAddress;
+                memcpy(&hook_pointer, &hook, sizeof(hook_pointer));
+                uintptr_t expected = 0;
+                (void)atomic_compare_exchange_strong_explicit(&attached_egl_get_proc_original,
+                    &expected, original, memory_order_acq_rel, memory_order_acquire);
             }
             void *page = (void *)((uintptr_t)slot & ~((uintptr_t)page_size - 1U));
             const int original_protection = mapping_protection(slot);
@@ -741,16 +961,118 @@ static int patch_graphics_relocations(struct dl_phdr_info *info, size_t size, vo
             if (mprotect(page, (size_t)page_size, PROT_READ | PROT_WRITE) != 0) continue;
             __atomic_store_n(slot, (uintptr_t)hook_pointer, __ATOMIC_RELEASE);
             (void)mprotect(page, (size_t)page_size, original_protection);
-            if (is_glx) {
+            if (is_glx || is_glx_proc) {
                 ++search->glx_patched;
-                debug_message("luma-game-capture: patched one resolved GLX relocation\n");
+                if (is_glx_proc) {
+                    debug_message("luma-game-capture: patched GLX proc-address relocation\n");
+                } else if (target_kind == 2) {
+                    debug_message("luma-game-capture: patched one resolved GLX relocation "
+                                  "(chained through capture shim)\n");
+                } else {
+                    debug_message("luma-game-capture: patched one resolved GLX relocation\n");
+                }
             } else {
                 ++search->egl_patched;
-                debug_message("luma-game-capture: patched one resolved EGL relocation\n");
+                debug_message(is_egl_proc
+                                  ? "luma-game-capture: patched EGL proc-address relocation\n"
+                                  : "luma-game-capture: patched one resolved EGL relocation\n");
             }
         }
     }
     return 0;
+}
+
+static uintptr_t loaded_symbol(const char *library, const char *symbol) {
+    void *handle = dlopen(library, RTLD_NOW | RTLD_NOLOAD);
+    if (handle == NULL) return 0;
+    void *address = dlsym(handle, symbol);
+    dlclose(handle);
+    return (uintptr_t)address;
+}
+
+struct cached_present_search {
+    uintptr_t self_base;
+    uintptr_t glx_targets[2];
+    uintptr_t egl_target;
+    uintptr_t glx_hook;
+    uintptr_t egl_hook;
+    size_t patched;
+};
+
+static int patch_cached_present_module(struct dl_phdr_info *info, size_t size, void *opaque) {
+    (void)size;
+    struct cached_present_search *search = opaque;
+    if ((uintptr_t)info->dlpi_addr == search->self_base) return 0;
+    const char *base_name = info->dlpi_name == NULL ? "" : strrchr(info->dlpi_name, '/');
+    base_name = base_name == NULL ? info->dlpi_name : base_name + 1;
+    if (base_name != NULL &&
+        (strncmp(base_name, "libGL", 5) == 0 || strncmp(base_name, "libEGL", 6) == 0 ||
+         strncmp(base_name, "libOpenGL", 9) == 0 || strncmp(base_name, "libluma", 7) == 0)) {
+        return 0;
+    }
+    for (ElfW(Half) index = 0; index < info->dlpi_phnum; ++index) {
+        const ElfW(Phdr) *segment = &info->dlpi_phdr[index];
+        if (segment->p_type != PT_LOAD || (segment->p_flags & (PF_R | PF_W)) != (PF_R | PF_W) ||
+            segment->p_memsz < sizeof(uintptr_t) ||
+            segment->p_memsz > 64U * 1024U * 1024U) {
+            continue;
+        }
+        const uintptr_t start = (uintptr_t)info->dlpi_addr + (uintptr_t)segment->p_vaddr;
+        const uintptr_t end = start + (uintptr_t)segment->p_memsz;
+        uintptr_t *slot = (uintptr_t *)((start + sizeof(uintptr_t) - 1U) &
+                                        ~((uintptr_t)sizeof(uintptr_t) - 1U));
+        uintptr_t *limit = (uintptr_t *)(end & ~((uintptr_t)sizeof(uintptr_t) - 1U));
+        for (; slot < limit; ++slot) {
+            const uintptr_t value = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+            for (size_t target = 0; target < 2; ++target) {
+                if (search->glx_targets[target] != 0 && value == search->glx_targets[target]) {
+                    uintptr_t expected = 0;
+                    (void)atomic_compare_exchange_strong_explicit(&attached_glx_original,
+                        &expected, value, memory_order_acq_rel, memory_order_acquire);
+                    __atomic_store_n(slot, search->glx_hook, __ATOMIC_RELEASE);
+                    ++search->patched;
+                    break;
+                }
+            }
+            if (search->egl_target != 0 && value == search->egl_target) {
+                uintptr_t expected = 0;
+                (void)atomic_compare_exchange_strong_explicit(&attached_egl_original,
+                    &expected, value, memory_order_acq_rel, memory_order_acquire);
+                __atomic_store_n(slot, search->egl_hook, __ATOMIC_RELEASE);
+                ++search->patched;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Toolkits commonly resolve a GLX/EGL present function once and retain it in
+ * their module data. Scan writable PT_LOAD data/BSS while dl_iterate_phdr holds
+ * the loader's module set stable. Never walk /proc/self/maps here: mappings can
+ * disappear between reading the file and dereferencing them, which previously
+ * crashed a live JVM during late injection. */
+static size_t patch_cached_present_pointers(uintptr_t self_base) {
+    glx_swap_buffers_fn glx_hook_function = glXSwapBuffers;
+    egl_swap_buffers_fn egl_hook_function = eglSwapBuffers;
+    struct cached_present_search search = {
+        .self_base = self_base,
+        .glx_targets = {
+            loaded_symbol("libGL.so.1", "glXSwapBuffers"),
+            loaded_symbol("libGLX.so.0", "glXSwapBuffers"),
+        },
+        .egl_target = loaded_symbol("libEGL.so.1", "eglSwapBuffers"),
+    };
+    memcpy(&search.glx_hook, &glx_hook_function, sizeof(search.glx_hook));
+    memcpy(&search.egl_hook, &egl_hook_function, sizeof(search.egl_hook));
+    (void)dl_iterate_phdr(patch_cached_present_module, &search);
+    if (search.patched != 0) {
+        char detail[128];
+        (void)snprintf(detail, sizeof(detail),
+                       "luma-game-capture: patched %zu cached GLX/EGL present pointer(s)\n",
+                       search.patched);
+        debug_message(detail);
+    }
+    return search.patched;
 }
 
 static int install_generic_graphics_hooks(void) {
@@ -761,7 +1083,8 @@ static int install_generic_graphics_hooks(void) {
     if (dladdr(self_symbol, &self) == 0 || self.dli_fbase == NULL) return -1;
     struct generic_hook_search search = {.self_base = (uintptr_t)self.dli_fbase};
     (void)dl_iterate_phdr(patch_graphics_relocations, &search);
-    if (search.glx_patched == 0 && search.egl_patched == 0) {
+    const size_t cached_patched = patch_cached_present_pointers(search.self_base);
+    if (search.glx_patched == 0 && search.egl_patched == 0 && cached_patched == 0) {
         debug_message("luma-game-capture: no resolved GLX/EGL present relocation found\n");
         return -1;
     }
@@ -774,7 +1097,10 @@ static int install_generic_graphics_hooks(void) {
 static int install_lwjgl2_glx_hook(void);
 
 static void *injected_hook_worker(void *opaque) {
-    (void)opaque;
+    /* NULL arrives from the ptrace helper's first install; any other value is
+     * a present-thread re-arm on an already-hooked process, where hook
+     * discovery must NOT run again (the slot already points here). */
+    const int rediscover = opaque == NULL;
     char config_path[PATH_MAX], control_path[PATH_MAX];
     (void)snprintf(config_path, sizeof(config_path), "/run/user/%u/luma-game-inject-%ld.conf",
                    (unsigned)geteuid(), (long)getpid());
@@ -795,20 +1121,41 @@ static void *injected_hook_worker(void *opaque) {
         if (mapped != MAP_FAILED) (void)munmap(mapped, 4);
         goto fail;
     }
-    injected_control = mapped;
-    debug_message("luma-game-capture: remote injection configuration activated\n");
-    debug_message("luma-game-capture: scanning for LWJGL2 presentation dispatch\n");
-    int hook_status = install_lwjgl2_glx_hook();
-    if (hook_status != 0) {
-        debug_message("luma-game-capture: scanning generic GLX/EGL relocations\n");
-        hook_status = install_generic_graphics_hooks();
-    }
-    if (hook_status != 0) {
-        debug_message("luma-game-capture: injected graphics hook setup failed\n");
-        void *mapped = injected_control;
-        injected_control = NULL;
-        (void)munmap(mapped, 4);
-        goto fail;
+    if (!rediscover) {
+        /* Repeat session: retire the previous capture object (fully quiesced
+         * by its stop on the present thread) and swap in the new control
+         * word. The present thread cannot dereference the old mapping while
+         * install state is 1 (see submit_direct_capture). */
+        struct luma_nvenc_direct *previous =
+            atomic_load_explicit(&direct_capture, memory_order_acquire);
+        if (previous != NULL) {
+            luma_nvenc_direct_stop_and_join(previous);
+            luma_nvenc_direct_destroy(previous);
+            atomic_store_explicit(&direct_capture, NULL, memory_order_release);
+        }
+        void *previous_control = injected_control;
+        injected_control = mapped;
+        if (previous_control != NULL) {
+            (void)munmap(previous_control, 4);
+        }
+        atomic_store_explicit(&direct_capture_state, 0, memory_order_release);
+        debug_message("luma-game-capture: re-armed installed hook for a new session\n");
+    } else {
+        injected_control = mapped;
+        debug_message("luma-game-capture: remote injection configuration activated\n");
+        debug_message("luma-game-capture: scanning for LWJGL2 presentation dispatch\n");
+        int hook_status = install_lwjgl2_glx_hook();
+        if (hook_status != 0) {
+            debug_message("luma-game-capture: scanning generic GLX/EGL relocations\n");
+            hook_status = install_generic_graphics_hooks();
+        }
+        if (hook_status != 0) {
+            debug_message("luma-game-capture: injected graphics hook setup failed\n");
+            void *failed = injected_control;
+            injected_control = NULL;
+            (void)munmap(failed, 4);
+            goto fail;
+        }
     }
     /* Removing the handoff file acknowledges that hook discovery completed. */
     (void)unlink(config_path);
@@ -816,13 +1163,17 @@ static void *injected_hook_worker(void *opaque) {
     return NULL;
 
 fail:
-    atomic_store_explicit(&injected_install_state, -1, memory_order_release);
+    /* First-install failures are terminal (restart the target); re-arm
+     * failures leave the idle hook in place so the next session can retry. */
+    atomic_store_explicit(&injected_install_state, rediscover ? -1 : 2, memory_order_release);
     return NULL;
 }
 
 /* Called by the ptrace helper only after remote dlopen has returned. Complex
  * libc and loader work runs on a normal pthread stack: HotSpot's interrupted
- * Java-thread stack and signal machinery are not safe places to perform it. */
+ * Java-thread stack and signal machinery are not safe places to perform it.
+ * Repeat sessions never come through here; the presenting thread re-arms the
+ * resident hook itself (see poll_injected_rearm). */
 __attribute__((visibility("default")))
 int luma_install_injected_hooks(void) {
     int expected = 0;
@@ -838,6 +1189,57 @@ int luma_install_injected_hooks(void) {
     }
     (void)pthread_detach(worker);
     return 0;
+}
+
+/* Process teardown (or dlclose) with a live session: never block it. Nudge
+ * the encode worker toward its fast path so exit-time driver cleanup cannot
+ * wedge on our still-current worker context. Destructor-safe: atomic stores
+ * and a leaf call only. */
+__attribute__((destructor))
+static void luma_capture_unload(void) {
+    struct luma_nvenc_direct *capture =
+        atomic_load_explicit(&direct_capture, memory_order_acquire);
+    if (capture != NULL) {
+        luma_nvenc_direct_notify_unload(capture);
+    }
+}
+
+static void poll_injected_rearm(void) {
+    if (atomic_load_explicit(&injected_install_state, memory_order_acquire) != 2) {
+        return;
+    }
+    const int capture = atomic_load_explicit(&direct_capture_state, memory_order_acquire);
+    if (capture != 0 && capture != 3) {
+        return;
+    }
+    char config_path[PATH_MAX];
+    (void)snprintf(config_path, sizeof(config_path), "/run/user/%u/luma-game-inject-%ld.conf",
+                   (unsigned)geteuid(), (long)getpid());
+    struct stat probe;
+    if (stat(config_path, &probe) != 0) {
+        return;
+    }
+    struct luma_attach_config config = {0};
+    if (read_attach_config(config_path, &config) != 0) {
+        /* Attacher mid-write or foreign file; retry on a later present. */
+        return;
+    }
+    if (strcmp(config.token, injected_token) == 0) {
+        /* Already adopted (unlink raced); nothing new. */
+        return;
+    }
+    int expected = 2;
+    if (!atomic_compare_exchange_strong_explicit(&injected_install_state, &expected, 1,
+                                                 memory_order_acq_rel, memory_order_acquire)) {
+        return;
+    }
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, injected_hook_worker, (void *)1) != 0) {
+        atomic_store_explicit(&injected_install_state, 2, memory_order_release);
+        return;
+    }
+    (void)pthread_detach(worker);
+    debug_message("luma-game-capture: re-arming installed hook for a new session\n");
 }
 
 static int address_has_permissions(const void *address, int require_write) {
@@ -897,19 +1299,32 @@ static int install_lwjgl2_glx_hook(void) {
 
     const unsigned char *code = search.swap_bridge;
     void **dispatch_slot = NULL;
+    unsigned scanned = 0;
+    char chained_through[64] = {0};
     for (size_t index = 0; index + 10 <= 64; ++index) {
         if (code[index] != 0x48 || code[index + 1] != 0x8b || code[index + 2] != 0x15) {
             continue;
         }
+        ++scanned;
         int32_t displacement = 0;
         memcpy(&displacement, code + index + 3, sizeof(displacement));
         void ***holder = (void ***)(code + index + 7 + displacement);
+        char detail[256];
         if (holder == NULL || !address_has_permissions(holder, 0)) {
+            (void)snprintf(detail, sizeof(detail),
+                            "luma-game-capture: LWJGL2 candidate %u holder %p unreadable\n",
+                            scanned, (const void *)holder);
+            debug_message(detail);
             continue;
         }
         void **candidate = NULL;
         memcpy(&candidate, holder, sizeof(candidate));
         if (candidate == NULL || !address_has_permissions(candidate, 1)) {
+            (void)snprintf(detail, sizeof(detail),
+                            "luma-game-capture: LWJGL2 candidate %u table %p not writable "
+                            "(GL context may not be initialized yet)\n",
+                            scanned, (const void *)candidate);
+            debug_message(detail);
             continue;
         }
         void *candidate_target = NULL;
@@ -921,15 +1336,35 @@ static int install_lwjgl2_glx_hook(void) {
             target_name = strrchr(target_info.dli_fname, '/');
             target_name = target_name == NULL ? target_info.dli_fname : target_name + 1;
         }
+        (void)snprintf(detail, sizeof(detail),
+                        "luma-game-capture: LWJGL2 candidate %u target %p in %s\n",
+                        scanned, candidate_target,
+                        target_name == NULL ? "<unknown>" : target_name);
+        debug_message(detail);
         if (target_name != NULL &&
             (strncmp(target_name, "libGL", 5) == 0 ||
              strncmp(target_name, "libOpenGL", 9) == 0)) {
             dispatch_slot = candidate;
             break;
         }
+        if (capture_shim_target(target_name)) {
+            (void)snprintf(detail, sizeof(detail),
+                            "luma-game-capture: LWJGL2 candidate %u chains through "
+                            "capture shim %s\n",
+                            scanned, target_name);
+            debug_message(detail);
+            (void)snprintf(chained_through, sizeof(chained_through), "%s", target_name);
+            dispatch_slot = candidate;
+            break;
+        }
     }
     if (dispatch_slot == NULL) {
-        debug_message("luma-game-capture: LWJGL2 GLX dispatch slot pattern is unsupported\n");
+        char summary[128];
+        (void)snprintf(summary, sizeof(summary),
+                        "luma-game-capture: LWJGL2 GLX dispatch slot pattern is unsupported "
+                        "(%u bridge candidates scanned)\n",
+                        scanned);
+        debug_message(summary);
         return -1;
     }
 
@@ -940,6 +1375,15 @@ static int install_lwjgl2_glx_hook(void) {
     const uintptr_t original = __atomic_load_n((uintptr_t *)dispatch_slot, __ATOMIC_ACQUIRE);
     atomic_store_explicit(&attached_glx_original, original, memory_order_release);
     __atomic_store_n((uintptr_t *)dispatch_slot, (uintptr_t)hook, __ATOMIC_RELEASE);
-    debug_message("luma-game-capture: attached to LWJGL2 GLX swap dispatch\n");
+    if (chained_through[0] != '\0') {
+        char chained[128];
+        (void)snprintf(chained, sizeof(chained),
+                        "luma-game-capture: attached to LWJGL2 GLX swap dispatch "
+                        "(chained through %s)\n",
+                        chained_through);
+        debug_message(chained);
+    } else {
+        debug_message("luma-game-capture: attached to LWJGL2 GLX swap dispatch\n");
+    }
     return 0;
 }

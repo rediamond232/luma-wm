@@ -20,3 +20,8 @@ repository = "https://github.com/rediamond232/luma-wm"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.performance]
+inherits = "release"
+lto = "fat"
+strip = "symbols"

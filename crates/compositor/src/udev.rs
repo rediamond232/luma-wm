@@ -19,7 +19,6 @@ use crate::{
     shell::WindowRenderElement,
     state::{DndIcon, SurfaceDmabufFeedback},
 };
-#[cfg(feature = "renderer_sync")]
 use smithay::backend::drm::compositor::PrimaryPlaneElement;
 #[cfg(feature = "egl")]
 use smithay::backend::renderer::ImportEgl;
@@ -73,7 +72,10 @@ use smithay::{
         },
         drm::{
             Device as _,
-            control::{Device, Mode as DrmMode, ModeTypeFlags, connector, crtc},
+            control::{
+                AtomicCommitFlags, Device, Mode as DrmMode, ModeTypeFlags, atomic, connector, crtc,
+                property,
+            },
         },
         input::{DeviceCapability, Libinput},
         rustix::fs::OFlags,
@@ -145,6 +147,105 @@ pub struct UdevData {
     debug_flags: DebugFlags,
     keyboards: Vec<smithay::reexports::input::Device>,
     input_devices: Vec<smithay::reexports::input::Device>,
+    last_input_at: Option<Instant>,
+    input_generation: u64,
+}
+
+const PERFORMANCE_SAMPLE_COUNT: usize = 256;
+
+#[derive(Debug)]
+struct DurationSamples {
+    values: [u32; PERFORMANCE_SAMPLE_COUNT],
+    len: usize,
+    next: usize,
+}
+
+impl Default for DurationSamples {
+    fn default() -> Self {
+        Self {
+            values: [0; PERFORMANCE_SAMPLE_COUNT],
+            len: 0,
+            next: 0,
+        }
+    }
+}
+
+impl DurationSamples {
+    fn record(&mut self, duration: Duration) {
+        self.values[self.next] = duration.as_micros().min(u128::from(u32::MAX)) as u32;
+        self.next = (self.next + 1) % PERFORMANCE_SAMPLE_COUNT;
+        self.len = (self.len + 1).min(PERFORMANCE_SAMPLE_COUNT);
+    }
+
+    fn percentile(&self, percentile: usize) -> u32 {
+        if self.len == 0 {
+            return 0;
+        }
+        let mut values = self.values[..self.len].to_vec();
+        values.sort_unstable();
+        let index = (values.len() - 1) * percentile / 100;
+        values[index]
+    }
+}
+
+#[derive(Debug, Default)]
+struct OutputPerformanceMetrics {
+    direct_scanout_frames: u64,
+    composed_frames: u64,
+    empty_frames: u64,
+    missed_deadlines: u64,
+    render: DurationSamples,
+    input_to_submit: DurationSamples,
+}
+
+impl OutputPerformanceMetrics {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn repaint_budget(&self, frame_duration: Duration) -> Duration {
+        // Keep enough room for the measured slow tail plus a small driver/KMS
+        // margin. The clamps prevent both zero-delay busy rendering and an
+        // over-optimistic deadline at very high refresh rates.
+        if self.render.len < 8 {
+            return frame_duration * 2 / 5;
+        }
+        let measured = Duration::from_micros(u64::from(self.render.percentile(95)));
+        let safety = Duration::from_micros(250);
+        (measured + safety).clamp(frame_duration / 5, frame_duration * 4 / 5)
+    }
+}
+
+#[cfg(test)]
+mod performance_metric_tests {
+    use super::*;
+
+    #[test]
+    fn duration_samples_keep_recent_percentiles() {
+        let mut samples = DurationSamples::default();
+        for value in 1..=100 {
+            samples.record(Duration::from_micros(value));
+        }
+        assert_eq!(samples.percentile(50), 50);
+        assert_eq!(samples.percentile(95), 95);
+        assert_eq!(samples.percentile(99), 99);
+    }
+
+    #[test]
+    fn repaint_budget_starts_safe_and_adapts_to_slow_tail() {
+        let frame = Duration::from_micros(2_778);
+        let mut metrics = OutputPerformanceMetrics::default();
+        assert_eq!(metrics.repaint_budget(frame), frame * 2 / 5);
+        for _ in 0..32 {
+            metrics.render.record(Duration::from_micros(800));
+        }
+        assert_eq!(metrics.repaint_budget(frame), Duration::from_micros(1_050));
+
+        for _ in 0..256 {
+            metrics.render.record(Duration::from_micros(10_000));
+        }
+        assert_eq!(metrics.repaint_budget(frame), frame * 4 / 5);
+    }
 }
 
 fn configure_input_device(device: &mut smithay::reexports::input::Device, config: &wm_core::Input) {
@@ -220,6 +321,64 @@ impl DmabufHandler for AnvilState<UdevData> {
 }
 
 impl Backend for UdevData {
+    fn apply_performance_policy(
+        &mut self,
+        performance: &wm_core::Performance,
+        gaming_outputs: &[String],
+        outputs: &std::collections::BTreeMap<String, wm_core::OutputConfig>,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        for backend in self.backends.values_mut() {
+            for surface in backend.surfaces.values_mut() {
+                let configured = outputs
+                    .get(&surface.output.name())
+                    .is_some_and(|output| output.vrr);
+                let automatic =
+                    performance.fullscreen_vrr && gaming_outputs.contains(&surface.output.name());
+                if let Err(error) = surface.configure_vrr(configured || automatic) {
+                    errors.push(error);
+                }
+            }
+        }
+        errors
+    }
+
+    fn performance_status(&self) -> Vec<wm_core::OutputPerformanceStatus> {
+        self.backends
+            .values()
+            .flat_map(|backend| backend.surfaces.values())
+            .map(|surface| wm_core::OutputPerformanceStatus {
+                name: surface.output.name(),
+                refresh_millihz: surface
+                    .output
+                    .current_mode()
+                    .map(|mode| mode.refresh)
+                    .unwrap_or_default(),
+                vrr_active: surface
+                    .drm_output
+                    .with_compositor(|compositor| compositor.vrr_enabled()),
+                direct_scanout_frames: surface.performance.direct_scanout_frames,
+                composed_frames: surface.performance.composed_frames,
+                empty_frames: surface.performance.empty_frames,
+                missed_deadlines: surface.performance.missed_deadlines,
+                render_us_p50: surface.performance.render.percentile(50),
+                render_us_p95: surface.performance.render.percentile(95),
+                render_us_p99: surface.performance.render.percentile(99),
+                input_to_submit_us_p50: surface.performance.input_to_submit.percentile(50),
+                input_to_submit_us_p95: surface.performance.input_to_submit.percentile(95),
+                input_to_submit_us_p99: surface.performance.input_to_submit.percentile(99),
+            })
+            .collect()
+    }
+
+    fn reset_performance_metrics(&mut self) {
+        for backend in self.backends.values_mut() {
+            for surface in backend.surfaces.values_mut() {
+                surface.performance.clear();
+            }
+        }
+    }
+
     fn snapshot_window(
         &mut self,
         window: &crate::shell::WindowElement,
@@ -415,6 +574,29 @@ impl Backend for UdevData {
                     warn!("{error}");
                     errors.push(error);
                 }
+                if requested.hdr != surface.hdr_enabled {
+                    match configure_hdr(
+                        device.drm_output_manager.device(),
+                        surface.connector,
+                        *crtc,
+                        requested.hdr,
+                    ) {
+                        Ok(()) => {
+                            surface.hdr_enabled = requested.hdr;
+                            surface.drm_output.reset_buffers();
+                            info!(
+                                output = %surface.output.name(),
+                                enabled = requested.hdr,
+                                "HDR10 output state applied"
+                            );
+                        }
+                        Err(error) => {
+                            let error = format!("{}: {error}", surface.output.name());
+                            warn!("{error}");
+                            errors.push(error);
+                        }
+                    }
+                }
             }
         }
         errors
@@ -510,6 +692,8 @@ pub fn run_udev() {
         debug_flags: DebugFlags::empty(),
         keyboards: Vec::new(),
         input_devices: Vec::new(),
+        last_input_at: None,
+        input_generation: 0,
     };
     let mut state = AnvilState::init(display, event_loop.handle(), data, true);
 
@@ -540,6 +724,15 @@ pub fn run_udev() {
         .handle()
         .insert_source(libinput_backend, move |mut event, _, data| {
             let dh = data.backend_data.dh.clone();
+            let pointer_before = data.pointer.current_location();
+            if !matches!(
+                &event,
+                InputEvent::DeviceAdded { .. } | InputEvent::DeviceRemoved { .. }
+            ) {
+                data.backend_data.last_input_at = Some(Instant::now());
+                data.backend_data.input_generation =
+                    data.backend_data.input_generation.wrapping_add(1).max(1);
+            }
             if let InputEvent::DeviceAdded { device } = &mut event {
                 configure_input_device(device, &data.desktop.config.input);
                 data.backend_data.input_devices.push(device.clone());
@@ -563,7 +756,13 @@ pub fn run_udev() {
             }
 
             data.process_input_event(&dh, event);
-            data.desktop.redraw = true;
+            // Relative motion for a locked pointer must reach the client but
+            // does not move a compositor cursor or damage the output. Client
+            // commits, focus/layout changes, and real cursor motion schedule
+            // their own redraws.
+            if data.pointer.current_location() != pointer_before {
+                data.desktop.redraw = true;
+            }
         })
         .unwrap();
 
@@ -940,6 +1139,255 @@ struct SurfaceData {
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     last_presentation_time: Option<Time<Monotonic>>,
     vblank_throttle_timer: Option<RegistrationToken>,
+    repaint_timer: Option<RegistrationToken>,
+    repaint_target: Option<Time<Monotonic>>,
+    performance: OutputPerformanceMetrics,
+    last_input_generation: u64,
+    hdr_enabled: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct HdrChromaticity {
+    x: u16,
+    y: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct HdrMetadataInfoframe {
+    eotf: u8,
+    metadata_type: u8,
+    display_primaries: [HdrChromaticity; 3],
+    white_point: HdrChromaticity,
+    max_display_mastering_luminance: u16,
+    min_display_mastering_luminance: u16,
+    max_cll: u16,
+    max_fall: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct HdrOutputMetadata {
+    metadata_type: u32,
+    hdmi_metadata_type1: HdrMetadataInfoframe,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct DrmColorLut {
+    red: u16,
+    green: u16,
+    blue: u16,
+    reserved: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct DrmColorCtm {
+    matrix: [u64; 9],
+}
+
+const HDR_LUT_SIZE: usize = 1024;
+const HDR_MAX_LUMINANCE: u16 = 1000;
+const HDR_SDR_WHITE_LUMINANCE: f64 = 203.0;
+
+fn hdr10_metadata() -> HdrOutputMetadata {
+    HdrOutputMetadata {
+        metadata_type: 0,
+        hdmi_metadata_type1: HdrMetadataInfoframe {
+            // CTA-861 SMPTE ST 2084 and static metadata type 1.
+            eotf: 2,
+            metadata_type: 0,
+            // BT.2020 primaries and D65, in CTA units of 0.00002.
+            display_primaries: [
+                HdrChromaticity {
+                    x: 35_400,
+                    y: 14_600,
+                },
+                HdrChromaticity {
+                    x: 8_500,
+                    y: 39_850,
+                },
+                HdrChromaticity { x: 6_550, y: 2_300 },
+            ],
+            white_point: HdrChromaticity {
+                x: 15_635,
+                y: 16_450,
+            },
+            max_display_mastering_luminance: HDR_MAX_LUMINANCE,
+            min_display_mastering_luminance: 1,
+            max_cll: HDR_MAX_LUMINANCE,
+            max_fall: 400,
+        },
+    }
+}
+
+fn property_named<D: Device, H: smithay::reexports::drm::control::ResourceHandle>(
+    device: &D,
+    handle: H,
+    name: &str,
+) -> Result<(property::Info, u64), String> {
+    device
+        .get_properties(handle)
+        .map_err(|error| format!("cannot read DRM properties: {error}"))?
+        .into_iter()
+        .find_map(|(property, value)| {
+            let info = device.get_property(property).ok()?;
+            (info.name().to_str() == Ok(name)).then_some((info, value))
+        })
+        .ok_or_else(|| format!("DRM property {name} is unavailable"))
+}
+
+fn enum_value(info: &property::Info, name: &str) -> Result<u64, String> {
+    let property::ValueType::Enum(values) = info.value_type() else {
+        return Err(format!("DRM property {:?} is not an enum", info.name()));
+    };
+    values
+        .values()
+        .1
+        .iter()
+        .find(|value| value.name().to_str() == Ok(name))
+        .map(|value| value.value())
+        .ok_or_else(|| format!("DRM enum value {name} is unavailable"))
+}
+
+fn srgb_to_linear(value: f64) -> f64 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_pq(value: f64) -> f64 {
+    let normalized_luminance = value.clamp(0.0, 1.0) * HDR_SDR_WHITE_LUMINANCE / 10_000.0;
+    let m1 = 2610.0 / 16384.0;
+    let m2 = 2523.0 / 32.0;
+    let c1 = 3424.0 / 4096.0;
+    let c2 = 2413.0 / 128.0;
+    let c3 = 2392.0 / 128.0;
+    let powered = normalized_luminance.powf(m1);
+    ((c1 + c2 * powered) / (1.0 + c3 * powered)).powf(m2)
+}
+
+fn color_lut(transform: fn(f64) -> f64) -> [DrmColorLut; HDR_LUT_SIZE] {
+    std::array::from_fn(|index| {
+        let input = index as f64 / (HDR_LUT_SIZE - 1) as f64;
+        let value = (transform(input).clamp(0.0, 1.0) * u16::MAX as f64).round() as u16;
+        DrmColorLut {
+            red: value,
+            green: value,
+            blue: value,
+            reserved: 0,
+        }
+    })
+}
+
+fn ctm_value(value: f64) -> u64 {
+    (value * (1u64 << 32) as f64).round() as u64
+}
+
+fn srgb_to_bt2020_ctm() -> DrmColorCtm {
+    DrmColorCtm {
+        matrix: [
+            ctm_value(0.627_404),
+            ctm_value(0.329_283),
+            ctm_value(0.043_313),
+            ctm_value(0.069_097),
+            ctm_value(0.919_540),
+            ctm_value(0.011_362),
+            ctm_value(0.016_391),
+            ctm_value(0.088_013),
+            ctm_value(0.895_595),
+        ],
+    }
+}
+
+fn configure_hdr<D: Device>(
+    device: &D,
+    connector: connector::Handle,
+    crtc: crtc::Handle,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled && std::env::var_os("ANVIL_DISABLE_10BIT").is_some() {
+        return Err("HDR cannot be enabled while ANVIL_DISABLE_10BIT is set".into());
+    }
+    let (colorspace, _) = property_named(device, connector, "Colorspace")?;
+    let (hdr_metadata, _) = property_named(device, connector, "HDR_OUTPUT_METADATA")?;
+    let (degamma, _) = property_named(device, crtc, "DEGAMMA_LUT")?;
+    let (_, degamma_size) = property_named(device, crtc, "DEGAMMA_LUT_SIZE")?;
+    let (ctm, _) = property_named(device, crtc, "CTM")?;
+    let (gamma, _) = property_named(device, crtc, "GAMMA_LUT")?;
+    let (_, gamma_size) = property_named(device, crtc, "GAMMA_LUT_SIZE")?;
+    if enabled && (degamma_size != HDR_LUT_SIZE as u64 || gamma_size != HDR_LUT_SIZE as u64) {
+        return Err(format!(
+            "HDR requires {HDR_LUT_SIZE}-entry KMS LUTs, found degamma={degamma_size} gamma={gamma_size}"
+        ));
+    }
+
+    let mut blobs = Vec::new();
+    let mut request = atomic::AtomicModeReq::new();
+    let colorspace_value = enum_value(&colorspace, if enabled { "BT2020_RGB" } else { "Default" })?;
+    request.add_raw_property(connector.into(), colorspace.handle(), colorspace_value);
+
+    if enabled {
+        for (info, value) in [
+            (
+                &hdr_metadata,
+                device.create_property_blob(&hdr10_metadata()),
+            ),
+            (
+                &degamma,
+                device.create_property_blob(&color_lut(srgb_to_linear)),
+            ),
+            (&ctm, device.create_property_blob(&srgb_to_bt2020_ctm())),
+            (
+                &gamma,
+                device.create_property_blob(&color_lut(linear_to_pq)),
+            ),
+        ] {
+            let blob = value
+                .map_err(|error| {
+                    format!(
+                        "cannot create {} blob: {error}",
+                        info.name().to_string_lossy()
+                    )
+                })?
+                .as_blob()
+                .ok_or("DRM returned a non-blob property value")?;
+            blobs.push(blob);
+            let target = if info.handle() == hdr_metadata.handle() {
+                connector.into()
+            } else {
+                crtc.into()
+            };
+            request.add_raw_property(target, info.handle(), blob);
+        }
+    } else {
+        request.add_raw_property(connector.into(), hdr_metadata.handle(), 0);
+        request.add_raw_property(crtc.into(), degamma.handle(), 0);
+        request.add_raw_property(crtc.into(), ctm.handle(), 0);
+        request.add_raw_property(crtc.into(), gamma.handle(), 0);
+    }
+
+    let result = device
+        .atomic_commit(
+            AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+            request.clone(),
+        )
+        .and_then(|()| device.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, request))
+        .map_err(|error| format!("cannot apply HDR KMS state: {error}"));
+    for blob in blobs {
+        if let Err(error) = device.destroy_property_blob(blob) {
+            debug!(
+                blob,
+                ?error,
+                "Could not release userspace HDR property blob handle"
+            );
+        }
+    }
+    result
 }
 
 fn advertised_modes(modes: &[DrmMode]) -> Vec<(i32, i32, i32, bool)> {
@@ -967,6 +1415,9 @@ impl SurfaceData {
     fn configure_vrr(&mut self, enabled: bool) -> Result<(), String> {
         let name = self.output.name();
         self.drm_output.with_compositor(|compositor| {
+            if compositor.vrr_enabled() == enabled {
+                return Ok(());
+            }
             if enabled {
                 let support = compositor
                     .vrr_supported(self.connector)
@@ -975,13 +1426,11 @@ impl SurfaceData {
                     return Err(format!("{name}: VRR requested but not supported"));
                 }
             }
-            if compositor.vrr_enabled() != enabled {
-                compositor
-                    .use_vrr(enabled)
-                    .map_err(|error| format!("{name}: cannot configure VRR: {error}"))?;
-                compositor.reset_buffers();
-                info!(output = %name, enabled, "VRR state requested for next presentation");
-            }
+            compositor
+                .use_vrr(enabled)
+                .map_err(|error| format!("{name}: cannot configure VRR: {error}"))?;
+            compositor.reset_buffers();
+            info!(output = %name, enabled, "VRR state requested for next presentation");
             Ok(())
         })
     }
@@ -1042,6 +1491,26 @@ mod mode_update_tests {
         assert_eq!(output.modes(), vec![new]);
         synchronize_output_modes(&output, &[], None);
         assert_eq!(output.current_mode(), Some(new));
+    }
+
+    #[test]
+    fn hdr_metadata_matches_the_kernel_uapi_layout_and_bt2020_values() {
+        assert_eq!(std::mem::size_of::<HdrOutputMetadata>(), 32);
+        let metadata = hdr10_metadata();
+        assert_eq!(metadata.hdmi_metadata_type1.eotf, 2);
+        assert_eq!(metadata.hdmi_metadata_type1.display_primaries[0].x, 35_400);
+        assert_eq!(metadata.hdmi_metadata_type1.max_cll, HDR_MAX_LUMINANCE);
+    }
+
+    #[test]
+    fn hdr_luts_decode_srgb_and_encode_reference_white_as_pq() {
+        let degamma = color_lut(srgb_to_linear);
+        let gamma = color_lut(linear_to_pq);
+        assert_eq!(degamma[0].red, 0);
+        assert_eq!(degamma[HDR_LUT_SIZE - 1].red, u16::MAX);
+        assert_eq!(gamma[0].red, 0);
+        assert!(gamma[HDR_LUT_SIZE - 1].red > 37_000);
+        assert!(gamma[HDR_LUT_SIZE - 1].red < 39_000);
     }
 }
 
@@ -1530,11 +1999,35 @@ impl AnvilState<UdevData> {
                 dmabuf_feedback,
                 last_presentation_time: None,
                 vblank_throttle_timer: None,
+                repaint_timer: None,
+                repaint_target: None,
+                performance: OutputPerformanceMetrics::default(),
+                last_input_generation: 0,
+                hdr_enabled: false,
             };
 
             if let Err(error) = surface.configure_vrr(requested.vrr) {
                 warn!("{error}");
                 self.desktop.error = Some(error);
+            }
+            if requested.hdr {
+                match configure_hdr(
+                    device.drm_output_manager.device(),
+                    connector.handle(),
+                    crtc,
+                    true,
+                ) {
+                    Ok(()) => {
+                        surface.hdr_enabled = true;
+                        surface.drm_output.reset_buffers();
+                        info!(output = %surface.output.name(), "HDR10 output enabled");
+                    }
+                    Err(error) => {
+                        let error = format!("{}: {error}", surface.output.name());
+                        warn!("{error}");
+                        self.desktop.error = Some(error);
+                    }
+                }
             }
 
             device.surfaces.insert(crtc, surface);
@@ -1718,6 +2211,10 @@ impl AnvilState<UdevData> {
         if let Some(timer_token) = surface.vblank_throttle_timer.take() {
             self.handle.remove(timer_token);
         }
+        if let Some(timer_token) = surface.repaint_timer.take() {
+            self.handle.remove(timer_token);
+        }
+        surface.repaint_target = None;
 
         let output = if let Some(output) = self.space.outputs().find(|o| {
             o.user_data().get::<UdevOutputId>()
@@ -1863,24 +2360,20 @@ impl AnvilState<UdevData> {
             // new buffer during the repaint delay that can hit the very next
             // VBlank, thus reducing the potential latency to below one frame.
             //
-            // Choosing a good delay is a topic on its own so we just implement
-            // a simple strategy here. We just split the duration between two
-            // VBlanks into two steps, one for the client repaint and one for the
-            // compositor repaint. Theoretically the repaint in the compositor should
-            // be faster so we give the client a bit more time to repaint. On a typical
-            // modern system the repaint in the compositor should not take more than 2ms
-            // so this should be safe for refresh rates up to at least 120 Hz. For 120 Hz
-            // this results in approx. 3.33ms time for repainting in the compositor.
-            // A too big delay could result in missing the next VBlank in the compositor.
-            //
-            // A more complete solution could work on a sliding window analyzing past repaints
-            // and do some prediction for the next repaint.
-            let repaint_delay = Duration::from_secs_f64(frame_duration.as_secs_f64() * 0.6f64);
+            // Schedule from measured work instead of a fixed fraction. At
+            // 360 Hz, the former 60% delay left only about 1.1 ms regardless
+            // of actual compositor and KMS cost.
+            let repaint_budget = surface.performance.repaint_budget(frame_duration);
+            let repaint_delay = frame_duration.saturating_sub(repaint_budget);
 
-            let timer = if surface
-                .render_node
-                .map(|render_node| render_node != self.backend_data.primary_gpu)
-                .unwrap_or(true)
+            let vrr_active = surface
+                .drm_output
+                .with_compositor(|compositor| compositor.vrr_enabled());
+            let timer = if vrr_active
+                || surface
+                    .render_node
+                    .map(|render_node| render_node != self.backend_data.primary_gpu)
+                    .unwrap_or(true)
             {
                 // However, if we need to do a copy, that might not be enough.
                 // (And without actual comparison to previous frames we cannot really know.)
@@ -1895,12 +2388,20 @@ impl AnvilState<UdevData> {
                 Timer::from_duration(repaint_delay)
             };
 
-            self.handle
+            let repaint_token = self
+                .handle
                 .insert_source(timer, move |_, _, data| {
+                    if let Some(backend) = data.backend_data.backends.get_mut(&dev_id)
+                        && let Some(surface) = backend.surfaces.get_mut(&crtc)
+                    {
+                        surface.repaint_timer = None;
+                    }
                     data.render(dev_id, Some(crtc), next_frame_target);
                     TimeoutAction::Drop
                 })
                 .expect("failed to schedule frame timer");
+            surface.repaint_timer = Some(repaint_token);
+            surface.repaint_target = Some(next_frame_target);
         }
     }
 
@@ -1942,6 +2443,9 @@ impl AnvilState<UdevData> {
 
         self.pre_repaint(&output, frame_target);
 
+        let input_generation = self.backend_data.input_generation;
+        let input_elapsed = self.backend_data.last_input_at.map(|input| input.elapsed());
+
         let device = if let Some(device) = self.backend_data.backends.get_mut(&node) {
             device
         } else {
@@ -1953,6 +2457,17 @@ impl AnvilState<UdevData> {
         } else {
             return;
         };
+
+        let scheduled_deadline = surface
+            .repaint_target
+            .take()
+            .is_some_and(|target| target == frame_target);
+        if let Some(timer_token) = surface.repaint_timer.take() {
+            self.handle.remove(timer_token);
+        }
+        let missed_before_render = scheduled_deadline
+            && Duration::from(frame_target).saturating_sub(self.clock.now().into())
+                == Duration::ZERO;
 
         let start = Instant::now();
 
@@ -2059,7 +2574,36 @@ impl AnvilState<UdevData> {
             self.show_window_preview,
         );
         let reschedule = match result {
-            Ok((_has_rendered, states)) => {
+            Ok((has_rendered, direct_scanout, states)) => {
+                let elapsed = start.elapsed();
+                if has_rendered {
+                    surface.performance.render.record(elapsed);
+                    if direct_scanout {
+                        surface.performance.direct_scanout_frames =
+                            surface.performance.direct_scanout_frames.saturating_add(1);
+                    } else {
+                        surface.performance.composed_frames =
+                            surface.performance.composed_frames.saturating_add(1);
+                    }
+                } else {
+                    surface.performance.empty_frames =
+                        surface.performance.empty_frames.saturating_add(1);
+                }
+                if has_rendered && input_generation != surface.last_input_generation {
+                    if let Some(input_elapsed) = input_elapsed {
+                        surface.performance.input_to_submit.record(input_elapsed);
+                    }
+                    surface.last_input_generation = input_generation;
+                }
+                if has_rendered
+                    && scheduled_deadline
+                    && (missed_before_render
+                        || Duration::from(frame_target).saturating_sub(self.clock.now().into())
+                            == Duration::ZERO)
+                {
+                    surface.performance.missed_deadlines =
+                        surface.performance.missed_deadlines.saturating_add(1);
+                }
                 let dmabuf_feedback = surface.dmabuf_feedback.clone();
                 self.post_repaint(&output, frame_target, dmabuf_feedback, &states);
                 false // No damage: sleep until a commit, input, or desktop change.
@@ -2119,8 +2663,7 @@ impl AnvilState<UdevData> {
                 })
                 .expect("failed to schedule frame timer");
         } else {
-            let elapsed = start.elapsed();
-            tracing::trace!(?elapsed, "rendered surface");
+            tracing::trace!(elapsed = ?start.elapsed(), "rendered surface");
         }
 
         profiling::finish_frame!();
@@ -2141,7 +2684,7 @@ fn render_surface<'a>(
     dnd_icon: &Option<DndIcon>,
     cursor_status: &mut CursorImageStatus,
     show_window_preview: bool,
-) -> Result<(bool, RenderElementStates), SwapBuffersError> {
+) -> Result<(bool, bool, RenderElementStates), SwapBuffersError> {
     let output_geometry = space.output_geometry(output).unwrap();
     let scale = Scale::from(output.current_scale().fractional_scale());
 
@@ -2231,15 +2774,23 @@ fn render_surface<'a>(
     } else {
         FrameFlags::DEFAULT
     };
-    let (rendered, states) = surface
+    let (rendered, direct_scanout, states) = surface
         .drm_output
         .render_frame(renderer, &elements, clear_color, frame_mode)
         .map(|render_frame_result| {
+            let direct_scanout = matches!(
+                &render_frame_result.primary_element,
+                PrimaryPlaneElement::Element(_)
+            );
             #[cfg(feature = "renderer_sync")]
-            if let PrimaryPlaneElement::Swapchain(element) = render_frame_result.primary_element {
+            if let PrimaryPlaneElement::Swapchain(element) = &render_frame_result.primary_element {
                 element.sync.wait();
             }
-            (!render_frame_result.is_empty, render_frame_result.states)
+            (
+                !render_frame_result.is_empty,
+                direct_scanout,
+                render_frame_result.states,
+            )
         })
         .map_err(|err| match err {
             smithay::backend::drm::compositor::RenderFrameError::PrepareFrame(err) => {
@@ -2270,5 +2821,5 @@ fn render_surface<'a>(
             .map_err(Into::<SwapBuffersError>::into)?;
     }
 
-    Ok((rendered, states))
+    Ok((rendered, direct_scanout, states))
 }

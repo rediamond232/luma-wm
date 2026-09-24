@@ -382,21 +382,59 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         // NOTE: This should use layer-shell when it is implemented to
         // get the correct maximum size
-        let window = self.window_for_surface(surface.wl_surface()).unwrap();
+        // Inactive workspaces are intentionally removed from `Space`, but the
+        // xdg-toplevel stays alive and may still request maximization. Look in
+        // the desktop model as well so such a request cannot panic the Wayland
+        // dispatcher and abort the whole compositor.
+        let managed_window = self
+            .desktop
+            .windows
+            .iter()
+            .find(|window| window.window.0.toplevel() == Some(&surface))
+            .map(|window| (window.window.clone(), window.output.clone()));
+        let window = self
+            .window_for_surface(surface.wl_surface())
+            .or_else(|| managed_window.as_ref().map(|(window, _)| window.clone()));
+        let Some(window) = window else {
+            warn!("ignoring maximize request for an unknown xdg-toplevel");
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
+            }
+            return;
+        };
+        let was_mapped = self.space.element_location(&window).is_some();
         let outputs_for_window = self.space.outputs_for_element(&window);
         let output = outputs_for_window
             .first()
-            // The window hasn't been mapped yet, use the primary output instead
-            .or_else(|| self.space.outputs().next())
-            // Assumes that at least one output exists
-            .expect("No outputs found");
-        let geometry = self.space.output_geometry(output).unwrap();
+            .cloned()
+            // Hidden windows retain their assigned output in the desktop model.
+            .or_else(|| {
+                managed_window.as_ref().and_then(|(_, output_name)| {
+                    self.space
+                        .outputs()
+                        .find(|output| output.name() == *output_name)
+                        .cloned()
+                })
+            })
+            // A newly-created window may not be in the desktop model yet.
+            .or_else(|| self.space.outputs().next().cloned());
+        let Some(geometry) = output.and_then(|output| self.space.output_geometry(&output)) else {
+            warn!("ignoring maximize request because no output geometry is available");
+            if surface.is_initial_configure_sent() {
+                surface.send_configure();
+            }
+            return;
+        };
 
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
             state.size = Some(geometry.size);
         });
-        self.space.map_element(window, geometry.loc, true);
+        // Do not make a window from an inactive workspace visible merely
+        // because its client changed toplevel state while it was hidden.
+        if was_mapped {
+            self.space.map_element(window, geometry.loc, true);
+        }
 
         // The protocol demands us to always reply with a configure,
         // regardless of we fulfilled the request or not

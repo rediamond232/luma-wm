@@ -22,7 +22,10 @@ static xcb_window_t create_window(xcb_connection_t *connection, xcb_screen_t *sc
                                   uint32_t color, const char *title, const char *class_name,
                                   const char *type_name, xcb_window_t transient_for) {
     xcb_window_t window = xcb_generate_id(connection);
-    uint32_t values[] = {color, XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY};
+    uint32_t values[] = {
+        color,
+        XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_BUTTON_PRESS,
+    };
     xcb_create_window(connection, XCB_COPY_FROM_PARENT, window, screen->root,
                       x, y, width, height, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
                       screen->root_visual, XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK, values);
@@ -65,9 +68,9 @@ int main(void) {
     xcb_window_t parent = create_window(connection, screen, 40, 40, 420, 260, 0x00364f6b,
                                         "X11 normal fixture", "luma-x11-normal", NULL,
                                         XCB_WINDOW_NONE);
-    create_window(connection, screen, 0, 0, 300, 140, 0x00a13d4f,
-                  "X11 warning fixture", "luma-x11-warning", "_NET_WM_WINDOW_TYPE_DIALOG",
-                  parent);
+    xcb_window_t warning = create_window(
+        connection, screen, 0, 0, 300, 140, 0x00a13d4f,
+        "X11 warning fixture", "luma-x11-warning", "_NET_WM_WINDOW_TYPE_DIALOG", parent);
     xcb_window_t notification = create_window(
         connection, screen, 120, 80, 240, 100, 0x00d18b35,
         "X11 notification fixture", "luma-x11-notification",
@@ -86,6 +89,17 @@ int main(void) {
         xcb_generic_event_t *event = xcb_wait_for_event(connection);
         if (event == NULL) {
             break;
+        }
+        if ((event->response_type & 0x7f) == XCB_BUTTON_PRESS) {
+            xcb_button_press_event_t *press = (xcb_button_press_event_t *)event;
+            const char *receipt = getenv("LUMA_X11_AUX_CLICK_FILE");
+            if (press->event == warning && receipt != NULL) {
+                FILE *file = fopen(receipt, "w");
+                if (file != NULL) {
+                    fputs("warning clicked\n", file);
+                    fclose(file);
+                }
+            }
         }
         free(event);
     }

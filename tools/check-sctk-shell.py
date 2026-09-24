@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import subprocess
 import tempfile
@@ -155,19 +156,27 @@ def main():
             while not tray_info.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)
             assert "RegisterStatusNotifierItem" in tray_info.read_text(), tray_info.read_text()
-            tray_registration = directory / "tray-registration.txt"
+            # A watcher removes items whose service connection has gone away.
+            # Use the live, exported item fixture instead of registering a
+            # made-up unowned well-known name. This fixture enters its GLib
+            # loop before making the registration call, so it can answer the
+            # watcher's synchronous property reads while registration runs.
+            tray_item_ready = directory / "ready"
+            tray_item_log = directory / "tray-item.log"
             argv = [
                 "sh", "-lc",
-                "gdbus call --session --dest org.kde.StatusNotifierWatcher "
-                "--object-path /StatusNotifierWatcher "
-                "--method org.kde.StatusNotifierWatcher.RegisterStatusNotifierItem "
-                "org.luma.Smoke > " + str(tray_registration) + " 2>&1",
+                f"{shlex.join(['/usr/bin/python3', str(ROOT / 'tools/tray-menu-item.py'), str(directory)])} "
+                f"> {shlex.quote(str(tray_item_log))} 2>&1",
             ]
             assert request(socket_path, "exec " + json.dumps(argv))["ok"]
             deadline = time.monotonic() + 5
-            while not tray_registration.exists() and time.monotonic() < deadline:
+            while not tray_item_ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.05)
-            assert tray_registration.read_text().strip() == "()", tray_registration.read_text()
+            assert tray_item_ready.exists(), (
+                "StatusNotifierItem fixture did not register: "
+                + (tray_item_log.read_text(errors="replace") if tray_item_log.exists() else "no output")
+            )
+            assert tray_item_ready.read_text().strip() == "ok"
             tray_items = directory / "tray-items.txt"
             argv = [
                 "sh", "-lc",
@@ -179,9 +188,12 @@ def main():
             ]
             assert request(socket_path, "exec " + json.dumps(argv))["ok"]
             deadline = time.monotonic() + 5
-            while not tray_items.exists() and time.monotonic() < deadline:
+            while (
+                (not tray_items.exists() or "/TestItem" not in tray_items.read_text())
+                and time.monotonic() < deadline
+            ):
                 time.sleep(0.05)
-            assert "org.luma.Smoke" in tray_items.read_text(), tray_items.read_text()
+            assert "/TestItem" in tray_items.read_text(), tray_items.read_text()
             tray_host = directory / "tray-host.txt"
             argv = [
                 "sh", "-lc",
@@ -212,7 +224,12 @@ def main():
             assert "uint32" in notification_reply.read_text(), notification_reply.read_text()
             wait_for(
                 socket_path, process,
-                lambda state: any(layer["namespace"] == "wm-notifications" and layer.get("surface_size") for layer in state["layers"]),
+                lambda state: any(
+                    layer["namespace"] == "wm-notifications"
+                    and isinstance(layer.get("surface_size"), list)
+                    and layer["surface_size"][0] > 100
+                    for layer in state["layers"]
+                ),
             )
             if screenshot := os.environ.get("WM_CHECK_POPUP_SCREENSHOT"):
                 window = subprocess.check_output(
@@ -291,7 +308,9 @@ def main():
                 socket_path, process,
                 lambda state: any(
                     layer["namespace"] == "wm-recorder"
-                    and layer.get("surface_size", [0, 0])[0] > 100
+                    and isinstance(layer.get("surface_size"), list)
+                    and len(layer["surface_size"]) == 2
+                    and layer["surface_size"][0] > 100
                     for layer in state["layers"]
                 ),
             )

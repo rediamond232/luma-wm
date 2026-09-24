@@ -142,6 +142,477 @@ impl RecorderCaptureMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecorderView {
+    Controls,
+    Settings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecorderSettingsTab {
+    Output,
+    Capture,
+    Video,
+    Audio,
+    Replay,
+}
+
+impl RecorderSettingsTab {
+    const ALL: [Self; 5] = [
+        Self::Output,
+        Self::Capture,
+        Self::Video,
+        Self::Audio,
+        Self::Replay,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Output => "Output",
+            Self::Capture => "Capture",
+            Self::Video => "Video",
+            Self::Audio => "Audio",
+            Self::Replay => "Replay",
+        }
+    }
+
+    fn cycle(self, forward: bool) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|tab| *tab == self)
+            .expect("settings tab is listed");
+        let next = if forward {
+            (index + 1) % Self::ALL.len()
+        } else {
+            (index + Self::ALL.len() - 1) % Self::ALL.len()
+        };
+        Self::ALL[next]
+    }
+}
+
+/// What kind of editor a settings row renders. Shared by the drawing and the
+/// pointer/keyboard hit tests so the two cannot drift apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecorderRowKind {
+    /// "< value >" cycle widget.
+    Cycle,
+    /// "< value >" where the value is a number.
+    Step,
+    /// On/off pill.
+    Toggle,
+    /// Text row; Enter enters an inline edit. Path rows edit a filesystem
+    /// path, Identity rows edit a remembered window/process/profile match.
+    Path,
+    Identity,
+    Action,
+    /// Read-only informational row.
+    Info,
+}
+
+/// One drawable settings row computed from the compositor's effective
+/// settings (never the shell's local config copy).
+#[derive(Clone)]
+struct RecorderRowDisplay {
+    label: &'static str,
+    value: String,
+    kind: RecorderRowKind,
+}
+
+/// A clickable region of the recorder panel, produced by
+/// `recorder_hit_regions` and consumed by the pointer handler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecorderHit {
+    StartStop,
+    Pause,
+    ReplaySave,
+    Settings,
+    Tab(usize),
+    Row(usize, RecorderRowPart),
+    CloseSettings,
+    ResetSettings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecorderRowPart {
+    Dec,
+    Value,
+    Inc,
+}
+
+fn recorder_capture_mode_label(settings: &wm_core::Recorder) -> String {
+    match settings.capture_mode.as_str() {
+        "xwayland" => "Xwayland window".into(),
+        "inject" => "OpenGL inject".into(),
+        "opengl" => "OpenGL profile".into(),
+        "vulkan" => "Vulkan profile".into(),
+        _ => "Screen".into(),
+    }
+}
+
+/// Human-readable form of one remembered capture target. Empty identities
+/// read as "None" instead of failing to render.
+fn recorder_remembered_target_label(settings: &wm_core::Recorder) -> String {
+    match settings.capture_mode.as_str() {
+        "screen" | "xwayland" => recorder_window_identity_label(settings),
+        "inject" => {
+            if settings.inject_process.is_empty() {
+                "None".into()
+            } else {
+                settings.inject_process.clone()
+            }
+        }
+        "opengl" | "vulkan" => {
+            if settings.game_profile.is_empty() {
+                "None".into()
+            } else {
+                settings.game_profile.clone()
+            }
+        }
+        _ => "None".into(),
+    }
+}
+
+fn recorder_window_identity_label(settings: &wm_core::Recorder) -> String {
+    if settings.window_app_id.is_empty() && settings.window_title.is_empty() {
+        return "None".into();
+    }
+    if settings.window_title.is_empty() {
+        return settings.window_app_id.clone();
+    }
+    if settings.window_app_id.is_empty() {
+        return settings.window_title.clone();
+    }
+    format!("{} · {}", settings.window_app_id, settings.window_title)
+}
+
+fn recorder_window_identity_placeholder(settings: &wm_core::Recorder) -> String {
+    if settings.window_app_id.is_empty() && settings.window_title.is_empty() {
+        return String::new();
+    }
+    settings.window_app_id.clone()
+}
+
+fn recorder_settings_rows(
+    settings: &wm_core::Recorder,
+    tab: RecorderSettingsTab,
+) -> Vec<RecorderRowDisplay> {
+    match tab {
+        RecorderSettingsTab::Output => vec![
+            RecorderRowDisplay {
+                label: "Encoder",
+                value: format!("{} (NVENC)", settings.codec.to_uppercase()),
+                kind: RecorderRowKind::Cycle,
+            },
+            RecorderRowDisplay {
+                label: "Quality (CQ)",
+                value: settings.quality.to_string(),
+                kind: RecorderRowKind::Step,
+            },
+            RecorderRowDisplay {
+                label: "HDR (10-bit PQ)",
+                value: if settings.hdr { "On" } else { "Off" }.into(),
+                kind: RecorderRowKind::Toggle,
+            },
+            RecorderRowDisplay {
+                label: "Capture cursor",
+                value: if settings.cursor { "On" } else { "Off" }.into(),
+                kind: RecorderRowKind::Toggle,
+            },
+            RecorderRowDisplay {
+                label: "Container",
+                value: "MP4 (fragmented, streamable)".into(),
+                kind: RecorderRowKind::Info,
+            },
+            RecorderRowDisplay {
+                label: "Recording path",
+                value: settings.output_directory.clone(),
+                kind: RecorderRowKind::Path,
+            },
+        ],
+        RecorderSettingsTab::Capture => vec![
+            RecorderRowDisplay {
+                label: "Method",
+                value: recorder_capture_mode_label(settings),
+                kind: RecorderRowKind::Cycle,
+            },
+            RecorderRowDisplay {
+                label: "Remembered target",
+                value: recorder_remembered_target_label(settings),
+                kind: RecorderRowKind::Identity,
+            },
+            RecorderRowDisplay {
+                label: "Remember current",
+                value: "Save the selection below".into(),
+                kind: RecorderRowKind::Action,
+            },
+            RecorderRowDisplay {
+                label: "Method note",
+                value: "Changed sources take effect now".into(),
+                kind: RecorderRowKind::Info,
+            },
+        ],
+        RecorderSettingsTab::Video => vec![
+            RecorderRowDisplay {
+                label: "Screen capture FPS",
+                value: settings.screen_fps.to_string(),
+                kind: RecorderRowKind::Step,
+            },
+            RecorderRowDisplay {
+                label: "Injection FPS (attach)",
+                value: settings.fps.to_string(),
+                kind: RecorderRowKind::Step,
+            },
+            RecorderRowDisplay {
+                label: "Output width",
+                value: settings.output_width.to_string(),
+                kind: RecorderRowKind::Step,
+            },
+            RecorderRowDisplay {
+                label: "Output height",
+                value: settings.output_height.to_string(),
+                kind: RecorderRowKind::Step,
+            },
+            RecorderRowDisplay {
+                label: "HDR note",
+                value: "HDR needs the HEVC encoder".into(),
+                kind: RecorderRowKind::Info,
+            },
+        ],
+        RecorderSettingsTab::Audio => vec![
+            RecorderRowDisplay {
+                label: "Desktop audio",
+                value: audio_source_label(&settings.desktop_audio, "default_output"),
+                kind: RecorderRowKind::Cycle,
+            },
+            RecorderRowDisplay {
+                label: "Microphone",
+                value: audio_source_label(&settings.microphone, "default_input"),
+                kind: RecorderRowKind::Cycle,
+            },
+            RecorderRowDisplay {
+                label: "Program mix",
+                value: "Opus 256 kbit · 48 kHz stereo".into(),
+                kind: RecorderRowKind::Info,
+            },
+        ],
+        RecorderSettingsTab::Replay => vec![
+            RecorderRowDisplay {
+                label: "Replay duration (s)",
+                value: settings.replay_seconds.to_string(),
+                kind: RecorderRowKind::Step,
+            },
+            RecorderRowDisplay {
+                label: "Replay buffer (MiB)",
+                value: settings.replay_max_mib.to_string(),
+                kind: RecorderRowKind::Step,
+            },
+            RecorderRowDisplay {
+                label: "Save replay",
+                value: "Super+F8 during a recording".into(),
+                kind: RecorderRowKind::Info,
+            },
+        ],
+    }
+}
+
+fn audio_source_label(value: &str, default_name: &str) -> String {
+    if value.is_empty() || value == "disabled" {
+        "Disabled".into()
+    } else if value == default_name {
+        format!("Default ({value})")
+    } else {
+        value.to_string()
+    }
+}
+
+/// Match a live window against the remembered identity: substring, case
+/// insensitive, app_id preferred with title as the fallback. The same
+/// matcher backs the panel's selection restore and the compositor's
+/// `recorder start remembered` resolution.
+fn window_matches_settings(window: &wm_core::WindowInfo, settings: &wm_core::Recorder) -> bool {
+    let app_id = window.app_id.to_lowercase();
+    let title = window.title.to_lowercase();
+    let remembered_app = settings.window_app_id.to_lowercase();
+    let remembered_title = settings.window_title.to_lowercase();
+    if !remembered_app.is_empty()
+        && (!app_id.is_empty() && app_id.contains(&remembered_app)
+            || app_id.is_empty() && title.contains(&remembered_app))
+    {
+        return true;
+    }
+    !remembered_title.is_empty() && title.contains(&remembered_title)
+}
+
+/// Compute the ordered `recorder set KEY VALUE` commands for one Left/Right
+/// adjustment of a settings row. Values are pre-validated against the same
+/// rules the compositor enforces, so the UI never sends a command it knows
+/// will be rejected.
+fn adjust_recorder_setting(
+    settings: &wm_core::Recorder,
+    tab: RecorderSettingsTab,
+    row: usize,
+    direction: i32,
+) -> Result<Vec<(String, String)>, String> {
+    if direction == 0 {
+        return Ok(vec![]);
+    }
+    let forward = direction > 0;
+    let rows = recorder_settings_rows(settings, tab);
+    if rows.get(row).is_none() {
+        return Err("settings row is out of range".into());
+    }
+    let mut commands: Vec<(String, String)> = Vec::new();
+    let step = |current: u64, min: u64, max: u64, amount: u64| -> String {
+        let next = if forward {
+            current.saturating_add(amount).min(max)
+        } else {
+            current.saturating_sub(amount).max(min)
+        };
+        next.to_string()
+    };
+    match tab {
+        RecorderSettingsTab::Output => match row {
+            0 => {
+                // Two encoders: cycling either direction flips between them.
+                let codec = if settings.codec == "h264" {
+                    "hevc"
+                } else {
+                    "h264"
+                };
+                // HDR demands HEVC; dropping back to H.264 must drop HDR
+                // first or the compositor rejects the command.
+                if codec == "h264" && settings.hdr {
+                    commands.push(("hdr".into(), "false".into()));
+                }
+                commands.push(("codec".into(), codec.into()));
+            }
+            1 => commands.push(("quality".into(), step(u64::from(settings.quality), 1, 51, 1))),
+            2 => commands.push(("hdr".into(), (!settings.hdr).to_string())),
+            3 => commands.push(("cursor".into(), (!settings.cursor).to_string())),
+            4 => return Err("the container is fixed to fragmented MP4".into()),
+            5 => return Err("press Enter to edit the recording path".into()),
+            _ => return Err("settings row is out of range".into()),
+        },
+        RecorderSettingsTab::Capture => match row {
+            0 => {
+                let modes = ["screen", "xwayland", "inject", "opengl", "vulkan"];
+                let current = modes
+                    .iter()
+                    .position(|mode| *mode == settings.capture_mode.as_str())
+                    .unwrap_or(0);
+                let next = if forward {
+                    (current + 1) % modes.len()
+                } else {
+                    (current + modes.len() - 1) % modes.len()
+                };
+                commands.push(("capture_mode".into(), modes[next].into()));
+            }
+            1 => return Err("press Enter to edit the remembered target".into()),
+            2 => return Err("press Enter to remember the current selection".into()),
+            3 => return Ok(vec![]),
+            _ => return Err("settings row is out of range".into()),
+        },
+        RecorderSettingsTab::Video => match row {
+            0 => commands.push((
+                "screen_fps".into(),
+                step(u64::from(settings.screen_fps), 30, 480, 30),
+            )),
+            1 => commands.push((
+                "fps".into(),
+                step(u64::from(settings.fps), 30, 480, 30),
+            )),
+            2 => commands.push((
+                "output_width".into(),
+                step(u64::from(settings.output_width), 2, 16_384, 2),
+            )),
+            3 => commands.push((
+                "output_height".into(),
+                step(u64::from(settings.output_height), 2, 16_384, 2),
+            )),
+            _ => return Ok(vec![]),
+        },
+        RecorderSettingsTab::Audio => match row {
+            0 => commands.push((
+                "desktop_audio".into(),
+                if settings.desktop_audio == "default_output" {
+                    "disabled"
+                } else {
+                    "default_output"
+                }
+                .into(),
+            )),
+            1 => commands.push((
+                "microphone".into(),
+                if settings.microphone == "default_input" {
+                    "disabled"
+                } else {
+                    "default_input"
+                }
+                .into(),
+            )),
+            _ => return Ok(vec![]),
+        },
+        RecorderSettingsTab::Replay => match row {
+            0 => commands.push((
+                "replay_seconds".into(),
+                step(u64::from(settings.replay_seconds), 2, 3600, 5),
+            )),
+            1 => commands.push((
+                "replay_max_mib".into(),
+                step(u64::from(settings.replay_max_mib), 64, 8192, 64),
+            )),
+            _ => return Ok(vec![]),
+        },
+    }
+    // Validate every command against the compositor's rules before sending.
+    let mut candidate = settings.clone();
+    for (key, value) in &commands {
+        candidate
+            .apply(key, value)
+            .map_err(|error| format!("{key}: {error}"))?;
+    }
+    Ok(commands)
+}
+
+/// Pure Start-button decision, checked in the order a real start can fail so
+/// the label and `recorder_can_start` can never disagree.
+///
+/// Direct graphics-API paths always encode their own SDR H.264 stream. Their
+/// output is deliberately independent from the Screen/Xwayland codec, which
+/// may remain HEVC HDR while a game profile is started.
+fn recorder_start_blocker_for(
+    mode: RecorderCaptureMode,
+    settings: &wm_core::Recorder,
+    has_xwayland_window: bool,
+    has_attach_target: bool,
+    profile_count: usize,
+    has_selected_profile: bool,
+) -> Option<&'static str> {
+    if !settings.enabled {
+        return Some("RECORDER DISABLED IN SETTINGS");
+    }
+    match mode {
+        RecorderCaptureMode::Screen => None,
+        RecorderCaptureMode::XwaylandDirect => {
+            (!has_xwayland_window).then_some("NO XWAYLAND WINDOW OPEN")
+        }
+        RecorderCaptureMode::OpenGlInject => {
+            if !has_attach_target {
+                Some("NO RUNNING OPENGL PROCESS FOUND")
+            } else {
+                None
+            }
+        }
+        RecorderCaptureMode::OpenGlGame | RecorderCaptureMode::VulkanGame => {
+            if profile_count == 0 || !has_selected_profile {
+                Some("NO MATCHING API PROFILE CONFIGURED")
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn recorder_attach_targets() -> Vec<RecorderAttachTarget> {
     use std::os::unix::fs::MetadataExt;
 
@@ -246,9 +717,12 @@ struct Notification {
 }
 
 const CONFIG_ERROR_NOTIFICATION_ID: u32 = u32::MAX;
-/// Keep the status widgets clear of the rounded panel edge and visibly left
-/// of the screen edge without desynchronising their pointer hitboxes.
-const BAR_RIGHT_INSET: u32 = 44;
+/// Bar geometry is shared by drawing and pointer hit testing. The left island
+/// holds the launcher and the workspace ribbon; status chips run from right.
+const BAR_RIGHT_INSET: u32 = 8;
+const BAR_LAUNCHER_RIGHT: u32 = 40;
+const BAR_WORKSPACE_START: u32 = 48;
+const BAR_WORKSPACE_STEP: u32 = 26;
 const NOTIFICATION_LIFETIME: Duration = Duration::from_secs(5);
 
 fn application_notification_expiry(now: Instant) -> Instant {
@@ -963,6 +1437,131 @@ enum LauncherItem {
     Action(&'static str),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LauncherCategory {
+    Apps,
+    Windows,
+    Commands,
+    Power,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LauncherHit {
+    Category(LauncherCategory),
+    Result(usize),
+}
+
+const LAUNCHER_CATEGORY_CHIPS: [(LauncherCategory, &str, u32); 4] = [
+    (LauncherCategory::Apps, "APPS", 47),
+    (LauncherCategory::Windows, "@ WINDOWS", 79),
+    (LauncherCategory::Commands, "> COMMANDS", 91),
+    (LauncherCategory::Power, ": POWER", 67),
+];
+
+const LAUNCHER_CATEGORY_TOP: u32 = 140;
+const LAUNCHER_RESULTS_TOP: u32 = 185;
+const LAUNCHER_RESULT_STEP: u32 = 35;
+const LAUNCHER_RESULT_HEIGHT: u32 = 30;
+const LAUNCHER_RESULTS_BOTTOM_INSET: u32 = 48;
+
+fn launcher_panel_rect(width: u32, height: u32) -> [u32; 4] {
+    let panel_w = width.min(680);
+    let panel_h = height.min(420);
+    [
+        (width - panel_w) / 2,
+        (height - panel_h) / 2,
+        panel_w,
+        panel_h,
+    ]
+}
+
+fn launcher_category_regions(
+    width: u32,
+    height: u32,
+) -> [(LauncherCategory, &'static str, [u32; 4]); 4] {
+    let [panel_x, panel_y, _, _] = launcher_panel_rect(width, height);
+    let mut category_x = panel_x + 92;
+    std::array::from_fn(|index| {
+        let (category, label, chip_width) = LAUNCHER_CATEGORY_CHIPS[index];
+        let rect = [category_x, panel_y + LAUNCHER_CATEGORY_TOP, chip_width, 20];
+        category_x = category_x.saturating_add(chip_width + 6);
+        (category, label, rect)
+    })
+}
+
+fn launcher_result_row_rect(width: u32, height: u32, index: usize) -> Option<[u32; 4]> {
+    let [panel_x, panel_y, panel_w, panel_h] = launcher_panel_rect(width, height);
+    let row_offset = u32::try_from(index)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(LAUNCHER_RESULT_STEP);
+    let row_y = panel_y
+        .saturating_add(LAUNCHER_RESULTS_TOP)
+        .saturating_add(row_offset);
+    let list_bottom = panel_y + panel_h.saturating_sub(LAUNCHER_RESULTS_BOTTOM_INSET);
+    (row_y.saturating_add(LAUNCHER_RESULT_HEIGHT) <= list_bottom).then_some([
+        panel_x + 20,
+        row_y,
+        panel_w.saturating_sub(40),
+        LAUNCHER_RESULT_HEIGHT,
+    ])
+}
+
+fn launcher_rect_contains(pointer_x: f64, pointer_y: f64, rect: [u32; 4]) -> bool {
+    pointer_x.is_finite()
+        && pointer_y.is_finite()
+        && pointer_x >= rect[0] as f64
+        && pointer_x < rect[0].saturating_add(rect[2]) as f64
+        && pointer_y >= rect[1] as f64
+        && pointer_y < rect[1].saturating_add(rect[3]) as f64
+}
+
+fn launcher_pointer_hit(
+    width: u32,
+    height: u32,
+    pointer_x: f64,
+    pointer_y: f64,
+    result_count: usize,
+) -> Option<LauncherHit> {
+    for (category, _, rect) in launcher_category_regions(width, height) {
+        if launcher_rect_contains(pointer_x, pointer_y, rect) {
+            return Some(LauncherHit::Category(category));
+        }
+    }
+    for index in 0..result_count {
+        if launcher_result_row_rect(width, height, index)
+            .is_some_and(|rect| launcher_rect_contains(pointer_x, pointer_y, rect))
+        {
+            return Some(LauncherHit::Result(index));
+        }
+    }
+    None
+}
+
+fn launcher_category_for_query(query: &str) -> LauncherCategory {
+    match query.trim_start().chars().next() {
+        Some('@') => LauncherCategory::Windows,
+        Some('>') => LauncherCategory::Commands,
+        Some(':') => LauncherCategory::Power,
+        _ => LauncherCategory::Apps,
+    }
+}
+
+fn launcher_query_for_category(category: LauncherCategory, query: &str) -> String {
+    let query = query.trim_start();
+    let term = query
+        .strip_prefix('@')
+        .or_else(|| query.strip_prefix('>'))
+        .or_else(|| query.strip_prefix(':'))
+        .unwrap_or(query)
+        .trim_start();
+    match category {
+        LauncherCategory::Apps => term.to_string(),
+        LauncherCategory::Windows => format!("@{term}"),
+        LauncherCategory::Commands => format!("> {term}"),
+        LauncherCategory::Power => format!(":{term}"),
+    }
+}
+
 impl LauncherItem {
     fn label(&self, apps: &[DesktopEntry], snapshot: &Snapshot) -> String {
         match self {
@@ -1009,6 +1608,13 @@ struct App {
     recorder_game_profile_selected: usize,
     recorder_attach_selected: usize,
     recorder_xwayland_selected: usize,
+    recorder_view: RecorderView,
+    recorder_settings_tab: RecorderSettingsTab,
+    recorder_settings_row: usize,
+    recorder_path_edit: Option<String>,
+    recorder_feedback: Option<(String, bool)>,
+    recorder_settings_events: Option<channel::Sender<Option<String>>>,
+    recorder_selection_restored: bool,
     notifications: VecDeque<Notification>,
     notification_timers: BTreeMap<u32, RegistrationToken>,
     notification_events: Option<channel::Sender<NotificationEvent>>,
@@ -1101,6 +1707,13 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
         recorder_game_profile_selected: 0,
         recorder_attach_selected: 0,
         recorder_xwayland_selected: 0,
+        recorder_view: RecorderView::Controls,
+        recorder_settings_tab: RecorderSettingsTab::Output,
+        recorder_settings_row: 0,
+        recorder_path_edit: None,
+        recorder_feedback: None,
+        recorder_settings_events: None,
+        recorder_selection_restored: false,
         notifications: VecDeque::new(),
         notification_timers: BTreeMap::new(),
         notification_events: None,
@@ -1181,6 +1794,7 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                             Mode::Launcher => false,
                             Mode::Recorder => {
                                 app.snapshot.recorder != snapshot.recorder
+                                    || app.snapshot.recorder_settings != snapshot.recorder_settings
                                     || app.snapshot.outputs != snapshot.outputs
                                     || app.snapshot.windows != snapshot.windows
                             }
@@ -1188,6 +1802,18 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
                         app.snapshot = snapshot;
                         app.recorder_selected =
                             app.recorder_selected.min(app.snapshot.windows.len());
+                        if app.mode == Mode::Recorder {
+                            app.recorder_settings_row = app
+                                .recorder_settings_row
+                                .min(app.recorder_settings_row_count().saturating_sub(1));
+                            // The panel is a fresh process on every open, so
+                            // restore the remembered method/source from the
+                            // persisted settings on the first snapshot.
+                            if !app.recorder_selection_restored {
+                                app.restore_recorder_selection();
+                                app.recorder_selection_restored = true;
+                            }
+                        }
                         if config_error_changed {
                             if let Some(error) = app.snapshot.error.as_deref() {
                                 if let Some(sender) = app.notification_events.as_ref() {
@@ -1212,6 +1838,29 @@ fn run(mode: Mode, config: Config) -> Result<(), String> {
             })
             .map_err(|error| error.to_string())?;
         spawn_subscription(sender);
+    }
+
+    if mode == Mode::Recorder {
+        // Settings commands run on a worker so a slow compositor never blocks
+        // the UI thread; the response arrives here as error feedback.
+        let (settings_sender, settings_receiver) = channel::channel::<Option<String>>();
+        app.recorder_settings_events = Some(settings_sender);
+        handle
+            .insert_source(settings_receiver, |event, _, app| {
+                if let channel::Event::Msg(outcome) = event {
+                    match outcome {
+                        None => {
+                            app.recorder_feedback =
+                                Some(("Saved".into(), false));
+                        }
+                        Some(error) => {
+                            app.recorder_feedback = Some((error, true));
+                        }
+                    }
+                    app.redraw_all(&qh);
+                }
+            })
+            .map_err(|error| error.to_string())?;
     }
 
     if mode == Mode::Bar {
@@ -1713,6 +2362,16 @@ fn spawn_audio_monitor(sender: channel::Sender<AudioState>) {
             thread::sleep(Duration::from_secs(2));
         }
     });
+}
+
+fn compact_network_bar_label(label: &str) -> &'static str {
+    if label == "NET OFF" {
+        "NET OFF"
+    } else if label.starts_with("WIFI") {
+        "WIFI"
+    } else {
+        "NET"
+    }
 }
 
 fn read_network_state(proxy: &zbus::blocking::Proxy<'_>) -> NetworkState {
@@ -2584,10 +3243,497 @@ impl App {
         }
     }
 
+    fn click_launcher(&mut self, pointer_x: f64, pointer_y: f64, qh: &QueueHandle<Self>) {
+        let Some((width, height)) = self
+            .surfaces
+            .iter()
+            .find(|surface| surface.kind == SurfaceKind::Launcher)
+            .map(|surface| (surface.width, surface.height))
+        else {
+            return;
+        };
+        let result_count = self.launcher_items().len();
+        match launcher_pointer_hit(width, height, pointer_x, pointer_y, result_count) {
+            Some(LauncherHit::Category(category)) => {
+                self.launcher_query = launcher_query_for_category(category, &self.launcher_query);
+                self.launcher_selected = 0;
+                self.redraw_all(qh);
+            }
+            Some(LauncherHit::Result(index)) => {
+                self.launcher_selected = index;
+                self.activate_launcher_item();
+            }
+            None => {}
+        }
+    }
+
     fn run_command(command: String) {
         thread::spawn(move || {
             let _ = wm_core::connect_command(&command);
         });
+    }
+
+    /// Send `recorder set` commands through the compositor with response
+    /// feedback. Settings always come from `snapshot.recorder_settings`, so
+    /// the UI cannot drift from what the compositor will actually use.
+    fn send_recorder_commands(&mut self, commands: Vec<(String, String)>) {
+        self.recorder_feedback = None;
+        let Some(sender) = self.recorder_settings_events.clone() else {
+            return;
+        };
+        thread::spawn(move || {
+            for (key, value) in commands {
+                let command = format!("recorder set {key} {value}");
+                let error = match wm_core::connect_command(&command) {
+                    Ok(response) if response.ok => None,
+                    Ok(response) => {
+                        Some(response.error.unwrap_or_else(|| "recorder command failed".into()))
+                    }
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = error {
+                    let _ = sender.send(Some(error));
+                    return;
+                }
+            }
+            let _ = sender.send(None);
+        });
+    }
+
+    fn apply_recorder_adjustment(&mut self, direction: i32) {
+        let settings = self.snapshot.recorder_settings.clone();
+        match adjust_recorder_setting(
+            &settings,
+            self.recorder_settings_tab,
+            self.recorder_settings_row,
+            direction,
+        ) {
+            Ok(commands) if commands.is_empty() => {}
+            Ok(commands) => self.send_recorder_commands(commands),
+            Err(error) => self.recorder_feedback = Some((error, true)),
+        }
+    }
+
+    /// Whether a text row (path or remembered-target identity) is being
+    /// edited right now. Both share the same inline buffer.
+    fn recorder_identity_editing(&self) -> bool {
+        self.recorder_path_edit.is_some()
+    }
+
+    /// Kind of the selected row when it supports Enter activation.
+    fn recorder_editable_row_kind(&self) -> Option<RecorderRowKind> {
+        recorder_settings_rows(
+            &self.snapshot.recorder_settings,
+            self.recorder_settings_tab,
+        )
+        .get(self.recorder_settings_row)
+        .map(|row| row.kind)
+        .filter(|kind| {
+            matches!(
+                kind,
+                RecorderRowKind::Path
+                    | RecorderRowKind::Identity
+                    | RecorderRowKind::Action
+            )
+        })
+    }
+
+    /// Commit the shared text buffer to whichever row is selected: the
+    /// recording path, or the remembered capture target for the current
+    /// method.
+    fn commit_recorder_text_edit(&mut self) {
+        let Some(buffer) = self.recorder_path_edit.take() else {
+            return;
+        };
+        let buffer = buffer.trim().to_string();
+        match self.recorder_editable_row_kind() {
+            Some(RecorderRowKind::Identity) => {
+                if buffer.is_empty() {
+                    self.recorder_feedback =
+                        Some(("Remembered target cannot be empty".into(), true));
+                    return;
+                }
+                match self.snapshot.recorder_settings.capture_mode.as_str() {
+                    "screen" | "xwayland" => self.send_recorder_commands(vec![(
+                        "window_match".into(),
+                        buffer,
+                    )]),
+                    "inject" => self.send_recorder_commands(vec![(
+                        "inject_process".into(),
+                        buffer,
+                    )]),
+                    "opengl" | "vulkan" => self.send_recorder_commands(vec![(
+                        "game_profile".into(),
+                        buffer,
+                    )]),
+                    _ => {}
+                }
+            }
+            _ => {
+                if buffer.is_empty() {
+                    self.recorder_feedback =
+                        Some(("Recording path cannot be empty".into(), true));
+                    return;
+                }
+                self.send_recorder_commands(vec![("output_directory".into(), buffer)]);
+            }
+        }
+    }
+
+    fn recorder_settings_row_count(&self) -> usize {
+        recorder_settings_rows(&self.snapshot.recorder_settings, self.recorder_settings_tab).len()
+    }
+
+    /// Snap the Controls-page method and per-method selection cursor to the
+    /// remembered settings, so reopening the panel (or restarting the shell)
+    /// lands on the same source. Remembered state is stable text identity,
+    /// never the previous session's window IDs.
+    fn restore_recorder_selection(&mut self) {
+        let settings = self.snapshot.recorder_settings.clone();
+        self.recorder_capture_mode = match settings.capture_mode.as_str() {
+            "xwayland" => RecorderCaptureMode::XwaylandDirect,
+            "inject" => RecorderCaptureMode::OpenGlInject,
+            "opengl" => RecorderCaptureMode::OpenGlGame,
+            "vulkan" => RecorderCaptureMode::VulkanGame,
+            _ => RecorderCaptureMode::Screen,
+        };
+        match self.recorder_capture_mode {
+            RecorderCaptureMode::Screen => {
+                self.recorder_selected = self.window_index_for_settings(&settings);
+            }
+            RecorderCaptureMode::XwaylandDirect => {
+                self.recorder_xwayland_selected = self
+                    .snapshot
+                    .windows
+                    .iter()
+                    .filter(|window| window.x11_window.is_some())
+                    .position(|window| window_matches_settings(window, &settings))
+                    .unwrap_or(0);
+            }
+            RecorderCaptureMode::OpenGlInject => {
+                self.recorder_attach_selected = recorder_attach_targets()
+                    .iter()
+                    .position(|target| {
+                        !settings.inject_process.is_empty()
+                            && target
+                                .comm
+                                .to_lowercase()
+                                .contains(&settings.inject_process.to_lowercase())
+                    })
+                    .unwrap_or(0);
+            }
+            RecorderCaptureMode::OpenGlGame | RecorderCaptureMode::VulkanGame => {
+                let api = match self.recorder_capture_mode {
+                    RecorderCaptureMode::VulkanGame => "vulkan",
+                    _ => "opengl",
+                };
+                self.recorder_game_profile_selected = settings
+                    .game_profiles
+                    .iter()
+                    .filter(|profile| profile.api == api)
+                    .position(|profile| profile.name == settings.game_profile)
+                    .unwrap_or(0);
+            }
+        }
+        // Selection list lengths can differ from where the cursor restored.
+        self.cycle_recorder_capture_mode(true);
+        self.cycle_recorder_capture_mode(false);
+    }
+
+    /// Index into the Screen-mode source list for the remembered window, or
+    /// 0 (the monitor/region picker) when nothing matches.
+    fn window_index_for_settings(&self, settings: &wm_core::Recorder) -> usize {
+        if settings.window_app_id.is_empty() && settings.window_title.is_empty() {
+            return 0;
+        }
+        self.snapshot
+            .windows
+            .iter()
+            .position(|window| window_matches_settings(window, settings))
+            .map(|index| index + 1)
+            .unwrap_or(0)
+    }
+
+    fn send_recorder_command_string(&mut self, command: &str) {
+        self.recorder_feedback = None;
+        let Some(sender) = self.recorder_settings_events.clone() else {
+            Self::run_command(command.into());
+            return;
+        };
+        let command = command.to_string();
+        thread::spawn(move || {
+            let error = match wm_core::connect_command(&command) {
+                Ok(response) if response.ok => None,
+                Ok(response) => {
+                    Some(response.error.unwrap_or_else(|| "recorder command failed".into()))
+                }
+                Err(error) => Some(error),
+            };
+            let _ = sender.send(error);
+        });
+    }
+
+    /// Resolve a click position to a recorder hit region using the same
+    /// geometry functions the renderer uses.
+    fn recorder_hit_at(&self, pointer_x: f64, pointer_y: f64) -> Option<RecorderHit> {
+        let surface = self
+            .surfaces
+            .iter()
+            .find(|surface| surface.kind == SurfaceKind::Recorder)?;
+        let (px, py, panel_w, _) = recorder_panel(surface.width, surface.height);
+        let x = pointer_x.max(0.0) as u32;
+        let y = pointer_y.max(0.0) as u32;
+        let inside = |rect: [u32; 4]| {
+            x >= px.saturating_add(rect[0])
+                && x < px.saturating_add(rect[0].saturating_add(rect[2]))
+                && y >= py.saturating_add(rect[1])
+                && y < py.saturating_add(rect[1].saturating_add(rect[3]))
+        };
+        if self.recorder_view == RecorderView::Settings {
+            if inside(recorder_settings_close_rect(panel_w)) {
+                return Some(RecorderHit::CloseSettings);
+            }
+            for index in 0..RecorderSettingsTab::ALL.len() {
+                if inside(recorder_settings_tab_rect(index)) {
+                    return Some(RecorderHit::Tab(index));
+                }
+            }
+            if inside(recorder_settings_reset_rect()) {
+                return Some(RecorderHit::ResetSettings);
+            }
+            let rows = recorder_settings_rows(
+                &self.snapshot.recorder_settings,
+                self.recorder_settings_tab,
+            );
+            for (index, row) in rows.iter().enumerate() {
+                let row_rect = recorder_settings_row_rect(index, panel_w);
+                if !inside(row_rect) {
+                    continue;
+                }
+                return match row.kind {
+                    RecorderRowKind::Cycle | RecorderRowKind::Step => {
+                        let (dec, _, inc) = recorder_settings_widget_rects(row_rect);
+                        let part = if inside(dec) {
+                            RecorderRowPart::Dec
+                        } else if inside(inc) {
+                            RecorderRowPart::Inc
+                        } else {
+                            RecorderRowPart::Value
+                        };
+                        Some(RecorderHit::Row(index, part))
+                    }
+                    _ => Some(RecorderHit::Row(index, RecorderRowPart::Value)),
+                };
+            }
+            return None;
+        }
+        recorder_control_button_rects(panel_w)
+            .iter()
+            .find(|(rect, _)| inside(*rect))
+            .map(|(_, hit)| *hit)
+    }
+
+    /// Dispatch one recorder hit. Returns true when the panel should close.
+    fn activate_recorder_hit(&mut self, hit: Option<RecorderHit>) -> bool {
+        let Some(hit) = hit else {
+            return false;
+        };
+        let running = !matches!(
+            self.snapshot.recorder.state,
+            RecorderState::Idle | RecorderState::Error
+        );
+        match hit {
+            RecorderHit::StartStop => {
+                if running {
+                    Self::run_command("recorder stop".into());
+                    self.exit = true;
+                    return true;
+                }
+                if self.recorder_can_start() {
+                    if let Some(command) = self.recorder_start_command() {
+                        Self::run_command(command);
+                        self.exit = true;
+                        return true;
+                    }
+                }
+                false
+            }
+            RecorderHit::Pause => {
+                if running {
+                    Self::run_command("recorder pause".into());
+                }
+                false
+            }
+            RecorderHit::ReplaySave => {
+                if running {
+                    Self::run_command("recorder replay-save".into());
+                }
+                false
+            }
+            RecorderHit::Settings => {
+                self.recorder_view = RecorderView::Settings;
+                false
+            }
+            RecorderHit::CloseSettings => {
+                self.recorder_view = RecorderView::Controls;
+                false
+            }
+            RecorderHit::ResetSettings => {
+                self.send_recorder_command_string("recorder settings-reset");
+                false
+            }
+            RecorderHit::Tab(index) => {
+                if let Some(tab) = RecorderSettingsTab::ALL.get(index) {
+                    self.recorder_settings_tab = *tab;
+                    self.recorder_settings_row = self
+                        .recorder_settings_row
+                        .min(self.recorder_settings_row_count().saturating_sub(1));
+                    self.recorder_path_edit = None;
+                }
+                false
+            }
+            RecorderHit::Row(index, part) => {
+                self.recorder_settings_row = index;
+                let settings = self.snapshot.recorder_settings.clone();
+                let row_count = recorder_settings_rows(&settings, self.recorder_settings_tab).len();
+                let Some(row) = recorder_settings_rows(&settings, self.recorder_settings_tab)
+                    .get(index.min(row_count.saturating_sub(1)))
+                    .cloned()
+                else {
+                    return false;
+                };
+                if index >= row_count {
+                    self.recorder_settings_row = row_count.saturating_sub(1);
+                    return false;
+                }
+                match row.kind {
+                    RecorderRowKind::Toggle => self.apply_recorder_adjustment(1),
+                    RecorderRowKind::Path => {
+                        self.recorder_path_edit = Some(settings.output_directory.clone());
+                    }
+                    RecorderRowKind::Identity => {
+                        self.recorder_path_edit = Some(self.recorder_identity_edit_seed());
+                    }
+                    RecorderRowKind::Action => {
+                        self.remember_current_recorder_source();
+                    }
+                    RecorderRowKind::Cycle | RecorderRowKind::Step => {
+                        self.apply_recorder_adjustment(match part {
+                            RecorderRowPart::Dec => -1,
+                            _ => 1,
+                        });
+                    }
+                    RecorderRowKind::Info => {}
+                }
+                false
+            }
+        }
+    }
+
+    /// Seed for editing the remembered target: the Controls-page selection
+    /// that the action row would store, or the stored identity placeholder
+    /// when the cursor has nothing applicable selected.
+    fn recorder_identity_edit_seed(&self) -> String {
+        let settings = self.snapshot.recorder_settings.clone();
+        match settings.capture_mode.as_str() {
+            "screen" | "xwayland" => self
+                .recorder_selected_window_identity()
+                .unwrap_or_else(|| recorder_window_identity_placeholder(&settings)),
+            "inject" => self
+                .selected_recorder_attach_target()
+                .map(|target| target.comm)
+                .unwrap_or_else(|| settings.inject_process.clone()),
+            "opengl" | "vulkan" => self
+                .selected_recorder_game_profile()
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| settings.game_profile.clone()),
+            _ => String::new(),
+        }
+    }
+
+    /// app_id first, title as fallback, for the Controls-page window cursor.
+    fn recorder_selected_window_identity(&self) -> Option<String> {
+        let window = match self.recorder_capture_mode {
+            RecorderCaptureMode::XwaylandDirect => {
+                self.selected_recorder_xwayland_window()?.clone()
+            }
+            _ => self
+                .snapshot
+                .windows
+                .get(self.recorder_selected.saturating_sub(1))?
+                .clone(),
+        };
+        if !window.app_id.trim().is_empty() {
+            return Some(window.app_id.clone());
+        }
+        if !window.title.trim().is_empty() {
+            return Some(window.title.clone());
+        }
+        None
+    }
+
+    /// Remember the Controls-page selection as settings ("Remember current").
+    /// Window memory stores app_id/title identity, process memory the command
+    /// name, profile memory the profile name — never PIDs or window IDs.
+    fn remember_current_recorder_source(&mut self) {
+        let mut commands: Vec<(String, String)> = vec![(
+            "capture_mode".into(),
+            match self.recorder_capture_mode {
+                RecorderCaptureMode::XwaylandDirect => "xwayland",
+                RecorderCaptureMode::OpenGlInject => "inject",
+                RecorderCaptureMode::OpenGlGame => "opengl",
+                RecorderCaptureMode::VulkanGame => "vulkan",
+                RecorderCaptureMode::Screen => "screen",
+            }
+            .into(),
+        )];
+        match self.recorder_capture_mode {
+            RecorderCaptureMode::Screen | RecorderCaptureMode::XwaylandDirect => {
+                let window = match self.recorder_capture_mode {
+                    RecorderCaptureMode::XwaylandDirect => {
+                        self.selected_recorder_xwayland_window().cloned()
+                    }
+                    _ => self
+                        .snapshot
+                        .windows
+                        .get(self.recorder_selected.saturating_sub(1))
+                        .cloned(),
+                };
+                let Some(window) = window else {
+                    self.recorder_feedback =
+                        Some(("Select a source on the Controls page first".into(), true));
+                    return;
+                };
+                if !window.app_id.trim().is_empty() {
+                    commands.push(("window_match".into(), window.app_id.clone()));
+                }
+                if !window.title.trim().is_empty() {
+                    commands.push(("window_title".into(), window.title.clone()));
+                }
+                if commands.len() == 1 {
+                    self.recorder_feedback =
+                        Some(("That window has no app_id or title to remember".into(), true));
+                    return;
+                }
+            }
+            RecorderCaptureMode::OpenGlInject => {
+                let Some(target) = self.selected_recorder_attach_target() else {
+                    self.recorder_feedback =
+                        Some(("Select a process on the Controls page first".into(), true));
+                    return;
+                };
+                commands.push(("inject_process".into(), target.comm));
+            }
+            RecorderCaptureMode::OpenGlGame | RecorderCaptureMode::VulkanGame => {
+                let Some(profile) = self.selected_recorder_game_profile() else {
+                    self.recorder_feedback =
+                        Some(("Select a profile on the Controls page first".into(), true));
+                    return;
+                };
+                commands.push(("game_profile".into(), profile.name.clone()));
+            }
+        }
+        self.send_recorder_commands(commands);
     }
 
     fn recorder_source_label(&self) -> String {
@@ -2614,8 +3760,8 @@ impl App {
             | RecorderCaptureMode::XwaylandDirect
             | RecorderCaptureMode::OpenGlInject => return 0,
         };
-        self.config
-            .recorder
+        self.snapshot
+            .recorder_settings
             .game_profiles
             .iter()
             .filter(|profile| profile.api == api)
@@ -2630,8 +3776,8 @@ impl App {
             | RecorderCaptureMode::XwaylandDirect
             | RecorderCaptureMode::OpenGlInject => return None,
         };
-        self.config
-            .recorder
+        self.snapshot
+            .recorder_settings
             .game_profiles
             .iter()
             .filter(|profile| profile.api == api)
@@ -2691,27 +3837,48 @@ impl App {
         }
     }
 
-    fn recorder_can_start(&self) -> bool {
-        match self.recorder_capture_mode {
-            RecorderCaptureMode::Screen => true,
-            RecorderCaptureMode::XwaylandDirect => {
-                self.config.recorder.codec == "h264"
-                    && self.selected_recorder_xwayland_window().is_some()
-            }
-            RecorderCaptureMode::OpenGlInject => {
-                self.config.recorder.codec == "h264"
-                    && self.selected_recorder_attach_target().is_some()
-            }
-            RecorderCaptureMode::OpenGlGame | RecorderCaptureMode::VulkanGame => {
-                self.config.recorder.codec == "h264"
-                    && self.selected_recorder_game_profile().is_some()
-            }
+    /// Why the Start button cannot start the selected method right now, using
+    /// the live panel state. Returns None when the selection is usable.
+    fn recorder_start_blocker(&self) -> Option<&'static str> {
+        if !matches!(
+            self.snapshot.recorder.state,
+            RecorderState::Idle | RecorderState::Error
+        ) {
+            return None;
         }
+        recorder_start_blocker_for(
+            self.recorder_capture_mode,
+            &self.snapshot.recorder_settings,
+            self.selected_recorder_xwayland_window().is_some(),
+            self.selected_recorder_attach_target().is_some(),
+            self.recorder_game_profile_count(),
+            self.selected_recorder_game_profile().is_some(),
+        )
+    }
+
+    fn recorder_can_start(&self) -> bool {
+        if !matches!(
+            self.snapshot.recorder.state,
+            RecorderState::Idle | RecorderState::Error
+        ) {
+            return false;
+        }
+        self.recorder_start_blocker().is_none()
     }
 
     fn recorder_start_command(&self) -> Option<String> {
+        if self.snapshot.recorder.state != RecorderState::Idle
+            && self.snapshot.recorder.state != RecorderState::Error
+        {
+            return Some("recorder stop".into());
+        }
         match self.recorder_capture_mode {
-            RecorderCaptureMode::Screen => Some(self.recorder_command("start")),
+            // Screen, Xwayland, and inject selections re-resolve the
+            // remembered window/identity at start: titles and PIDs change
+            // across restarts, so the stored app_id/title is matched fresh.
+            RecorderCaptureMode::Screen => {
+                Some(self.remembered_screen_command("start", self.recorder_selected))
+            }
             RecorderCaptureMode::XwaylandDirect => self
                 .selected_recorder_xwayland_window()
                 .and_then(|window| window.x11_window)
@@ -2725,15 +3892,37 @@ impl App {
         }
     }
 
+    /// Screen-mode start command: the remembered window wins when it is open
+    /// right now; otherwise the picker selection is used verbatim.
+    fn remembered_screen_command(&self, action: &str, selected: usize) -> String {
+        let settings = &self.snapshot.recorder_settings;
+        if (!settings.window_app_id.is_empty() || !settings.window_title.is_empty())
+            && self
+                .snapshot
+                .windows
+                .iter()
+                .any(|window| window_matches_settings(window, settings))
+        {
+            return format!("recorder {action} remembered");
+        }
+        self.snapshot
+            .windows
+            .get(selected.saturating_sub(1))
+            .filter(|_| selected > 0)
+            .map(|window| format!("recorder {action} window {}", window.id))
+            .unwrap_or_else(|| format!("recorder {action} output"))
+    }
+
     fn recorder_display_fps(&self) -> u32 {
+        let settings = &self.snapshot.recorder_settings;
         match self.recorder_capture_mode {
-            RecorderCaptureMode::Screen => self.config.recorder.screen_fps,
-            RecorderCaptureMode::XwaylandDirect => self.config.recorder.fps,
-            RecorderCaptureMode::OpenGlInject => self.config.recorder.fps,
+            RecorderCaptureMode::Screen => settings.screen_fps,
+            RecorderCaptureMode::XwaylandDirect => settings.fps,
+            RecorderCaptureMode::OpenGlInject => settings.fps,
             RecorderCaptureMode::OpenGlGame | RecorderCaptureMode::VulkanGame => self
                 .selected_recorder_game_profile()
                 .map(|profile| profile.fps)
-                .unwrap_or(self.config.recorder.fps),
+                .unwrap_or(settings.fps),
         }
     }
 
@@ -2822,72 +4011,93 @@ impl App {
             .nth(self.recorder_xwayland_selected)
     }
 
-    fn recorder_command(&self, action: &str) -> String {
-        self.snapshot
-            .windows
-            .get(self.recorder_selected.saturating_sub(1))
-            .filter(|_| self.recorder_selected > 0)
-            .map(|window| format!("recorder {action} window {}", window.id))
-            .unwrap_or_else(|| format!("recorder {action} output"))
-    }
-
     fn bar_module_at(&self, surface: &wl_surface::WlSurface, x: f64) -> Option<&'static str> {
-        let width = self
+        let surface = self
             .surfaces
             .iter()
-            .find(|candidate| candidate.layer.wl_surface() == surface)
-            .map(|surface| surface.width)?;
+            .find(|candidate| candidate.layer.wl_surface() == surface)?;
+        self.bar_module_rects(surface.width, surface.height)
+            .into_iter()
+            .find(|(_, left, right)| x >= f64::from(*left) && x <= f64::from(*right))
+            .map(|(module, _, _)| module)
+    }
+
+    /// Right-side bar values in the exact order and form the renderer draws
+    /// them, so pointer hit tests always measure the same pixels.
+    fn bar_right_modules(&self) -> Vec<(&'static str, String)> {
         let modules = &self.config.shell.modules;
-        let values = [
-            modules
-                .iter()
-                .any(|module| module == "clock")
-                .then(|| ("clock", self.clock.clone())),
-            modules
-                .iter()
-                .any(|module| module == "battery")
+        let has = |name: &str| modules.iter().any(|module| module == name);
+        let has_tray_icons = self.tray.iter().any(TrayItem::has_visible_icon);
+        [
+            has("battery")
                 .then(|| self.battery.clone())
                 .flatten()
                 .map(|value| ("battery", value)),
-            modules
-                .iter()
-                .any(|module| module == "audio")
-                .then(|| ("audio", self.audio.label.clone())),
-            modules
-                .iter()
-                .any(|module| module == "network")
-                .then(|| ("network", self.network.label.clone())),
-            modules
-                .iter()
-                .any(|module| module == "media")
-                .then(|| ("media", self.media.label.clone())),
-            modules
-                .iter()
-                .any(|module| module == "bluetooth")
-                .then(|| ("bluetooth", self.bluetooth.label.clone())),
-            modules
-                .iter()
-                .any(|module| module == "tray")
+            (has("media") && self.media.label != "MEDIA —")
+                .then(|| ("media", "MEDIA".into())),
+            has("bluetooth").then(|| ("bluetooth", self.bluetooth.label.clone())),
+            (has("tray") && has_tray_icons)
                 .then(|| ("tray", format!("TRAY {}", self.tray.len()))),
-            modules
-                .iter()
-                .any(|module| module == "notifications")
-                .then(|| ("notifications", format!("NOT {}", self.notifications.len()))),
-            modules
-                .iter()
-                .any(|module| module == "power")
-                .then(|| ("power", "POWER".to_string())),
+            has("notifications")
+                .then(|| self.notifications_bar_label())
+                .flatten()
+                .map(|value| ("notifications", value)),
+            has("network").then(|| {
+                ("network", compact_network_bar_label(&self.network.label).into())
+            }),
+            has("audio").then(|| ("audio", self.audio.label.clone())),
+            has("clock").then(|| ("clock", self.clock.clone())),
+            // The recorder label is drawn regardless of the configured module
+            // list, so the hit test must mirror it unconditionally.
+            self.recorder_bar_label().map(|value| ("recorder", value)),
+            has("power").then(|| ("power", "POWER".to_string())),
         ]
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>();
-        right_module_at(
+        .collect()
+    }
+
+    fn bar_module_rects(&self, width: u32, height: u32) -> Vec<(&'static str, u32, u32)> {
+        bar_module_layout(
             width,
+            height,
             self.font.as_ref(),
             self.config.theme.font_size,
-            &values,
-            x,
+            self.tray
+                .iter()
+                .filter(|item| item.has_visible_icon())
+                .take(6)
+                .count(),
+            if self.config.shell.modules.iter().any(|module| module == "workspaces") {
+                BAR_WORKSPACE_START
+                    + BAR_WORKSPACE_STEP * u32::from(self.config.layout.workspaces)
+                    + 16
+            } else {
+                72
+            },
+            &self.bar_right_modules(),
         )
+    }
+
+    /// The recorder label exactly as the bar draws it.
+    fn recorder_bar_label(&self) -> Option<String> {
+        match self.snapshot.recorder.state {
+            RecorderState::Recording | RecorderState::Starting => {
+                Some(format!("REC {}", self.snapshot.recorder.requested_fps))
+            }
+            RecorderState::Paused => Some("REC PAUSED".into()),
+            RecorderState::Replay => Some("REPLAY".into()),
+            RecorderState::Error => Some("REC ERR".into()),
+            RecorderState::Idle => None,
+        }
+    }
+
+    /// Keep the bar count compact; the panel carries notification details.
+    fn notifications_bar_label(&self) -> Option<String> {
+        if self.do_not_disturb.load(Ordering::Relaxed) {
+            return Some("DND".into());
+        }
+        Some(format!("NOT {}", self.notifications.len()))
     }
 
     fn tray_item_at(&self, surface: &wl_surface::WlSurface, x: f64) -> Option<TrayItem> {
@@ -2895,78 +4105,31 @@ impl App {
             .surfaces
             .iter()
             .find(|candidate| candidate.layer.wl_surface() == surface)?;
-        let modules = &self.config.shell.modules;
-        if !modules.iter().any(|module| module == "tray") {
+        if !self
+            .config
+            .shell
+            .modules
+            .iter()
+            .any(|module| module == "tray")
+        {
             return None;
         }
-        let values = [
-            modules
-                .iter()
-                .any(|module| module == "clock")
-                .then(|| self.clock.clone()),
-            modules
-                .iter()
-                .any(|module| module == "battery")
-                .then(|| battery_state().0)
-                .flatten(),
-            modules
-                .iter()
-                .any(|module| module == "audio")
-                .then(|| self.audio.label.clone()),
-            modules
-                .iter()
-                .any(|module| module == "network")
-                .then(|| self.network.label.clone()),
-            modules
-                .iter()
-                .any(|module| module == "media")
-                .then(|| self.media.label.clone()),
-            modules
-                .iter()
-                .any(|module| module == "bluetooth")
-                .then(|| self.bluetooth.label.clone()),
-            Some(format!("TRAY {}", self.tray.len())),
-            modules
-                .iter()
-                .any(|module| module == "notifications")
-                .then(|| format!("NOT {}", self.notifications.len())),
-            modules
-                .iter()
-                .any(|module| module == "power")
-                .then(|| "POWER".to_string()),
-        ];
-        let mut right = surface.width.saturating_sub(BAR_RIGHT_INSET);
-        for (index, value) in values.into_iter().enumerate().rev() {
-            let Some(value) = value else {
-                continue;
-            };
-            let icon_size = surface.height.saturating_sub(12).clamp(12, 24);
-            let tray_width = self
-                .tray
-                .iter()
-                .filter(|item| item.has_visible_icon())
-                .take(6)
-                .count() as u32
-                * (icon_size + 2)
-                + 8;
-            let value_width = text_width(self.font.as_ref(), &value, self.config.theme.font_size)
-                .max((index == 6).then_some(tray_width).unwrap_or(0))
-                .min(right.saturating_sub(12));
-            let left = right.saturating_sub(value_width);
-            if index == 6 && x >= left as f64 && x < right as f64 {
-                let icon_index =
-                    ((x as u32).saturating_sub(left.saturating_add(4)) / (icon_size + 2)) as usize;
-                return self
-                    .tray
-                    .iter()
-                    .filter(|item| item.has_visible_icon())
-                    .take(6)
-                    .nth(icon_index)
-                    .cloned();
-            }
-            right = left.saturating_sub(16);
+        let (_, left, right) = self
+            .bar_module_rects(surface.width, surface.height)
+            .into_iter()
+            .find(|(module, _, _)| *module == "tray")?;
+        if x < f64::from(left) || x >= f64::from(right) {
+            return None;
         }
-        None
+        let icon_size = surface.height.saturating_sub(12).clamp(12, 24);
+        let icon_index =
+            ((x as u32).saturating_sub(left.saturating_add(4)) / (icon_size + 2)) as usize;
+        self.tray
+            .iter()
+            .filter(|item| item.has_visible_icon())
+            .take(6)
+            .nth(icon_index)
+            .cloned()
     }
 
     fn change_audio(command: &[&str]) {
@@ -3376,7 +4539,7 @@ impl App {
         if self.tray_menu.is_some() {
             self.close_tray_menu(qh);
         }
-        if x < 12.0 {
+        if x < f64::from(BAR_LAUNCHER_RIGHT) {
             if button == 0x110 {
                 Self::run_command("launcher".into());
             }
@@ -3414,11 +4577,26 @@ impl App {
             }
             return;
         }
-        let workspace = ((x as u32).saturating_sub(12) / 25 + 1) as u8;
-        if workspace > self.config.layout.workspaces
-            || x >= 12.0 + 25.0 * self.config.layout.workspaces as f64
+        let workspace_span = BAR_WORKSPACE_STEP * u32::from(self.config.layout.workspaces);
+        if self.config.shell.modules.iter().any(|module| module == "workspaces")
+            && x >= f64::from(BAR_WORKSPACE_START)
+            && x < f64::from(BAR_WORKSPACE_START + workspace_span)
         {
-            match (self.bar_module_at(surface, x), button) {
+            if button == 0x110 {
+                let workspace = ((x as u32 - BAR_WORKSPACE_START) / BAR_WORKSPACE_STEP + 1) as u8;
+                let output = self
+                    .surfaces
+                    .iter()
+                    .find(|candidate| candidate.layer.wl_surface() == surface)
+                    .and_then(|candidate| candidate.output.as_ref())
+                    .and_then(|output| self.output_state.info(output))
+                    .and_then(|info| info.name)
+                    .unwrap_or_default();
+                Self::run_command(format!("workspace {workspace} {output}"));
+            }
+            return;
+        }
+        match (self.bar_module_at(surface, x), button) {
                 (Some("audio"), 0x110) => self.show_controls(ControlPanel::Audio, surface, qh),
                 (Some("network"), 0x110) => self.show_controls(ControlPanel::Network, surface, qh),
                 (Some("bluetooth"), 0x110) => {
@@ -3445,21 +4623,7 @@ impl App {
                     self.redraw_all(qh);
                 }
                 _ => {}
-            }
-            return;
         }
-        if button != 0x110 {
-            return;
-        }
-        let output = self
-            .surfaces
-            .iter()
-            .find(|candidate| candidate.layer.wl_surface() == surface)
-            .and_then(|candidate| candidate.output.as_ref())
-            .and_then(|output| self.output_state.info(output))
-            .and_then(|info| info.name)
-            .unwrap_or_default();
-        Self::run_command(format!("workspace {workspace} {output}"));
     }
 
     fn scroll_bar(&self, surface: &wl_surface::WlSurface, x: f64, steps: i32) {
@@ -3510,7 +4674,7 @@ impl App {
                     .contains(&local_y)
                     .then(|| {
                         let mut action_x = notification_text_x(&notification);
-                        notification.actions.iter().find_map(|(key, label)| {
+                        notification.actions.iter().take(4).find_map(|(key, label)| {
                             let width = text_width(
                                 self.font.as_ref(),
                                 label,
@@ -3771,6 +4935,8 @@ impl App {
         };
         match panel {
             ControlPanel::Audio => {
+                // The volume slider track is only 6 px tall; keep the generous
+                // band so it stays easy to grab.
                 if (58.0..=92.0).contains(&y) {
                     let value = ((x - 24.0) / 332.0 * 100.0).round().clamp(0.0, 100.0);
                     Self::change_audio(&[
@@ -3778,50 +4944,52 @@ impl App {
                         "@DEFAULT_SINK@",
                         &format!("{value}%"),
                     ]);
-                } else if (104.0..140.0).contains(&y) {
+                } else if control_button(104).contains(&y) {
                     Self::change_audio(&["set-sink-mute", "@DEFAULT_SINK@", "toggle"]);
-                } else if (152.0..188.0).contains(&y) {
+                } else if control_button(152).contains(&y) {
                     Self::spawn_desktop_tool("pavucontrol");
                 }
             }
             ControlPanel::Network => {
-                if (56.0..92.0).contains(&y) {
+                if control_button(56).contains(&y) {
                     Self::set_networking(!self.network.networking_enabled);
-                } else if (100.0..136.0).contains(&y) {
+                } else if control_button(100).contains(&y) {
                     Self::set_wireless(!self.network.wireless_enabled);
-                } else if (152.0..188.0).contains(&y) {
+                } else if control_button(152).contains(&y) {
                     Self::spawn_desktop_tool("nm-connection-editor");
                 }
             }
             ControlPanel::Bluetooth => {
-                if (56.0..92.0).contains(&y) {
+                if control_button(56).contains(&y) {
                     if let Some(powered) = self.bluetooth.powered {
                         Self::set_bluetooth_powered(!powered);
                     }
-                } else if (100.0..136.0).contains(&y) {
+                } else if control_button(100).contains(&y) {
                     Self::set_bluetooth_discovery(true);
-                } else if (152.0..188.0).contains(&y) {
+                } else if control_button(152).contains(&y) {
                     Self::spawn_desktop_tool("blueman-manager");
                 }
             }
             ControlPanel::Media => {
                 if (60.0..104.0).contains(&y) {
-                    if x < 126.0 {
+                    // Split the transport buttons at the midpoints of their
+                    // gaps: the drawn columns are 18..126, 136..244, 254..362.
+                    if x < 131.0 {
                         Self::change_media("Previous");
-                    } else if x < 252.0 {
+                    } else if x < 249.0 {
                         Self::change_media("PlayPause");
                     } else {
                         Self::change_media("Next");
                     }
-                } else if (116.0..152.0).contains(&y) {
+                } else if control_button(116).contains(&y) {
                     Self::change_media("Stop");
                 }
             }
             ControlPanel::Notifications => {
-                if (56.0..92.0).contains(&y) {
+                if control_button(56).contains(&y) {
                     self.do_not_disturb.fetch_xor(true, Ordering::Relaxed);
                     self.sync_notification_surface(qh);
-                } else if (100.0..136.0).contains(&y) {
+                } else if control_button(100).contains(&y) {
                     for notification in &self.notifications {
                         let _ = self.notification_signals.send(NotificationSignal::Closed {
                             id: notification.id,
@@ -3835,19 +5003,19 @@ impl App {
             }
             ControlPanel::Power => {
                 if let Some(action) = self.pending_power_action {
-                    if (76.0..=110.0).contains(&y) {
+                    if control_button(76).contains(&y) {
                         self.hide_controls(qh);
                         Self::perform_power_action(action);
                         return;
                     }
-                    if (120.0..=154.0).contains(&y) {
+                    if control_button(120).contains(&y) {
                         self.pending_power_action = None;
                     }
-                } else if (56.0..=92.0).contains(&y) {
+                } else if control_button(56).contains(&y) {
                     self.pending_power_action = Some(PowerAction::LogOut);
-                } else if (100.0..=136.0).contains(&y) {
+                } else if control_button(100).contains(&y) {
                     self.pending_power_action = Some(PowerAction::Reboot);
-                } else if (144.0..=180.0).contains(&y) {
+                } else if control_button(144).contains(&y) {
                     self.pending_power_action = Some(PowerAction::Shutdown);
                 }
             }
@@ -3998,26 +5166,17 @@ impl App {
             return;
         }
         let colors = Colors::from_config(&self.config);
-        let title = self
-            .snapshot
-            .focused
-            .and_then(|id| self.snapshot.windows.iter().find(|window| window.id == id))
-            .map(|window| bar_label_text(&window.title, 128))
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| "Luma".into());
-        let active_workspace = self.surfaces[index]
+        let output_name = self.surfaces[index]
             .output
             .as_ref()
             .and_then(|output| self.output_state.info(output))
-            .and_then(|info| info.name)
-            .and_then(|name| {
-                self.snapshot
-                    .outputs
-                    .iter()
-                    .find(|output| output.name == name)
-                    .map(|output| output.workspace)
-            })
+            .and_then(|info| info.name);
+        let active_workspace = output_name
+            .as_deref()
+            .and_then(|name| self.snapshot.outputs.iter().find(|output| output.name == name))
+            .map(|output| output.workspace)
             .unwrap_or(1);
+        let title = visible_bar_title(&self.snapshot, active_workspace, output_name.as_deref());
         let font = self.font.clone();
         let font_size = self.config.theme.font_size;
         let modules = self.config.shell.modules.clone();
@@ -4044,51 +5203,27 @@ impl App {
         let network = modules
             .iter()
             .any(|module| module == "network")
-            .then(|| self.network.label.as_str());
-        let media = modules
-            .iter()
-            .any(|module| module == "media")
-            .then(|| self.media.label.as_str());
+            .then(|| compact_network_bar_label(&self.network.label));
+        let media = (modules.iter().any(|module| module == "media")
+            && self.media.label != "MEDIA —")
+            .then_some("MEDIA");
         let bluetooth = modules
             .iter()
             .any(|module| module == "bluetooth")
             .then(|| self.bluetooth.label.as_str());
-        let tray = modules
-            .iter()
-            .any(|module| module == "tray")
+        let tray = (modules.iter().any(|module| module == "tray")
+            && self.tray.iter().any(TrayItem::has_visible_icon))
             .then(|| format!("TRAY {}", self.tray.len()));
         let notifications = modules
             .iter()
             .any(|module| module == "notifications")
-            .then(|| {
-                if self.do_not_disturb.load(Ordering::Relaxed) {
-                    return "DND".into();
-                }
-                self.notifications.back().map_or_else(
-                    || "NOT 0".into(),
-                    |notification| {
-                        let text = if notification.summary.is_empty() {
-                            &notification.body
-                        } else {
-                            &notification.summary
-                        };
-                        format!("NOT {} · {}", self.notifications.len(), text)
-                    },
-                )
-            });
+            .then(|| self.notifications_bar_label())
+            .flatten();
         let power = modules
             .iter()
             .any(|module| module == "power")
             .then_some("POWER");
-        let recorder = match self.snapshot.recorder.state {
-            RecorderState::Recording | RecorderState::Starting => {
-                Some(format!("REC {}", self.snapshot.recorder.requested_fps))
-            }
-            RecorderState::Paused => Some("REC PAUSED".into()),
-            RecorderState::Replay => Some("REPLAY".into()),
-            RecorderState::Error => Some("REC ERR".into()),
-            RecorderState::Idle => None,
-        };
+        let recorder = self.recorder_bar_label();
         let notification_rows = self
             .notifications
             .iter()
@@ -4131,10 +5266,12 @@ impl App {
         let recorder_capture_note = (kind == SurfaceKind::Recorder)
             .then(|| self.recorder_capture_note())
             .unwrap_or_default();
-        let recorder_can_start = (kind == SurfaceKind::Recorder) && self.recorder_can_start();
+        let recorder_start_blocker = (kind == SurfaceKind::Recorder)
+            .then(|| self.recorder_start_blocker())
+            .flatten();
         let recorder_display_fps = (kind == SurfaceKind::Recorder)
             .then(|| self.recorder_display_fps())
-            .unwrap_or(self.config.recorder.screen_fps);
+            .unwrap_or(self.snapshot.recorder_settings.screen_fps);
         let surface = &mut self.surfaces[index];
         let width = surface.width;
         let height = surface.height;
@@ -4204,13 +5341,18 @@ impl App {
                 self.config.theme.radius.round().clamp(0.0, 100.0) as u32,
                 font.as_ref(),
                 font_size,
-                &self.config,
                 &self.snapshot,
+                &self.snapshot.recorder_settings,
+                self.recorder_view,
+                self.recorder_settings_tab,
+                self.recorder_settings_row,
+                self.recorder_path_edit.as_deref(),
+                self.recorder_feedback.as_ref(),
+                recorder_start_blocker,
                 &recorder_capture_label,
                 recorder_selection_heading,
                 &recorder_selection_label,
                 &recorder_capture_note,
-                recorder_can_start,
                 recorder_display_fps,
             ),
             SurfaceKind::Notifications => draw_notifications(
@@ -4291,6 +5433,17 @@ impl Colors {
             muted: rgba(&config.theme.muted, 1.0),
             radius: config.theme.radius.max(0.0).round() as u32,
         }
+    }
+
+    /// Alpha-scale a premultiplied ARGB color; every channel scales together
+    /// so the result stays valid premultiplied-alpha.
+    fn scaled(color: u32, alpha: f32) -> u32 {
+        let channel = |shift: u32| {
+            (((color >> shift) & 0xff) as f32 * alpha)
+                .round()
+                .min(255.0) as u32
+        };
+        channel(24) << 24 | channel(16) << 16 | channel(8) << 8 | channel(0)
     }
 }
 
@@ -4445,6 +5598,18 @@ fn focused_bar_identity(snapshot: &Snapshot) -> Option<(u64, &str, &str)> {
     })
 }
 
+fn visible_bar_title(snapshot: &Snapshot, workspace: u8, output: Option<&str>) -> String {
+    snapshot
+        .focused
+        .and_then(|id| snapshot.windows.iter().find(|window| window.id == id))
+        .filter(|window| {
+            window.workspace == workspace && output.is_none_or(|name| window.output == name)
+        })
+        .map(|window| bar_label_text(&window.title, 128))
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "Luma".into())
+}
+
 fn battery_state() -> (Option<String>, bool) {
     let Ok(supplies) = std::fs::read_dir("/sys/class/power_supply") else {
         return (None, false);
@@ -4497,123 +5662,212 @@ fn draw_bar(
     power: Option<&str>,
 ) {
     fill(canvas, 0);
-    let margin = 4.min(height.saturating_sub(1) / 2);
-    let panel_height = height.saturating_sub(margin * 2);
-    rounded_rect(
-        canvas,
-        width,
-        margin,
-        margin,
-        width.saturating_sub(margin * 2),
-        panel_height,
-        colors.radius.min(panel_height / 2),
-        colors.background,
-    );
-    rect(
-        canvas,
-        width,
-        margin.saturating_add(colors.radius.min(width / 2)),
-        margin.saturating_add(panel_height.saturating_sub(2)),
-        width.saturating_sub(margin * 2 + colors.radius.min(width / 2) * 2),
-        2,
-        colors.accent,
-    );
-    let y = height.saturating_sub(14) / 2;
+    let island_y = 4.min(height.saturating_sub(1) / 2);
+    let island_h = height.saturating_sub(island_y * 2);
+    let island_radius = colors.radius.min(island_h / 2);
     let has = |name| modules.iter().any(|module| module == name);
-    if has("workspaces") {
-        for workspace in 1..=workspace_count {
-            let x = 12 + (workspace - 1) as u32 * 25;
-            let color = if workspace == active_workspace {
-                colors.accent
-            } else {
-                colors.muted
-            };
-            rounded_rect(canvas, width, x, y, 18, 14, 5, color);
-            digit(canvas, width, x + 6, y + 3, workspace, colors.background);
-        }
-    }
-    let workspace_width = if has("workspaces") {
-        12 + 25 * workspace_count as u32
+    let workspace_end = if has("workspaces") {
+        BAR_WORKSPACE_START + BAR_WORKSPACE_STEP * u32::from(workspace_count)
     } else {
-        12
+        BAR_WORKSPACE_START
     };
+    let left_end = workspace_end.saturating_add(8);
+    panel(
+        canvas,
+        width,
+        4,
+        island_y,
+        left_end.saturating_sub(4),
+        island_h,
+        island_radius,
+        colors,
+    );
+    let logo_y = height.saturating_sub(24) / 2;
+    rounded_rect(canvas, width, 10, logo_y, 26, 24, 8, colors.accent);
     text(
         canvas,
         width,
         font,
-        workspace_width + 12,
-        y + font_size.min(16),
-        "Luma",
-        font_size,
-        colors.accent,
-        54,
+        19,
+        logo_y + 17,
+        "L",
+        14,
+        colors.background | 0xff00_0000,
+        16,
     );
-    let title_x = workspace_width + 82;
-    let right_reserved = 252;
-    let available = width.saturating_sub(title_x + right_reserved) as usize;
-    if has("title") {
-        title_text(
-            canvas,
-            width,
-            title_x,
-            y + font_size.min(16),
-            title,
-            available,
-            colors.foreground,
-            font,
-            font_size,
-        );
-    }
-    let mut right = width.saturating_sub(BAR_RIGHT_INSET);
-    let mut tray_bounds = None;
-    for value in [
-        clock,
-        battery,
-        audio,
-        network,
-        media,
-        bluetooth,
-        tray,
-        notifications,
-        recorder,
-        power,
-    ]
-    .into_iter()
-    .flatten()
-    .rev()
-    {
-        let icon_width = height.saturating_sub(12).clamp(12, 24) + 2;
-        let tray_width = tray_items
-            .iter()
-            .filter(|item| item.has_visible_icon())
-            .take(6)
-            .count() as u32
-            * icon_width
-            + 8;
-        let value_width = text_width(font, value, font_size)
-            .max(if tray == Some(value) { tray_width } else { 0 })
-            .min(right.saturating_sub(12));
-        right = right.saturating_sub(value_width);
-        if tray == Some(value) {
-            tray_bounds = Some((right, value_width));
-        }
-        if tray != Some(value) || !tray_items.iter().any(TrayItem::has_visible_icon) {
+    if has("workspaces") {
+        for workspace in 1..=workspace_count {
+            let x = BAR_WORKSPACE_START + (u32::from(workspace) - 1) * BAR_WORKSPACE_STEP;
+            let active = workspace == active_workspace;
+            rounded_rect(
+                canvas,
+                width,
+                x,
+                height.saturating_sub(22) / 2,
+                22,
+                22,
+                8,
+                if active {
+                    colors.accent
+                } else {
+                    Colors::scaled(colors.muted, 0.16)
+                },
+            );
+            let numeral = workspace.to_string();
+            let numeral_width = text_width(font, &numeral, 12);
+            let numeral_x = x + 11u32.saturating_sub(numeral_width / 2);
             text(
                 canvas,
                 width,
                 font,
-                right,
-                y + font_size.min(16),
-                value,
+                numeral_x,
+                height / 2 + 5,
+                &numeral,
+                12,
+                if active {
+                    colors.background | 0xff00_0000
+                } else {
+                    colors.muted
+                },
+                18,
+            );
+            if active {
+                rect(canvas, width, x + 7, island_y + island_h - 3, 8, 2, colors.accent);
+            }
+        }
+    }
+
+    // Status chips are independently bounded so their painted and clickable
+    // areas agree. This also leaves real transparency between the three bar
+    // islands instead of blurring a full-width opaque strip.
+    let mut values: Vec<(&'static str, String)> = Vec::new();
+    for (module, value) in [
+        ("battery", battery),
+        ("media", media),
+        ("bluetooth", bluetooth),
+        ("tray", tray),
+        ("notifications", notifications),
+        ("network", network),
+        ("audio", audio),
+        ("clock", clock),
+        ("recorder", recorder),
+        ("power", power),
+    ] {
+        if let Some(value) = value {
+            values.push((module, value.to_owned()));
+        }
+    }
+    let tray_count = tray_items
+        .iter()
+        .filter(|item| item.has_visible_icon())
+        .take(6)
+        .count();
+    let module_rects = bar_module_layout(
+        width,
+        height,
+        font,
+        font_size,
+        tray_count,
+        left_end.saturating_add(8),
+        &values,
+    );
+    let right_start = module_rects
+        .iter()
+        .map(|(_, left, _)| *left)
+        .min()
+        .unwrap_or(width.saturating_sub(BAR_RIGHT_INSET));
+
+    if has("title") && !title.is_empty() {
+        let gap_start = left_end.saturating_add(12);
+        let gap_width = right_start.saturating_sub(gap_start + 12);
+        if gap_width >= 120 {
+            let title_w = (text_width(font, title, font_size) + 44)
+                .clamp(160, 560)
+                .min(gap_width);
+            let title_x = gap_start + (gap_width - title_w) / 2;
+            panel(
+                canvas,
+                width,
+                title_x,
+                island_y,
+                title_w,
+                island_h,
+                island_radius,
+                colors,
+            );
+            rounded_rect(
+                canvas,
+                width,
+                title_x + 12,
+                height.saturating_sub(6) / 2,
+                6,
+                6,
+                3,
+                colors.accent,
+            );
+            title_text(
+                canvas,
+                width,
+                title_x + 26,
+                height / 2 + font_size.min(16) / 2,
+                title,
+                title_w.saturating_sub(38) as usize,
+                colors.foreground,
+                font,
                 font_size,
-                colors.muted,
-                value_width,
             );
         }
-        right = right.saturating_sub(16);
     }
-    if let Some((x, _tray_width)) = tray_bounds {
-        draw_tray_icons(canvas, width, height, x, tray_items);
+
+    for (module, left, right) in module_rects {
+        let Some((_, value)) = values.iter().find(|(name, _)| *name == module) else {
+            continue;
+        };
+        let chip_w = right.saturating_sub(left);
+        let active = value == "DND" || value.starts_with("REC") || value == "REPLAY";
+        rounded_rect(
+            canvas,
+            width,
+            left,
+            island_y,
+            chip_w,
+            island_h,
+            island_radius,
+            if active {
+                Colors::scaled(colors.accent, 0.20)
+            } else {
+                colors.background
+            },
+        );
+        rounded_rect_outline(
+            canvas,
+            width,
+            left,
+            island_y,
+            chip_w,
+            island_h,
+            island_radius,
+            Colors::scaled(colors.accent, if active { 0.45 } else { 0.18 }),
+        );
+        if module == "tray" && tray_count > 0 {
+            draw_tray_icons(canvas, width, height, left, tray_items);
+        } else {
+            text(
+                canvas,
+                width,
+                font,
+                left + 10,
+                height / 2 + font_size.min(16) / 2,
+                value,
+                font_size,
+                if active || module == "clock" {
+                    colors.foreground
+                } else {
+                    colors.muted
+                },
+                chip_w.saturating_sub(20),
+            );
+        }
     }
 }
 
@@ -4703,149 +5957,504 @@ fn draw_launcher(
     apps_loaded: bool,
 ) {
     fill(canvas, 0);
-    let panel_w = width.min(680);
-    let panel_h = height.min(420);
-    let x = (width - panel_w) / 2;
-    let y = (height - panel_h) / 2;
+    let [x, y, panel_w, panel_h] = launcher_panel_rect(width, height);
+    panel(canvas, width, x, y, panel_w, panel_h, radius, colors);
+    let kicker_size = font_size.saturating_sub(2).max(11);
+    let title_size = font_size.saturating_add(7).clamp(19, 22);
+    let entry_size = font_size.saturating_add(2).clamp(15, 18);
+    let chip_text_size = font_size.saturating_sub(3).max(10);
+    let meta_size = font_size.saturating_sub(2).max(11);
+    let row_text_size = font_size.saturating_add(3).clamp(15, 18);
+    let hint_size = font_size.saturating_sub(3).max(10);
+    let rendered_width = |value: &str, size: u32| {
+        if font.is_some() {
+            text_width(font, value, size)
+        } else {
+            value.len().saturating_mul(6).min(u32::MAX as usize) as u32
+        }
+    };
+
+    // Keep dynamic labels inside their allocated columns. The cutoff follows
+    // UTF-8 character boundaries, and the small reserve covers glyph bearings.
+    let fit_text = |value: &str, size: u32, max_width: u32| -> String {
+        let available = max_width.saturating_sub(3);
+        if rendered_width(value, size) <= available {
+            return value.to_string();
+        }
+        let ellipsis = "...";
+        let ellipsis_width = rendered_width(ellipsis, size);
+        if ellipsis_width > available {
+            return String::new();
+        }
+        let content_width = available.saturating_sub(ellipsis_width);
+        let Some(font) = font else {
+            let content_bytes = (content_width / 6) as usize;
+            let end_byte = value
+                .char_indices()
+                .map(|(byte_index, character)| byte_index + character.len_utf8())
+                .take_while(|end_byte| *end_byte <= content_bytes)
+                .last()
+                .unwrap_or(0);
+            return format!("{}{}", &value[..end_byte], ellipsis);
+        };
+        let scaled = font.as_scaled(PxScale::from(size.max(8) as f32));
+        let mut measured = 0.0;
+        let mut previous = None;
+        let mut end_byte = 0;
+        for (byte_index, character) in value.char_indices() {
+            let glyph = font.glyph_id(character);
+            let kerning = previous.map_or(0.0, |previous| scaled.kern(previous, glyph));
+            let next = measured + kerning + scaled.h_advance(glyph);
+            if next.ceil() > content_width as f32 {
+                break;
+            }
+            measured = next;
+            previous = Some(glyph);
+            end_byte = byte_index + character.len_utf8();
+        }
+        format!("{}{}", &value[..end_byte], ellipsis)
+    };
+
+    // The panel keeps the configured theme and accent outline, while this
+    // inset pass makes the surface read as a solid command palette over a
+    // bright wallpaper without changing any shell-wide opacity settings.
     rounded_rect(
         canvas,
         width,
-        x,
-        y,
-        panel_w,
-        panel_h,
-        radius,
+        x.saturating_add(1),
+        y.saturating_add(1),
+        panel_w.saturating_sub(2),
+        panel_h.saturating_sub(2),
+        radius.saturating_sub(1),
+        Colors::scaled(colors.background, 0.75),
+    );
+
+    // A small geometric L mark keeps the header recognizable without loading
+    // an icon or adding any work to the launcher's startup path.
+    let mark_x = x + 25;
+    let mark_y = y + 24;
+    rounded_rect(canvas, width, mark_x, mark_y, 28, 28, 8, colors.accent);
+    rect(
+        canvas,
+        width,
+        mark_x + 8,
+        mark_y + 6,
+        3,
+        15,
         colors.background,
-    );
-    text(
-        canvas,
-        width,
-        font,
-        x + 32,
-        y + 34,
-        "Luma",
-        font_size + 4,
-        colors.accent,
-        200,
-    );
-    text(
-        canvas,
-        width,
-        font,
-        x + 32,
-        y + 64,
-        "Launcher",
-        font_size,
-        colors.foreground,
-        300,
     );
     rect(
         canvas,
         width,
-        x + 32,
-        y + 98,
-        panel_w.saturating_sub(64),
-        2,
-        colors.accent,
+        mark_x + 8,
+        mark_y + 18,
+        12,
+        3,
+        colors.background,
     );
+
     text(
         canvas,
         width,
         font,
-        x + 32,
-        y + 126,
-        "SCTK shell",
-        font_size,
+        x + 65,
+        y + 37,
+        "QUICK ACCESS",
+        kicker_size,
         colors.muted,
-        300,
+        panel_w.saturating_sub(200),
     );
+
     text(
         canvas,
         width,
         font,
-        x + 32,
-        y + panel_h.saturating_sub(36),
-        "ESC TO CLOSE",
-        font_size,
-        colors.muted,
-        300,
+        x + 65,
+        y + 61,
+        "Search everything",
+        title_size,
+        colors.foreground,
+        panel_w.saturating_sub(200),
     );
+
+    let shortcut_x = x + panel_w.saturating_sub(132);
+    let shortcut_y = y + 25;
     rounded_rect(
         canvas,
         width,
-        x + 24,
-        y + 156,
-        panel_w.saturating_sub(48),
-        42,
-        8,
-        0x3300_0000,
+        shortcut_x,
+        shortcut_y,
+        106,
+        25,
+        7,
+        Colors::scaled(colors.accent, 0.10),
+    );
+    rounded_rect_outline(
+        canvas,
+        width,
+        shortcut_x,
+        shortcut_y,
+        106,
+        25,
+        7,
+        Colors::scaled(colors.accent, 0.28),
+    );
+    let shortcut_size = font_size.saturating_sub(2).max(10);
+    let shortcut_text = fit_text("SUPER + SPACE", shortcut_size, 88);
+    text(
+        canvas,
+        width,
+        font,
+        shortcut_x + 10,
+        shortcut_y + 16,
+        &shortcut_text,
+        shortcut_size,
+        colors.accent,
+        88,
+    );
+
+    // Search well: the light olive tint provides an inset edge against the
+    // charcoal panel, with a tiny hand-drawn magnifier as its focus marker.
+    let entry_x = x + 24;
+    let entry_y = y + 78;
+    let entry_w = panel_w.saturating_sub(48);
+    let entry_h = 48;
+    rounded_rect(
+        canvas,
+        width,
+        entry_x,
+        entry_y,
+        entry_w,
+        entry_h,
+        11,
+        Colors::scaled(colors.muted, 0.10),
+    );
+    rounded_rect_outline(
+        canvas,
+        width,
+        entry_x,
+        entry_y,
+        entry_w,
+        entry_h,
+        11,
+        Colors::scaled(colors.muted, 0.30),
+    );
+    rounded_rect_outline(
+        canvas,
+        width,
+        entry_x + 17,
+        entry_y + 15,
+        12,
+        12,
+        6,
+        colors.accent,
+    );
+    rect(
+        canvas,
+        width,
+        entry_x + 27,
+        entry_y + 26,
+        6,
+        2,
+        colors.accent,
     );
     let prompt = if query.is_empty() {
-        "> type a command"
+        "Search apps, windows, commands, and power"
     } else {
         query
+    };
+    let baseline = entry_y + 32;
+    let display_query = if query.is_empty() {
+        prompt.to_string()
+    } else {
+        fit_text(query, entry_size, entry_w.saturating_sub(58))
     };
     text(
         canvas,
         width,
         font,
-        x + 40,
-        y + 184,
-        prompt,
-        font_size,
+        entry_x + 42,
+        baseline,
+        &display_query,
+        entry_size,
         if query.is_empty() {
             colors.muted
         } else {
             colors.foreground
         },
-        panel_w.saturating_sub(80),
+        entry_w.saturating_sub(58),
     );
-    if rows.is_empty() {
-        let message = if apps_loaded || !query.is_empty() {
-            "No matching applications"
-        } else {
-            "Loading applications…"
-        };
-        text(
+    if !query.is_empty() {
+        // The launcher redraws on every keypress, so a steady caret needs no
+        // frame loop for blinking.
+        let caret_x = (entry_x + 42 + rendered_width(&display_query, entry_size))
+            .min(entry_x + entry_w.saturating_sub(18));
+        let caret_y = baseline.saturating_sub(18);
+        rect(canvas, width, caret_x, caret_y, 2, 22, colors.accent);
+    }
+
+    // Search modes are discoverable without spending space in the input
+    // placeholder or requiring the user to guess each prefix.
+    let category_y = y + LAUNCHER_CATEGORY_TOP;
+    text(
+        canvas,
+        width,
+        font,
+        x + 24,
+        category_y + 14,
+        &fit_text("SEARCH IN", chip_text_size, 62),
+        chip_text_size,
+        colors.muted,
+        62,
+    );
+    let active_category = launcher_category_for_query(query);
+    for (category, label, chip) in launcher_category_regions(width, height) {
+        let (category_x, category_y, chip_w, chip_h) = (chip[0], chip[1], chip[2], chip[3]);
+        let active = category == active_category;
+        rounded_rect(
             canvas,
             width,
-            font,
-            x + 40,
-            y + 228,
-            message,
-            font_size,
-            colors.muted,
-            panel_w.saturating_sub(80),
+            category_x,
+            category_y,
+            chip_w,
+            chip_h,
+            7,
+            Colors::scaled(
+                if active { colors.accent } else { colors.muted },
+                if active { 0.16 } else { 0.10 },
+            ),
         );
-    }
-    for (index, row) in rows.iter().enumerate() {
-        let row_y = y + 216 + index as u32 * 28;
-        if row_y + 22 > y + panel_h.saturating_sub(52) {
-            break;
-        }
-        if index == selected {
-            rounded_rect(
+        if active {
+            rounded_rect_outline(
                 canvas,
                 width,
-                x + 24,
-                row_y.saturating_sub(16),
-                panel_w.saturating_sub(48),
-                24,
-                6,
-                0x330f_1c33,
+                category_x,
+                category_y,
+                chip_w,
+                chip_h,
+                7,
+                Colors::scaled(colors.accent, 0.32),
             );
         }
         text(
             canvas,
             width,
             font,
+            category_x + 8,
+            category_y + 14,
+            &fit_text(label, chip_text_size, chip_w.saturating_sub(16)),
+            chip_text_size,
+            if active { colors.accent } else { colors.muted },
+            chip_w.saturating_sub(16),
+        );
+    }
+
+    text(
+        canvas,
+        width,
+        font,
+        x + 25,
+        y + 178,
+        "MATCHES",
+        meta_size,
+        colors.accent,
+        160,
+    );
+    let result_count = format!("{} ITEMS", rows.len());
+    let result_count_width = rendered_width(&result_count, meta_size);
+    text(
+        canvas,
+        width,
+        font,
+        x + panel_w.saturating_sub(25 + result_count_width),
+        y + 178,
+        &result_count,
+        meta_size,
+        colors.muted,
+        result_count_width,
+    );
+
+    let list_top = y + LAUNCHER_RESULTS_TOP;
+    if rows.is_empty() {
+        let message = if apps_loaded || !query.is_empty() {
+            "No matching results"
+        } else {
+            "Loading apps…"
+        };
+        let message = fit_text(message, row_text_size, panel_w.saturating_sub(80));
+        text(
+            canvas,
+            width,
+            font,
             x + 40,
-            row_y,
-            row,
-            font_size,
-            colors.foreground,
+            list_top + 29,
+            &message,
+            row_text_size,
+            colors.muted,
             panel_w.saturating_sub(80),
         );
+    }
+    for (index, row) in rows.iter().enumerate() {
+        let Some(row_rect) = launcher_result_row_rect(width, height, index) else {
+            break;
+        };
+        let row_y = row_rect[1];
+        let is_selected = index == selected;
+        if index == selected {
+            rounded_rect(
+                canvas,
+                width,
+                row_rect[0],
+                row_rect[1],
+                row_rect[2],
+                row_rect[3],
+                9,
+                Colors::scaled(colors.accent, 0.14),
+            );
+            rounded_rect(canvas, width, x + 21, row_y + 6, 3, 18, 1, colors.accent);
+        }
+
+        let icon_x = x + 33;
+        let icon_y = row_y + 5;
+        rounded_rect(
+            canvas,
+            width,
+            icon_x,
+            icon_y,
+            20,
+            20,
+            6,
+            Colors::scaled(colors.accent, if is_selected { 0.28 } else { 0.12 }),
+        );
+        if let Some(initial) = row.chars().next() {
+            let monogram = initial.to_uppercase().to_string();
+            let monogram_size = font_size.saturating_add(1).clamp(13, 15);
+            let monogram_width = rendered_width(&monogram, monogram_size);
+            text(
+                canvas,
+                width,
+                font,
+                icon_x + 10u32.saturating_sub(monogram_width / 2),
+                icon_y + 14,
+                &monogram,
+                monogram_size,
+                if is_selected {
+                    colors.accent
+                } else {
+                    colors.muted
+                },
+                18,
+            );
+        }
+
+        let display_row = fit_text(row, row_text_size, panel_w.saturating_sub(148));
+        text(
+            canvas,
+            width,
+            font,
+            x + 64,
+            row_y + 21,
+            &display_row,
+            row_text_size,
+            if is_selected {
+                colors.foreground
+            } else {
+                Colors::scaled(colors.foreground, 0.86)
+            },
+            panel_w.saturating_sub(148),
+        );
+
+        if is_selected {
+            let key_x = x + panel_w.saturating_sub(76);
+            rounded_rect(
+                canvas,
+                width,
+                key_x,
+                row_y + 6,
+                50,
+                18,
+                6,
+                Colors::scaled(colors.accent, 0.11),
+            );
+            text(
+                canvas,
+                width,
+                font,
+                key_x + 8,
+                row_y + 18,
+                "ENTER",
+                hint_size,
+                colors.accent,
+                36,
+            );
+        } else {
+            let ordinal = format!("{:02}", index + 1);
+            let ordinal_width = rendered_width(&ordinal, hint_size);
+            text(
+                canvas,
+                width,
+                font,
+                x + panel_w.saturating_sub(26 + ordinal_width),
+                row_y + 19,
+                &ordinal,
+                hint_size,
+                colors.muted,
+                ordinal_width,
+            );
+        }
+    }
+
+    let divider_y = y + panel_h.saturating_sub(39);
+    rect(
+        canvas,
+        width,
+        x + 24,
+        divider_y,
+        panel_w.saturating_sub(48),
+        1,
+        Colors::scaled(colors.muted, 0.22),
+    );
+    let key_y = y + panel_h.saturating_sub(30);
+    let key_baseline = key_y + 13;
+    let mut hint_x = x + 24;
+    for (key, key_w, label, label_w) in [
+        ("UP/DN", 42, "MOVE", 36),
+        ("ENTER", 44, "OPEN", 34),
+        ("ESC", 32, "CLOSE", 41),
+    ] {
+        rounded_rect(
+            canvas,
+            width,
+            hint_x,
+            key_y,
+            key_w,
+            18,
+            5,
+            Colors::scaled(colors.muted, 0.12),
+        );
+        text(
+            canvas,
+            width,
+            font,
+            hint_x + 6,
+            key_baseline,
+            key,
+            hint_size,
+            colors.foreground,
+            key_w.saturating_sub(12),
+        );
+        text(
+            canvas,
+            width,
+            font,
+            hint_x + key_w + 6,
+            key_baseline,
+            label,
+            hint_size,
+            colors.muted,
+            label_w,
+        );
+        hint_x = hint_x.saturating_add(key_w + label_w + 18);
     }
 }
 
@@ -4857,20 +6466,22 @@ fn draw_recorder(
     radius: u32,
     font: Option<&FontArc>,
     font_size: u32,
-    config: &Config,
     snapshot: &Snapshot,
+    settings: &wm_core::Recorder,
+    view: RecorderView,
+    settings_tab: RecorderSettingsTab,
+    settings_row: usize,
+    path_edit: Option<&str>,
+    feedback: Option<&(String, bool)>,
+    start_blocker: Option<&str>,
     capture_label: &str,
     selection_heading: &str,
     selection_label: &str,
     capture_note: &str,
-    can_start: bool,
     capture_fps: u32,
 ) {
     fill(canvas, 0);
-    let panel_w = width.min(720);
-    let panel_h = height.min(500);
-    let x = (width - panel_w) / 2;
-    let y = (height - panel_h) / 2;
+    let (x, y, panel_w, panel_h) = recorder_panel(width, height);
     rounded_rect(
         canvas,
         width,
@@ -4881,86 +6492,280 @@ fn draw_recorder(
         radius,
         colors.background,
     );
+    // A quiet olive edge gives the recorder the same lifted surface language
+    // as the rest of the shell without adding another backdrop effect.
+    rect(
+        canvas,
+        width,
+        x + radius.min(panel_w / 2),
+        y,
+        panel_w.saturating_sub(radius.min(panel_w / 2) * 2),
+        1,
+        Colors::scaled(colors.muted, 0.16),
+    );
+    match view {
+        RecorderView::Settings => draw_recorder_settings(
+            canvas,
+            width,
+            x,
+            y,
+            panel_w,
+            colors,
+            font,
+            font_size,
+            snapshot,
+            settings,
+            settings_tab,
+            settings_row,
+            path_edit,
+            feedback,
+        ),
+        RecorderView::Controls => draw_recorder_controls(
+            canvas,
+            width,
+            x,
+            y,
+            panel_w,
+            colors,
+            font,
+            font_size,
+            settings,
+            snapshot,
+            start_blocker,
+            capture_label,
+            selection_heading,
+            selection_label,
+            capture_note,
+            capture_fps,
+        ),
+    }
+    text(
+        canvas,
+        width,
+        font,
+        x + panel_w.saturating_sub(180),
+        y + 488,
+        if view == RecorderView::Settings {
+            "Esc  ·  Back"
+        } else {
+            "Esc  ·  Close"
+        },
+        font_size,
+        colors.muted,
+        150,
+    );
+}
+
+fn draw_recorder_controls(
+    canvas: &mut [u8],
+    width: u32,
+    x: u32,
+    y: u32,
+    panel_w: u32,
+    colors: Colors,
+    font: Option<&FontArc>,
+    font_size: u32,
+    settings: &wm_core::Recorder,
+    snapshot: &Snapshot,
+    start_blocker: Option<&str>,
+    capture_label: &str,
+    selection_heading: &str,
+    selection_label: &str,
+    capture_note: &str,
+    capture_fps: u32,
+) {
+    let title_size = font_size.saturating_add(7);
+    let body_size = font_size.saturating_add(3);
+    let label_size = font_size.saturating_add(1);
     text(
         canvas,
         width,
         font,
         x + 32,
-        y + 42,
+        y + 48,
         "Luma Recorder",
-        font_size + 5,
-        colors.accent,
+        title_size,
+        colors.foreground,
         panel_w.saturating_sub(64),
     );
-    let state = format!("STATUS  {:?}", snapshot.recorder.state).to_uppercase();
+    let (state, active) = match snapshot.recorder.state {
+        RecorderState::Idle => ("Ready", false),
+        RecorderState::Starting => ("Starting", true),
+        RecorderState::Recording => ("Recording", true),
+        RecorderState::Paused => ("Paused", true),
+        RecorderState::Replay => ("Saving replay", true),
+        RecorderState::Error => ("Error", false),
+    };
+    rounded_rect(
+        canvas,
+        width,
+        x + 24,
+        y + 60,
+        214,
+        26,
+        8,
+        if active {
+            Colors::scaled(colors.accent, 0.13)
+        } else {
+            Colors::scaled(colors.muted, 0.09)
+        },
+    );
+    rounded_rect(
+        canvas,
+        width,
+        x + 38,
+        y + 69,
+        8,
+        8,
+        4,
+        if active { colors.accent } else { colors.muted },
+    );
     text(
         canvas,
         width,
         font,
-        x + 32,
-        y + 76,
-        &state,
-        font_size,
-        if snapshot.recorder.state == RecorderState::Error {
-            0xffff_7777
-        } else {
-            colors.foreground
-        },
-        panel_w.saturating_sub(64),
+        x + 56,
+        y + 78,
+        "STATUS",
+        font_size.saturating_sub(1).max(10),
+        colors.muted,
+        54,
+    );
+    text(
+        canvas,
+        width,
+        font,
+        x + 114,
+        y + 78,
+        state,
+        font_size.saturating_add(1),
+        if active { colors.accent } else { colors.foreground },
+        112,
     );
     rect(
         canvas,
         width,
         x + 32,
-        y + 94,
+        y + 96,
         panel_w.saturating_sub(64),
-        2,
-        colors.accent,
+        1,
+        Colors::scaled(colors.muted, 0.18),
     );
+    let source = format!("{}  ·  {selection_label}", selection_heading.to_lowercase());
     let lines = [
-        format!("CAPTURE  {capture_label}  [LEFT/RIGHT]"),
-        format!("{selection_heading:<8}{selection_label}  [UP/DOWN]"),
-        format!(
-            "VIDEO    {}x{}  ·  up to {} FPS",
-            config.recorder.output_width, config.recorder.output_height, capture_fps
-        ),
-        format!(
-            "ENCODER  {} / NVENC performance  ·  quality {}",
-            config.recorder.codec.to_uppercase(),
-            config.recorder.quality
-        ),
-        if capture_label != "Screen (low-lag)" {
-            "AUDIO    direct game capture is video-only".into()
-        } else {
+        ("Capture", capture_label.to_string(), Some("← / →")),
+        ("Target", source, Some("↑ / ↓")),
+        (
+            "Video",
             format!(
-                "AUDIO    desktop: {}  ·  mic: {}",
-                config.recorder.desktop_audio, config.recorder.microphone
-            )
-        },
-        capture_note.into(),
-        format!(
-            "LIVE     source {:.1}  ·  encoded {:.1}  ·  dropped {}",
-            snapshot.recorder.source_fps,
-            snapshot.recorder.encoded_fps,
-            snapshot.recorder.dropped_frames
+                "{} × {}  ·  up to {} FPS",
+                settings.output_width, settings.output_height, capture_fps
+            ),
+            None,
+        ),
+        (
+            "Encoder",
+            format!(
+                "{}{}  ·  quality {}",
+                settings.codec.to_uppercase(),
+                if settings.hdr { " Main10 HDR10" } else { "" },
+                settings.quality
+            ),
+            None,
+        ),
+        (
+            "Audio",
+            if capture_label != "Screen (low-lag)" {
+                "Direct game capture is video-only".into()
+            } else {
+                format!(
+                    "Desktop: {}  ·  mic: {}",
+                    settings.desktop_audio, settings.microphone
+                )
+            },
+            None,
+        ),
+        ("Method", capture_note.into(), None),
+        (
+            "Live",
+            format!(
+                "source {:.1}  ·  encoded {:.1}  ·  dropped {}",
+                snapshot.recorder.source_fps,
+                snapshot.recorder.encoded_fps,
+                snapshot.recorder.dropped_frames
+            ),
+            None,
         ),
     ];
-    for (index, line) in lines.iter().enumerate() {
+    for (index, (label, value, hint)) in lines.iter().enumerate() {
+        let row_y = y + 124 + index as u32 * 31;
+        if index < 2 {
+            rounded_rect(
+                canvas,
+                width,
+                x + 24,
+                row_y.saturating_sub(16),
+                panel_w.saturating_sub(48),
+                27,
+                8,
+                Colors::scaled(colors.muted, 0.07),
+            );
+            rect(
+                canvas,
+                width,
+                x + 24,
+                row_y.saturating_sub(10),
+                2,
+                14,
+                Colors::scaled(colors.accent, 0.65),
+            );
+        } else if index == 6 {
+            rounded_rect(
+                canvas,
+                width,
+                x + 24,
+                row_y.saturating_sub(16),
+                panel_w.saturating_sub(48),
+                27,
+                8,
+                Colors::scaled(colors.accent, 0.09),
+            );
+        }
         text(
             canvas,
             width,
             font,
-            x + 32,
-            y + 124 + index as u32 * 31,
-            line,
-            font_size,
-            if index == 6 {
-                colors.foreground
-            } else {
-                colors.muted
-            },
-            panel_w.saturating_sub(64),
+            x + 40,
+            row_y,
+            label,
+            label_size,
+            colors.muted,
+            88,
         );
+        text(
+            canvas,
+            width,
+            font,
+            x + 132,
+            row_y,
+            value,
+            body_size,
+            if index == 5 { colors.muted } else { colors.foreground },
+            panel_w.saturating_sub(196 + if hint.is_some() { 70 } else { 0 }),
+        );
+        if let Some(hint) = hint {
+            text(
+                canvas,
+                width,
+                font,
+                x + panel_w.saturating_sub(88),
+                row_y,
+                hint,
+                font_size,
+                colors.accent,
+                64,
+            );
+        }
     }
     if let Some(error) = snapshot.recorder.error.as_deref() {
         text(
@@ -4970,8 +6775,8 @@ fn draw_recorder(
             x + 32,
             y + 341,
             error,
-            font_size,
-            0xffff_7777,
+            font_size.saturating_add(2),
+            colors.accent,
             panel_w.saturating_sub(64),
         );
     }
@@ -4979,81 +6784,734 @@ fn draw_recorder(
         snapshot.recorder.state,
         RecorderState::Idle | RecorderState::Error
     );
-    rounded_rect(
+    // OBS-style controls dock: settings + start/stop on one row, pause and
+    // replay save beneath. The rectangles come from
+    // `recorder_control_button_rects` so pointer hitboxes cannot drift from
+    // the drawn pixels.
+    let buttons = recorder_control_button_rects(panel_w);
+    for (rect, hit) in &buttons {
+        let rect = (x + rect[0], y + rect[1], rect[2], rect[3]);
+        match hit {
+            RecorderHit::Settings => {
+                rounded_rect(
+                    canvas,
+                    width,
+                    rect.0,
+                    rect.1,
+                    rect.2,
+                    rect.3,
+                    8,
+                    Colors::scaled(colors.muted, 0.12),
+                );
+                text(
+                    canvas,
+                    width,
+                    font,
+                    rect.0 + 16,
+                    rect.1 + 27,
+                    "Settings  [Tab]",
+                    font_size.saturating_add(2),
+                    colors.foreground,
+                    rect.2.saturating_sub(24),
+                );
+            }
+            RecorderHit::StartStop => {
+                let blocked = !running && start_blocker.is_some();
+                rounded_rect(
+                    canvas,
+                    width,
+                    rect.0,
+                    rect.1,
+                    rect.2,
+                    rect.3,
+                    8,
+                    if blocked {
+                        Colors::scaled(colors.muted, 0.24)
+                    } else {
+                        colors.accent
+                    },
+                );
+                let label = if running {
+                    "Stop recording  [Enter]"
+                } else if let Some(blocker) = start_blocker {
+                    blocker
+                } else if capture_label == "Xwayland Zero-Copy" {
+                    "Start Xwayland capture  [Enter]"
+                } else if capture_label == "OpenGL API Inject" {
+                    "Inject into running game  [Enter]"
+                } else if capture_label == "OpenGL Launch Profile" {
+                    "Start OpenGL game capture  [Enter]"
+                } else if capture_label == "Vulkan API Layer" {
+                    "Start Vulkan game capture  [Enter]"
+                } else {
+                    "Start recording  [Enter]"
+                };
+                text(
+                    canvas,
+                    width,
+                    font,
+                    rect.0 + 20,
+                    rect.1 + 27,
+                    label,
+                    font_size.saturating_add(2),
+                    if blocked { colors.muted } else { colors.background },
+                    rect.2.saturating_sub(40),
+                );
+            }
+            RecorderHit::Pause => {
+                let paused = snapshot.recorder.state == RecorderState::Paused;
+                rounded_rect(
+                    canvas,
+                    width,
+                    rect.0,
+                    rect.1,
+                    rect.2,
+                    rect.3,
+                    8,
+                    if running {
+                        Colors::scaled(colors.accent, 0.22)
+                    } else {
+                        Colors::scaled(colors.muted, 0.12)
+                    },
+                );
+                text(
+                    canvas,
+                    width,
+                    font,
+                    rect.0 + 16,
+                    rect.1 + 25,
+                    if paused {
+                        "Resume  [Space]"
+                    } else {
+                        "Pause  [Space]"
+                    },
+                    font_size.saturating_add(2),
+                    if running {
+                        colors.foreground
+                    } else {
+                        Colors::scaled(colors.muted, 0.55)
+                    },
+                    rect.2.saturating_sub(24),
+                );
+            }
+            RecorderHit::ReplaySave => {
+                rounded_rect(
+                    canvas,
+                    width,
+                    rect.0,
+                    rect.1,
+                    rect.2,
+                    rect.3,
+                    8,
+                    if running {
+                        Colors::scaled(colors.accent, 0.22)
+                    } else {
+                        Colors::scaled(colors.muted, 0.12)
+                    },
+                );
+                text(
+                    canvas,
+                    width,
+                    font,
+                    rect.0 + 16,
+                    rect.1 + 25,
+                    "Save replay  [F8]",
+                    font_size.saturating_add(2),
+                    if running {
+                        colors.foreground
+                    } else {
+                        Colors::scaled(colors.muted, 0.55)
+                    },
+                    rect.2.saturating_sub(24),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recorder panel rectangle shared by every recorder view. The panel stays
+/// panel-sized so the compositor's backdrop blur confines to one region, as
+/// with the launcher.
+fn recorder_panel(width: u32, height: u32) -> (u32, u32, u32, u32) {
+    let panel_w = width.min(720);
+    let panel_h = height.min(500);
+    let x = (width - panel_w) / 2;
+    let y = (height - panel_h) / 2;
+    (x, y, panel_w, panel_h)
+}
+
+/// Transport-button rectangles on the Controls page, relative to the panel
+/// origin. Shared by `draw_recorder_controls` and the pointer hit test.
+fn recorder_control_button_rects(panel_w: u32) -> Vec<([u32; 4], RecorderHit)> {
+    let settings_w = 150;
+    let start_x = 24 + settings_w + 8;
+    let half = (panel_w - 56) / 2;
+    vec![
+        ([24, 370, settings_w, 42], RecorderHit::Settings),
+        (
+            [
+                start_x,
+                370,
+                panel_w.saturating_sub(start_x + 24),
+                42,
+            ],
+            RecorderHit::StartStop,
+        ),
+        ([24, 420, half, 38], RecorderHit::Pause),
+        (
+            [
+                24 + half + 8,
+                420,
+                panel_w.saturating_sub(24 + half + 8 + 24),
+                38,
+            ],
+            RecorderHit::ReplaySave,
+        ),
+    ]
+}
+
+fn recorder_settings_tab_rect(index: usize) -> [u32; 4] {
+    [24, 104 + index as u32 * 46, 196, 42]
+}
+
+fn recorder_settings_reset_rect() -> [u32; 4] {
+    [24, 420, 196, 40]
+}
+
+fn recorder_settings_close_rect(panel_w: u32) -> [u32; 4] {
+    [panel_w.saturating_sub(56), 26, 30, 30]
+}
+
+fn recorder_settings_row_rect(index: usize, panel_w: u32) -> [u32; 4] {
+    let content_x = 244u32;
+    [
+        content_x,
+        104 + index as u32 * 52,
+        panel_w.saturating_sub(content_x + 24),
+        46,
+    ]
+}
+
+/// Dec/value/inc widget rectangles inside a row, right-aligned. Shared by the
+/// renderer and the hit test.
+fn recorder_settings_widget_rects(row: [u32; 4]) -> ([u32; 4], [u32; 4], [u32; 4]) {
+    let widget_w = 240u32;
+    let wx = row[0] + row[2].saturating_sub(widget_w);
+    let wy = row[1] + (row[3].saturating_sub(34)) / 2;
+    (
+        [wx, wy, 34, 34],
+        [wx + 42, wy, widget_w.saturating_sub(84), 34],
+        [wx + widget_w.saturating_sub(34), wy, 34, 34],
+    )
+}
+
+fn draw_recorder_settings(
+    canvas: &mut [u8],
+    width: u32,
+    x: u32,
+    y: u32,
+    panel_w: u32,
+    colors: Colors,
+    font: Option<&FontArc>,
+    font_size: u32,
+    snapshot: &Snapshot,
+    settings: &wm_core::Recorder,
+    tab: RecorderSettingsTab,
+    selected_row: usize,
+    path_edit: Option<&str>,
+    feedback: Option<&(String, bool)>,
+) {
+    let title_size = font_size.saturating_add(7);
+    text(
         canvas,
         width,
-        x + 24,
-        y + 370,
-        panel_w.saturating_sub(48),
-        42,
-        8,
-        colors.accent,
+        font,
+        x + 32,
+        y + 46,
+        "Recorder Settings",
+        title_size,
+        colors.foreground,
+        320,
     );
     text(
         canvas,
         width,
         font,
-        x + 44,
-        y + 397,
-        if running {
-            "STOP RECORDING  [ENTER]"
-        } else if !matches!(capture_label, "Screen (low-lag)" | "Xwayland Zero-Copy")
-            && config.recorder.codec != "h264"
-        {
-            "DIRECT API CAPTURE REQUIRES H.264"
-        } else if !can_start {
-            if capture_label == "OpenGL API Inject" {
-                "NO RUNNING OPENGL PROCESS FOUND"
+        x + 244,
+        y + 74,
+        tab.label(),
+        font_size.saturating_add(1),
+        colors.accent,
+        300,
+    );
+    let close = recorder_settings_close_rect(panel_w);
+    rounded_rect(
+        canvas,
+        width,
+        x + close[0],
+        y + close[1],
+        close[2],
+        close[3],
+        8,
+        Colors::scaled(colors.muted, 0.10),
+    );
+    text(
+        canvas,
+        width,
+        font,
+        x + close[0] + 10,
+        y + close[1] + 22,
+        "×",
+        font_size.saturating_add(2),
+        colors.foreground,
+        close[2].saturating_sub(12),
+    );
+    rect(
+        canvas,
+        width,
+        x + 24,
+        y + 86,
+        panel_w.saturating_sub(48),
+        1,
+        Colors::scaled(colors.muted, 0.18),
+    );
+    rect(
+        canvas,
+        width,
+        x + 24,
+        y + 85,
+        44,
+        2,
+        Colors::scaled(colors.accent, 0.72),
+    );
+    let rows = recorder_settings_rows(settings, tab);
+    // The quiet category rail keeps the current section easy to spot without
+    // turning every tab into a gold pill.
+    for (index, category) in RecorderSettingsTab::ALL.iter().enumerate() {
+        let rect = recorder_settings_tab_rect(index);
+        let selected = *category == tab;
+        rounded_rect(
+            canvas,
+            width,
+            x + rect[0],
+            y + rect[1],
+            rect[2],
+            rect[3],
+            8,
+            if selected {
+                Colors::scaled(colors.accent, 0.13)
             } else {
-                "NO MATCHING API PROFILE CONFIGURED"
-            }
-        } else if capture_label == "Xwayland Zero-Copy" {
-            "START XWAYLAND CAPTURE  [ENTER]"
-        } else if capture_label == "OpenGL API Inject" {
-            "INJECT INTO RUNNING GAME  [ENTER]"
-        } else if capture_label == "OpenGL Launch Profile" {
-            "START OPENGL GAME CAPTURE  [ENTER]"
-        } else if capture_label == "Vulkan API Layer" {
-            "START VULKAN GAME CAPTURE  [ENTER]"
-        } else {
-            "START RECORDING  [ENTER]"
+                Colors::scaled(colors.muted, 0.055)
+            },
+        );
+        if selected {
+            rounded_rect(
+                canvas,
+                width,
+                x + rect[0],
+                y + rect[1] + 10,
+                3,
+                22,
+                2,
+                colors.accent,
+            );
+        }
+        text(
+            canvas,
+            width,
+            font,
+            x + rect[0] + 16,
+            y + rect[1] + 27,
+            category.label(),
+            font_size.saturating_add(2),
+            if selected { colors.foreground } else { colors.muted },
+            rect[2].saturating_sub(24),
+        );
+    }
+    text(
+        canvas,
+        width,
+        font,
+        x + 24,
+        y + 330,
+        match tab {
+            RecorderSettingsTab::Output => "Codec, quality & folder",
+            RecorderSettingsTab::Capture => "Screen, window, or game",
+            RecorderSettingsTab::Video => "Output size and frame rate",
+            RecorderSettingsTab::Audio => "Desktop and mic mix",
+            RecorderSettingsTab::Replay => "Instant replay buffer limits",
         },
         font_size,
-        colors.background,
-        panel_w.saturating_sub(88),
+        Colors::scaled(colors.muted, 0.75),
+        196,
     );
+    let reset = recorder_settings_reset_rect();
     rounded_rect(
         canvas,
         width,
-        x + 24,
-        y + 420,
-        panel_w.saturating_sub(48),
-        38,
+        x + reset[0],
+        y + reset[1],
+        reset[2],
+        reset[3],
         8,
-        0x3300_0000,
+        Colors::scaled(colors.muted, 0.12),
     );
     text(
         canvas,
         width,
         font,
-        x + 44,
-        y + 445,
-        "INSTANT REPLAY COMING LATER  ·  DIRECT API CAPTURE IS EXPERIMENTAL",
-        font_size,
-        colors.foreground,
-        panel_w.saturating_sub(88),
+        x + reset[0] + 16,
+        y + reset[1] + 25,
+        "Restore defaults",
+        font_size.saturating_add(2),
+        colors.accent,
+        reset[2].saturating_sub(24),
     );
-    text(
+    draw_recorder_settings_rows(
         canvas,
         width,
+        x,
+        y,
+        panel_w,
+        colors,
         font,
-        x + panel_w.saturating_sub(180),
-        y + 488,
-        "ESC TO CLOSE",
-        font_size,
-        colors.muted,
-        150,
+        font_size.saturating_add(2),
+        snapshot,
+        &rows,
+        selected_row, path_edit, feedback,
     );
+}
+
+fn draw_recorder_settings_rows(
+    canvas: &mut [u8],
+    width: u32,
+    x: u32,
+    y: u32,
+    panel_w: u32,
+    colors: Colors,
+    font: Option<&FontArc>,
+    font_size: u32,
+    snapshot: &Snapshot,
+    rows: &[RecorderRowDisplay],
+    selected_row: usize,
+    path_edit: Option<&str>,
+    feedback: Option<&(String, bool)>,
+) {
+    for (index, row) in rows.iter().enumerate() {
+        let row_rect = recorder_settings_row_rect(index, panel_w);
+        let selected = index == selected_row;
+        rounded_rect(
+            canvas,
+            width,
+            x + row_rect[0],
+            y + row_rect[1],
+            row_rect[2],
+            row_rect[3],
+            8,
+            if selected {
+                Colors::scaled(colors.accent, 0.14)
+            } else {
+                Colors::scaled(colors.muted, 0.055)
+            },
+        );
+        if selected {
+            rect(
+                canvas,
+                width,
+                x + row_rect[0],
+                y + row_rect[1] + 11,
+                3,
+                24,
+                colors.accent,
+            );
+        }
+        text(
+            canvas,
+            width,
+            font,
+            x + row_rect[0] + 14,
+            y + row_rect[1] + 29,
+            row.label,
+            font_size,
+            if selected {
+                colors.accent
+            } else if row.kind == RecorderRowKind::Info {
+                Colors::scaled(colors.muted, 0.65)
+            } else {
+                colors.foreground
+            },
+            row_rect[2].saturating_sub(260),
+        );
+        draw_recorder_settings_widget(
+            canvas, width, x, y, colors, font, font_size, row, selected, path_edit, row_rect,
+        );
+    }
+    draw_recorder_settings_footer(
+        canvas, width, x, y, panel_w, colors, font, font_size, snapshot, feedback,
+    );
+}
+
+fn draw_recorder_settings_widget(
+    canvas: &mut [u8],
+    width: u32,
+    x: u32,
+    y: u32,
+    colors: Colors,
+    font: Option<&FontArc>,
+    font_size: u32,
+    row: &RecorderRowDisplay,
+    selected: bool,
+    path_edit: Option<&str>,
+    rect: [u32; 4],
+) {
+    match row.kind {
+        RecorderRowKind::Cycle | RecorderRowKind::Step => {
+            let (dec, value, inc) = recorder_settings_widget_rects(rect);
+            for (widget, label) in [(dec, "<"), (inc, ">")] {
+                rounded_rect(
+                    canvas,
+                    width,
+                    x + widget[0],
+                    y + widget[1],
+                    widget[2],
+                    widget[3],
+                    8,
+                    if selected {
+                        Colors::scaled(colors.accent, 0.18)
+                    } else {
+                        Colors::scaled(colors.muted, 0.09)
+                    },
+                );
+                text(
+                    canvas,
+                    width,
+                    font,
+                    x + widget[0] + 13,
+                    y + widget[1] + 23,
+                    label,
+                    font_size,
+                    colors.foreground,
+                    widget[2].saturating_sub(8),
+                );
+            }
+            rounded_rect(
+                canvas,
+                width,
+                x + value[0],
+                y + value[1],
+                value[2],
+                value[3],
+                8,
+                Colors::scaled(colors.background, 0.35),
+            );
+            let value_text = path_edit.unwrap_or(&row.value).to_string();
+            text(
+                canvas,
+                width,
+                font,
+                x + value[0] + 8,
+                y + value[1] + 23,
+                &value_text,
+                font_size,
+                if selected { colors.accent } else { colors.foreground },
+                value[2].saturating_sub(8),
+            );
+        }
+        RecorderRowKind::Toggle => {
+            let (_, value, _) = recorder_settings_widget_rects(rect);
+            let on = row.value == "On";
+            rounded_rect(
+                canvas,
+                width,
+                x + value[0],
+                y + value[1],
+                110,
+                value[3],
+                8,
+                if on {
+                    Colors::scaled(colors.accent, 0.16)
+                } else {
+                    Colors::scaled(colors.muted, 0.09)
+                },
+            );
+            text(
+                canvas,
+                width,
+                font,
+                x + value[0] + 12,
+                y + value[1] + 23,
+                &row.value,
+                font_size,
+                if on { colors.accent } else { colors.muted },
+                56,
+            );
+            rounded_rect(
+                canvas,
+                width,
+                x + value[0] + 88,
+                y + value[1] + 11,
+                12,
+                12,
+                6,
+                if on {
+                    colors.accent
+                } else {
+                    Colors::scaled(colors.muted, 0.52)
+                },
+            );
+        }
+        RecorderRowKind::Path | RecorderRowKind::Identity => {
+            let (field, value, _) = recorder_settings_widget_rects(rect);
+            let field_width = value[0] + value[2] - field[0];
+            let editing = selected && path_edit.is_some();
+            let buffer = path_edit.unwrap_or(&row.value).to_string();
+            let shown = if editing {
+                format!("{buffer}_")
+            } else {
+                buffer
+            };
+            rounded_rect(
+                canvas,
+                width,
+                x + field[0],
+                y + field[1],
+                field_width,
+                field[3],
+                8,
+                Colors::scaled(colors.background, 0.35),
+            );
+            if editing {
+                rounded_rect_outline(
+                    canvas,
+                    width,
+                    x + field[0],
+                    y + field[1],
+                    field_width,
+                    field[3],
+                    8,
+                    Colors::scaled(colors.accent, 0.62),
+                );
+            }
+            text(
+                canvas,
+                width,
+                font,
+                x + field[0] + 8,
+                y + field[1] + 23,
+                &shown,
+                font_size,
+                if editing { colors.accent } else { colors.foreground },
+                field_width.saturating_sub(16),
+            );
+        }
+        RecorderRowKind::Action => {
+            let action = [
+                rect[0] + rect[2].saturating_sub(240),
+                rect[1] + 6,
+                240,
+                34,
+            ];
+            rounded_rect(
+                canvas,
+                width,
+                x + action[0],
+                y + action[1],
+                action[2],
+                action[3],
+                8,
+                if selected {
+                    Colors::scaled(colors.accent, 0.17)
+                } else {
+                    Colors::scaled(colors.muted, 0.09)
+                },
+            );
+            text(
+                canvas,
+                width,
+                font,
+                x + action[0] + 12,
+                y + action[1] + 23,
+                &row.value,
+                font_size,
+                if selected { colors.accent } else { colors.foreground },
+                action[2].saturating_sub(24),
+            );
+        }
+        RecorderRowKind::Info => {
+            text(
+                canvas,
+                width,
+                font,
+                x + rect[0] + rect[2].saturating_sub(250),
+                y + rect[1] + 29,
+                &row.value,
+                font_size,
+                Colors::scaled(colors.muted, 0.65),
+                240,
+            );
+        }
+    }
+}
+
+fn draw_recorder_settings_footer(
+    canvas: &mut [u8],
+    width: u32,
+    x: u32,
+    y: u32,
+    panel_w: u32,
+    colors: Colors,
+    font: Option<&FontArc>,
+    font_size: u32,
+    snapshot: &Snapshot,
+    feedback: Option<&(String, bool)>,
+) {
+    let running = !matches!(
+        snapshot.recorder.state,
+        RecorderState::Idle | RecorderState::Error
+    );
+    if let Some((message, error)) = feedback {
+        let shown = if *error {
+            format!("Error  ·  {message}")
+        } else {
+            message.clone()
+        };
+        text(
+            canvas,
+            width,
+            font,
+            x + 244,
+            y + 448,
+            &shown,
+            font_size,
+            if *error { colors.foreground } else { colors.accent },
+            panel_w.saturating_sub(280),
+        );
+    } else if running {
+        text(
+            canvas,
+            width,
+            font,
+            x + 244,
+            y + 448,
+            "Changes apply to the next recording",
+            font_size,
+            colors.muted,
+            panel_w.saturating_sub(280),
+        );
+    } else {
+        text(
+            canvas,
+            width,
+            font,
+            x + 244,
+            y + 448,
+            "Settings persist across restarts  ·  ← / → edits",
+            font_size,
+            colors.muted,
+            panel_w.saturating_sub(280),
+        );
+    }
 }
 
 fn draw_notifications(
@@ -5070,57 +7528,184 @@ fn draw_notifications(
 ) {
     fill(canvas, 0);
     let panel_height = (rows.len().max(1) as u32 * 88 + 18).min(height);
-    rounded_rect(
+    panel(
         canvas,
         width,
         0,
         0,
         width,
         panel_height,
-        14,
-        colors.background,
+        colors.radius.min(panel_height / 2).min(width / 2),
+        colors,
     );
+    let card_radius = colors.radius.clamp(10, 18);
+    let state_size = font_size.saturating_add(2).clamp(16, 20);
+    let title_size = font_size.saturating_add(3).clamp(16, 20);
+    let body_size = font_size.saturating_add(1).clamp(14, 18);
     if muted && !rows.iter().any(|notification| notification.critical) {
+        rounded_rect(
+            canvas,
+            width,
+            14,
+            32,
+            width.saturating_sub(28),
+            44,
+            card_radius,
+            Colors::scaled(colors.muted, 0.12),
+        );
+        rounded_rect_outline(
+            canvas,
+            width,
+            14,
+            32,
+            width.saturating_sub(28),
+            44,
+            card_radius,
+            Colors::scaled(colors.muted, 0.24),
+        );
+        rounded_rect(
+            canvas,
+            width,
+            26,
+            50,
+            8,
+            8,
+            4,
+            Colors::scaled(colors.accent, 0.18),
+        );
+        rounded_rect_outline(canvas, width, 26, 50, 8, 8, 4, colors.accent);
         text(
             canvas,
             width,
             font,
-            18,
+            46,
             54,
             "Do Not Disturb is on",
-            font_size,
-            colors.muted,
+            state_size,
+            colors.foreground,
             width.saturating_sub(36),
         );
         return;
     }
     if rows.is_empty() {
+        rounded_rect(
+            canvas,
+            width,
+            14,
+            32,
+            width.saturating_sub(28),
+            44,
+            card_radius,
+            Colors::scaled(colors.muted, 0.12),
+        );
+        rounded_rect_outline(
+            canvas,
+            width,
+            14,
+            32,
+            width.saturating_sub(28),
+            44,
+            card_radius,
+            Colors::scaled(colors.muted, 0.24),
+        );
+        rounded_rect(
+            canvas,
+            width,
+            26,
+            50,
+            8,
+            8,
+            4,
+            Colors::scaled(colors.accent, 0.18),
+        );
+        rounded_rect_outline(canvas, width, 26, 50, 8, 8, 4, colors.accent);
         text(
             canvas,
             width,
             font,
-            18,
-            34,
+            46,
+            54,
             "No notifications",
-            font_size,
-            colors.muted,
+            state_size,
+            colors.foreground,
             width.saturating_sub(36),
         );
         return;
     }
+    rounded_rect(
+        canvas,
+        width,
+        12,
+        4,
+        width.saturating_sub(24),
+        24,
+        12,
+        Colors::scaled(colors.muted, 0.07),
+    );
+    rounded_rect_outline(
+        canvas,
+        width,
+        12,
+        4,
+        width.saturating_sub(24),
+        24,
+        12,
+        Colors::scaled(colors.muted, 0.2),
+    );
+    rounded_rect(canvas, width, 18, 13, 7, 7, 4, colors.accent);
     text(
         canvas,
         width,
         font,
-        18,
-        20,
+        30,
+        21,
         &format!("Notifications {}/{}", offset + 1, total),
-        font_size.saturating_sub(2).max(9),
-        colors.muted,
+        state_size,
+        colors.foreground,
         width.saturating_sub(36),
     );
     for (index, notification) in rows.iter().enumerate() {
         let y = 40 + index as u32 * 88;
+        let card_y = y.saturating_sub(12);
+        rounded_rect(
+            canvas,
+            width,
+            10,
+            card_y,
+            width.saturating_sub(20),
+            76,
+            card_radius,
+            Colors::scaled(colors.muted, 0.12),
+        );
+        rounded_rect_outline(
+            canvas,
+            width,
+            10,
+            card_y,
+            width.saturating_sub(20),
+            76,
+            card_radius,
+            Colors::scaled(
+                if notification.critical {
+                    colors.accent
+                } else {
+                    colors.muted
+                },
+                if notification.critical { 0.4 } else { 0.25 },
+            ),
+        );
+        if notification.critical {
+            rounded_rect(
+                canvas,
+                width,
+                14,
+                card_y + 10,
+                3,
+                56,
+                2,
+                colors.accent,
+            );
+        }
         let text_x = notification_text_x(notification);
         if let Some(icon) = notification.icon.as_ref() {
             draw_icon(canvas, width, 18, y.saturating_sub(14), 32, icon);
@@ -5130,10 +7715,14 @@ fn draw_notifications(
             width,
             font,
             text_x,
-            y,
+            y + 4,
             &notification.summary,
-            font_size,
-            colors.foreground,
+            title_size,
+            if notification.critical {
+                colors.accent
+            } else {
+                colors.foreground
+            },
             width.saturating_sub(text_x + 18),
         );
         text(
@@ -5141,9 +7730,9 @@ fn draw_notifications(
             width,
             font,
             text_x,
-            y + 22,
+            y + 26,
             &notification.body,
-            font_size.saturating_sub(2).max(9),
+            body_size,
             colors.muted,
             width.saturating_sub(text_x + 18),
         );
@@ -5157,8 +7746,18 @@ fn draw_notifications(
                 y + 31,
                 action_width,
                 18,
-                5,
-                0x331b_1d21,
+                9,
+                Colors::scaled(colors.accent, 0.12),
+            );
+            rounded_rect_outline(
+                canvas,
+                width,
+                action_x,
+                y + 31,
+                action_width,
+                18,
+                9,
+                Colors::scaled(colors.accent, 0.3),
             );
             text(
                 canvas,
@@ -5168,21 +7767,10 @@ fn draw_notifications(
                 y + 44,
                 label,
                 font_size.saturating_sub(2).max(9),
-                colors.foreground,
+                colors.accent,
                 action_width.saturating_sub(12),
             );
             action_x = action_x.saturating_add(action_width + 12);
-        }
-        if index + 1 < rows.len() {
-            rect(
-                canvas,
-                width,
-                18,
-                y + 60,
-                width.saturating_sub(36),
-                1,
-                0x331b_1d21,
-            );
         }
     }
 }
@@ -5194,7 +7782,7 @@ fn draw_controls(
     colors: Colors,
     font: Option<&FontArc>,
     font_size: u32,
-    panel: Option<ControlPanel>,
+    panel_kind: Option<ControlPanel>,
     pending_power_action: Option<PowerAction>,
     audio: &AudioState,
     network: &NetworkState,
@@ -5204,11 +7792,21 @@ fn draw_controls(
     notification_count: usize,
 ) {
     fill(canvas, 0);
-    let Some(panel) = panel else {
+    panel(
+        canvas,
+        width,
+        0,
+        0,
+        width,
+        height,
+        colors.radius.min(height / 2).min(width / 2),
+        colors,
+    );
+    let Some(panel) = panel_kind else {
         return;
     };
-    rounded_rect(canvas, width, 0, 0, width, height, 14, colors.background);
     let content_width = width.saturating_sub(48);
+    let control_radius = colors.radius.clamp(8, 16);
     let heading = match panel {
         ControlPanel::Audio => "Audio",
         ControlPanel::Network => "Network & Wi-Fi",
@@ -5217,66 +7815,130 @@ fn draw_controls(
         ControlPanel::Notifications => "Notifications",
         ControlPanel::Power => "Session",
     };
+    rounded_rect(
+        canvas,
+        width,
+        14,
+        12,
+        width.saturating_sub(28),
+        30,
+        control_radius,
+        Colors::scaled(colors.muted, 0.055),
+    );
+    rounded_rect_outline(
+        canvas,
+        width,
+        14,
+        12,
+        width.saturating_sub(28),
+        30,
+        control_radius,
+        Colors::scaled(colors.muted, 0.15),
+    );
+    rounded_rect(
+        canvas,
+        width,
+        19,
+        21,
+        6,
+        6,
+        3,
+        Colors::scaled(colors.accent, 0.18),
+    );
+    rounded_rect_outline(canvas, width, 19, 21, 6, 6, 3, colors.accent);
     text(
         canvas,
         width,
         font,
-        24,
+        32,
         30,
         heading,
         font_size + 2,
         colors.foreground,
         content_width,
     );
-    let button = |canvas: &mut [u8], y: u32, label: &str, active: bool| {
+    let status_line = |canvas: &mut [u8], label: &str| {
         rounded_rect(
             canvas,
             width,
-            18,
-            y,
-            width.saturating_sub(36),
-            34,
-            7,
-            if active { colors.accent } else { 0x331b_1d21 },
+            24,
+            46,
+            5,
+            5,
+            3,
+            colors.accent,
         );
         text(
             canvas,
             width,
             font,
-            30,
+            36,
+            52,
+            label,
+            font_size,
+            colors.muted,
+            width.saturating_sub(60),
+        );
+    };
+    let button = |canvas: &mut [u8], y: u32, label: &str, active: bool| {
+        let row_width = width.saturating_sub(36);
+        rounded_rect(
+            canvas,
+            width,
+            18,
+            y,
+            row_width,
+            34,
+            control_radius,
+            if active {
+                Colors::scaled(colors.accent, 0.16)
+            } else {
+                Colors::scaled(colors.muted, 0.075)
+            },
+        );
+        rounded_rect_outline(
+            canvas,
+            width,
+            18,
+            y,
+            row_width,
+            34,
+            control_radius,
+            Colors::scaled(
+                if active { colors.accent } else { colors.muted },
+                if active { 0.38 } else { 0.2 },
+            ),
+        );
+        rounded_rect(
+            canvas,
+            width,
+            23,
+            y + 13,
+            4,
+            8,
+            2,
+            if active {
+                colors.accent
+            } else {
+                Colors::scaled(colors.muted, 0.55)
+            },
+        );
+        text(
+            canvas,
+            width,
+            font,
+            34,
             y + 22,
             label,
             font_size,
-            if active {
-                colors.background
-            } else {
-                colors.foreground
-            },
-            width.saturating_sub(60),
+            if active { colors.accent } else { colors.foreground },
+            width.saturating_sub(66),
         );
     };
     match panel {
         ControlPanel::Audio => {
-            text(
-                canvas,
-                width,
-                font,
-                24,
-                52,
-                &audio.label,
-                font_size,
-                colors.muted,
-                content_width,
-            );
-            rect(
-                canvas,
-                width,
-                24,
-                72,
-                width.saturating_sub(48),
-                6,
-                0x551b_1d21,
-            );
+            status_line(canvas, &audio.label);
+            let trough_width = width.saturating_sub(48);
             let volume = audio
                 .label
                 .strip_prefix("VOL ")
@@ -5284,30 +7946,61 @@ fn draw_controls(
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(0)
                 .min(100);
-            rect(
+            // A shallow material track keeps this native scale easy to read
+            // without adding a compositor effect or a second render pass.
+            rounded_rect(
+                canvas,
+                width,
+                24,
+                67,
+                trough_width,
+                15,
+                7,
+                Colors::scaled(colors.muted, 0.07),
+            );
+            rounded_rect_outline(
+                canvas,
+                width,
+                24,
+                67,
+                trough_width,
+                15,
+                7,
+                Colors::scaled(colors.muted, 0.16),
+            );
+            rounded_rect(
                 canvas,
                 width,
                 24,
                 72,
-                width.saturating_sub(48) * volume / 100,
-                6,
-                colors.accent,
+                trough_width,
+                4,
+                2,
+                Colors::scaled(colors.muted, 0.25),
             );
+            let highlight_width = trough_width * volume / 100;
+            if highlight_width > 0 {
+                rounded_rect(canvas, width, 24, 72, highlight_width, 4, 2, colors.accent);
+            }
+            let knob_x = (24 + highlight_width)
+                .saturating_sub(6)
+                .clamp(24, 24 + trough_width.saturating_sub(12));
+            rounded_rect(
+                canvas,
+                width,
+                knob_x.saturating_sub(2),
+                67,
+                16,
+                16,
+                8,
+                Colors::scaled(colors.accent, 0.24),
+            );
+            rounded_rect(canvas, width, knob_x, 69, 12, 12, 6, colors.accent);
             button(canvas, 104, "Mute / unmute", audio.label == "MUTED");
             button(canvas, 152, "Sound settings…", false);
         }
         ControlPanel::Network => {
-            text(
-                canvas,
-                width,
-                font,
-                24,
-                52,
-                &network.label,
-                font_size,
-                colors.muted,
-                content_width,
-            );
+            status_line(canvas, &network.label);
             button(
                 canvas,
                 56,
@@ -5331,17 +8024,7 @@ fn draw_controls(
             button(canvas, 152, "Connection settings…", false);
         }
         ControlPanel::Bluetooth => {
-            text(
-                canvas,
-                width,
-                font,
-                24,
-                52,
-                &bluetooth.label,
-                font_size,
-                colors.muted,
-                content_width,
-            );
+            status_line(canvas, &bluetooth.label);
             button(
                 canvas,
                 56,
@@ -5356,19 +8039,28 @@ fn draw_controls(
             button(canvas, 152, "Bluetooth settings…", false);
         }
         ControlPanel::Media => {
-            text(
-                canvas,
-                width,
-                font,
-                24,
-                52,
-                &media.label,
-                font_size,
-                colors.muted,
-                content_width,
-            );
+            status_line(canvas, &media.label);
             for (x, label) in [(18, "Previous"), (136, "Play / pause"), (254, "Next")] {
-                rounded_rect(canvas, width, x, 60, 108, 44, 7, 0x331b_1d21);
+                rounded_rect(
+                    canvas,
+                    width,
+                    x,
+                    60,
+                    108,
+                    44,
+                    control_radius,
+                    Colors::scaled(colors.muted, 0.075),
+                );
+                rounded_rect_outline(
+                    canvas,
+                    width,
+                    x,
+                    60,
+                    108,
+                    44,
+                    control_radius,
+                    Colors::scaled(colors.muted, 0.22),
+                );
                 text(
                     canvas,
                     width,
@@ -5440,6 +8132,26 @@ fn draw_controls(
             }
         }
     }
+    rounded_rect(
+        canvas,
+        width,
+        14,
+        height.saturating_sub(31),
+        width.saturating_sub(28),
+        24,
+        control_radius,
+        Colors::scaled(colors.muted, 0.055),
+    );
+    rounded_rect_outline(
+        canvas,
+        width,
+        14,
+        height.saturating_sub(31),
+        width.saturating_sub(28),
+        24,
+        control_radius,
+        Colors::scaled(colors.muted, 0.14),
+    );
     text(
         canvas,
         width,
@@ -5466,10 +8178,40 @@ fn draw_tray_menu(
     let Some(menu) = menu else {
         return;
     };
-    rounded_rect(canvas, width, 0, 0, width, height, 10, colors.background);
+    panel(
+        canvas,
+        width,
+        0,
+        0,
+        width,
+        height,
+        colors.radius.min(height / 2).min(width / 2),
+        colors,
+    );
     const ROW_HEIGHT: u32 = 28;
+    let row_radius = colors.radius.clamp(7, 14);
     let mut row_index = 0u32;
     if menu.parents.len() > 1 {
+        rounded_rect(
+            canvas,
+            width,
+            8,
+            2,
+            width.saturating_sub(16),
+            24,
+            row_radius,
+            Colors::scaled(colors.accent, 0.14),
+        );
+        rounded_rect_outline(
+            canvas,
+            width,
+            8,
+            2,
+            width.saturating_sub(16),
+            24,
+            row_radius,
+            Colors::scaled(colors.accent, 0.32),
+        );
         text(
             canvas,
             width,
@@ -5478,7 +8220,7 @@ fn draw_tray_menu(
             20,
             "‹ Back",
             font_size,
-            colors.foreground,
+            colors.accent,
             width.saturating_sub(28),
         );
         row_index += 1;
@@ -5496,13 +8238,59 @@ fn draw_tray_menu(
                 top + ROW_HEIGHT / 2,
                 width.saturating_sub(24),
                 1,
-                colors.muted,
+                Colors::scaled(colors.muted, 0.25),
             );
         } else {
-            let color = if row.enabled {
-                colors.foreground
+            let selected = row.toggle_state == Some(1);
+            let row_color = if selected {
+                colors.accent
             } else {
                 colors.muted
+            };
+            rounded_rect(
+                canvas,
+                width,
+                8,
+                top + 2,
+                width.saturating_sub(16),
+                ROW_HEIGHT - 4,
+                row_radius,
+                Colors::scaled(
+                    row_color,
+                    if selected {
+                        0.14
+                    } else if row.enabled {
+                        0.055
+                    } else {
+                        0.025
+                    },
+                ),
+            );
+            rounded_rect_outline(
+                canvas,
+                width,
+                8,
+                top + 2,
+                width.saturating_sub(16),
+                ROW_HEIGHT - 4,
+                row_radius,
+                Colors::scaled(
+                    row_color,
+                    if selected {
+                        0.32
+                    } else if row.enabled {
+                        0.14
+                    } else {
+                        0.08
+                    },
+                ),
+            );
+            let color = if !row.enabled {
+                Colors::scaled(colors.muted, 0.55)
+            } else if selected {
+                colors.accent
+            } else {
+                colors.foreground
             };
             let marker = match row.toggle_state {
                 Some(1) => "✓ ",
@@ -5594,6 +8382,69 @@ fn rounded_rect(
     }
 }
 
+/// Shared native panel treatment: theme background with a quiet muted edge.
+/// The accent is reserved for selection, recording, and direct actions.
+fn panel(
+    canvas: &mut [u8],
+    width: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    radius: u32,
+    colors: Colors,
+) {
+    rounded_rect(canvas, width, x, y, w, h, radius, colors.background);
+    rounded_rect_outline(
+        canvas,
+        width,
+        x,
+        y,
+        w,
+        h,
+        radius,
+        Colors::scaled(colors.muted, 0.28),
+    );
+}
+
+/// One-pixel antialiased rounded-rectangle stroke centered on the given
+/// geometry, used for panel borders.
+fn rounded_rect_outline(
+    canvas: &mut [u8],
+    width: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    radius: u32,
+    color: u32,
+) {
+    let height = (canvas.len() / 4 / width as usize) as u32;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let radius = radius.min(w / 2).min(h / 2);
+    let center_x = w as f32 / 2.0;
+    let center_y = h as f32 / 2.0;
+    let inner_x = center_x - radius as f32;
+    let inner_y = center_y - radius as f32;
+    for py in y.min(height)..y.saturating_add(h).min(height) {
+        for px in x.min(width)..x.saturating_add(w).min(width) {
+            let qx = (px.saturating_sub(x) as f32 + 0.5 - center_x).abs() - inner_x;
+            let qy = (py.saturating_sub(y) as f32 + 0.5 - center_y).abs() - inner_y;
+            // Signed distance to the rounded-rect boundary: zero on the edge,
+            // negative inside, positive outside.
+            let distance = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0)
+                - radius as f32;
+            let coverage = ((1.0 - distance.abs()) * 255.0).round().clamp(0.0, 255.0) as u8;
+            if coverage != 0 {
+                let index = ((py * width + px) * 4) as usize;
+                blend_premultiplied_pixel(canvas, index, color, coverage);
+            }
+        }
+    }
+}
+
 fn paint_premultiplied_pixel(canvas: &mut [u8], index: usize, color: u32, coverage: u8) {
     if coverage == u8::MAX && color >> 24 == 0xff {
         canvas[index..index + 4].copy_from_slice(&color.to_le_bytes());
@@ -5615,33 +8466,6 @@ fn blend_premultiplied_pixel(canvas: &mut [u8], index: usize, color: u32, covera
         | blend(color & 0xff, destination & 0xff).min(255)
         | (alpha + ((destination >> 24) & 0xff) * inverse_alpha / 255).min(255) << 24;
     canvas[index..index + 4].copy_from_slice(&output.to_le_bytes());
-}
-
-const DIGIT_SEGMENTS: [u8; 10] = [
-    0b0111111, 0b0000110, 0b1011011, 0b1001111, 0b1100110, 0b1101101, 0b1111101, 0b0000111,
-    0b1111111, 0b1101111,
-];
-
-fn digit_segments(value: u8) -> u8 {
-    DIGIT_SEGMENTS[value.clamp(1, 9) as usize]
-}
-
-fn digit(canvas: &mut [u8], width: u32, x: u32, y: u32, value: u8, color: u32) {
-    let segments = digit_segments(value);
-    let lines = [
-        (1, 0, 4, 1),
-        (5, 1, 1, 4),
-        (5, 6, 1, 4),
-        (1, 10, 4, 1),
-        (0, 6, 1, 4),
-        (0, 1, 1, 4),
-        (1, 5, 4, 1),
-    ];
-    for (index, (dx, dy, w, h)) in lines.into_iter().enumerate() {
-        if segments & (1 << index) != 0 {
-            rect(canvas, width, x + dx, y + dy, w, h, color);
-        }
-    }
 }
 
 fn text(
@@ -5682,23 +8506,53 @@ fn text_width(font: Option<&FontArc>, value: &str, size: u32) -> u32 {
     width.ceil().max(0.0) as u32
 }
 
-fn right_module_at(
+/// Layout of the right-side bar chips, shared by drawing and hit testing.
+/// Rectangles are ordered right to left. Long dynamic labels are clipped so
+/// notifications and media titles cannot consume the entire bar.
+fn bar_module_layout(
     width: u32,
+    height: u32,
     font: Option<&FontArc>,
     font_size: u32,
+    tray_count: usize,
+    left_guard: u32,
     values: &[(&'static str, String)],
-    x: f64,
-) -> Option<&'static str> {
+) -> Vec<(&'static str, u32, u32)> {
+    let icon_width = height.saturating_sub(12).clamp(12, 24) + 2;
+    let tray_width = tray_count as u32 * icon_width + 8;
     let mut right = width.saturating_sub(BAR_RIGHT_INSET);
+    let mut rects = Vec::with_capacity(values.len());
     for (module, value) in values.iter().rev() {
-        let value_width = text_width(font, value, font_size).min(right.saturating_sub(12));
-        let left = right.saturating_sub(value_width);
-        if x >= left as f64 && x <= right as f64 {
-            return Some(*module);
+        let max_content = match *module {
+            "notifications" => 180,
+            "media" => 140,
+            "tray" => tray_width.max(40),
+            _ => 110,
+        };
+        let content_width = text_width(font, value, font_size)
+            .max(if *module == "tray" { tray_width } else { 0 })
+            .min(max_content);
+        let chip_width = content_width
+            .saturating_add(20)
+            .min(right.saturating_sub(left_guard));
+        if chip_width < 24 {
+            break;
         }
-        right = left.saturating_sub(16);
+        let left = right.saturating_sub(chip_width);
+        rects.push((*module, left, right));
+        if left <= left_guard {
+            break;
+        }
+        right = left.saturating_sub(6);
     }
-    None
+    rects
+}
+
+/// Hit range of a control-panel button row. The buttons are drawn 34 px tall;
+/// the hit range must cover exactly those pixels.
+fn control_button(y: u32) -> std::ops::RangeInclusive<f64> {
+    let start = f64::from(y);
+    start..=(start + 34.0)
 }
 
 fn draw_text(
@@ -5758,26 +8612,110 @@ fn blend(canvas: &mut [u8], width: u32, x: i32, y: i32, color: u32, coverage: f3
 }
 
 fn word(canvas: &mut [u8], width: u32, mut x: u32, y: u32, text: &str, color: u32) {
-    for ch in text.bytes() {
-        if ch == b' ' {
+    for ch in text.chars() {
+        if ch == ' ' {
             x += 6;
-        } else {
-            glyph(canvas, width, x, y, ch, color);
-            x += 6;
+            continue;
         }
+        if ch == '…' {
+            for offset in [0, 2, 4] {
+                glyph(canvas, width, x + offset, y, b'.', color);
+            }
+            x += 6;
+            continue;
+        }
+        let fallback = match ch {
+            '–' | '—' | '−' => b'-',
+            '‘' | '’' => b'\'',
+            '“' | '”' => b'"',
+            '·' | '•' => b'.',
+            '×' => b'x',
+            '←' | '≤' => b'<',
+            '→' | '≥' => b'>',
+            _ if ch.is_ascii() => ch as u8,
+            _ => b'?',
+        };
+        glyph(canvas, width, x, y, fallback, color);
+        x += 6;
     }
 }
 
 fn glyph(canvas: &mut [u8], width: u32, x: u32, y: u32, ch: u8, color: u32) {
     let rows = match ch.to_ascii_uppercase() {
+        b'!' => [
+            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100,
+        ],
+        b'"' => [
+            0b01010, 0b01010, 0b01010, 0b00000, 0b00000, 0b00000, 0b00000,
+        ],
+        b'#' => [
+            0b01010, 0b11111, 0b01010, 0b01010, 0b11111, 0b01010, 0b01010,
+        ],
+        b'$' => [
+            0b00100, 0b01111, 0b10100, 0b01110, 0b00101, 0b11110, 0b00100,
+        ],
+        b'%' => [
+            0b11001, 0b11010, 0b00100, 0b01000, 0b10110, 0b00110, 0b00000,
+        ],
+        b'&' => [
+            0b01100, 0b10010, 0b10100, 0b01000, 0b10101, 0b10010, 0b01101,
+        ],
+        b'\'' => [
+            0b00100, 0b00100, 0b00010, 0b00000, 0b00000, 0b00000, 0b00000,
+        ],
+        b'(' => [
+            0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010,
+        ],
+        b')' => [
+            0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000,
+        ],
+        b'*' => [
+            0b00000, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0b00000,
+        ],
+        b'+' => [
+            0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000,
+        ],
+        b',' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00100, 0b01000,
+        ],
+        b'-' => [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        b'.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110,
+        ],
+        b'/' => [
+            0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000,
+        ],
         b'A' => [
             0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        b'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
         ],
         b'C' => [
             0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
         ],
+        b'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
         b'E' => [
             0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        b'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        b'G' => [
+            0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+        ],
+        b'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        b'I' => [
+            0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        b'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
         ],
         b'K' => [
             0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
@@ -5788,8 +8726,17 @@ fn glyph(canvas: &mut [u8], width: u32, x: u32, y: u32, ch: u8, color: u32) {
         b'M' => [
             0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
         ],
+        b'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
         b'O' => [
             0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        b'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        b'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
         ],
         b'R' => [
             0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
@@ -5803,6 +8750,102 @@ fn glyph(canvas: &mut [u8], width: u32, x: u32, y: u32, ch: u8, color: u32) {
         b'U' => [
             0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
         ],
+        b'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        b'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
+        ],
+        b'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        b'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        b'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        b'0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        b'1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        b'2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        b'3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        b'4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        b'5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        b'6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        b'7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        b'8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        b'9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        b':' => [
+            0b00000, 0b00110, 0b00110, 0b00000, 0b00110, 0b00110, 0b00000,
+        ],
+        b';' => [
+            0b00000, 0b00110, 0b00110, 0b00000, 0b00110, 0b00100, 0b01000,
+        ],
+        b'<' => [
+            0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010,
+        ],
+        b'=' => [
+            0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        b'>' => [
+            0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000,
+        ],
+        b'?' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100,
+        ],
+        b'@' => [
+            0b01110, 0b10001, 0b10111, 0b10101, 0b10111, 0b10000, 0b01110,
+        ],
+        b'[' => [
+            0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110,
+        ],
+        b'\\' => [
+            0b10000, 0b01000, 0b01000, 0b00100, 0b00010, 0b00010, 0b00001,
+        ],
+        b']' => [
+            0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110,
+        ],
+        b'^' => [
+            0b00000, 0b00100, 0b01010, 0b10001, 0b00000, 0b00000, 0b00000,
+        ],
+        b'_' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111,
+        ],
+        b'`' => [
+            0b01000, 0b00100, 0b00010, 0b00000, 0b00000, 0b00000, 0b00000,
+        ],
+        b'{' => [
+            0b00010, 0b00100, 0b00100, 0b01000, 0b00100, 0b00100, 0b00010,
+        ],
+        b'|' => [
+            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        b'}' => [
+            0b01000, 0b00100, 0b00100, 0b00010, 0b00100, 0b00100, 0b01000,
+        ],
+        b'~' => [
+            0b00000, 0b00000, 0b01001, 0b10110, 0b00000, 0b00000, 0b00000,
+        ],
         _ => [0, 0, 0, 0, 0, 0, 0],
     };
     for (row, bits) in rows.into_iter().enumerate() {
@@ -5813,7 +8856,6 @@ fn glyph(canvas: &mut [u8], width: u32, x: u32, y: u32, ch: u8, color: u32) {
         }
     }
 }
-
 fn title_text(
     canvas: &mut [u8],
     width: u32,
@@ -6050,12 +9092,90 @@ impl KeyboardHandler for App {
         _: u32,
         event: KeyEvent,
     ) {
-        if event.keysym == Keysym::Escape {
-            self.exit = true;
-            return;
-        }
         if self.mode == Mode::Recorder {
+            if event.keysym == Keysym::Escape {
+                if self.recorder_view == RecorderView::Settings {
+                    // First Escape cancels a path edit, then leaves Settings;
+                    // only on the Controls page does it close the panel.
+                    if self.recorder_path_edit.take().is_none() {
+                        self.recorder_view = RecorderView::Controls;
+                    }
+                    self.redraw_all(qh);
+                    return;
+                }
+                self.exit = true;
+                return;
+            }
+            if self.recorder_view == RecorderView::Settings {
+                match event.keysym {
+                    Keysym::Tab => {
+                        self.recorder_settings_tab = self.recorder_settings_tab.cycle(true);
+                        self.recorder_settings_row = self
+                            .recorder_settings_row
+                            .min(self.recorder_settings_row_count().saturating_sub(1));
+                        self.recorder_path_edit = None;
+                    }
+                    Keysym::Up => {
+                        self.recorder_settings_row = self.recorder_settings_row.saturating_sub(1);
+                        self.recorder_path_edit = None;
+                    }
+                    Keysym::Down => {
+                        self.recorder_settings_row = self
+                            .recorder_settings_row
+                            .saturating_add(1)
+                            .min(self.recorder_settings_row_count().saturating_sub(1));
+                        self.recorder_path_edit = None;
+                    }
+                    Keysym::Left => self.apply_recorder_adjustment(-1),
+                    Keysym::Right => self.apply_recorder_adjustment(1),
+                    Keysym::Return => {
+                        if self.recorder_identity_editing() {
+                            self.commit_recorder_text_edit();
+                        } else {
+                            match self.recorder_editable_row_kind() {
+                                Some(RecorderRowKind::Path) => {
+                                    let directory = self
+                                        .snapshot
+                                        .recorder_settings
+                                        .output_directory
+                                        .clone();
+                                    self.recorder_path_edit = Some(directory);
+                                }
+                                Some(RecorderRowKind::Identity) => {
+                                    self.recorder_path_edit =
+                                        Some(self.recorder_identity_edit_seed());
+                                }
+                                Some(RecorderRowKind::Action) => {
+                                    self.remember_current_recorder_source();
+                                }
+                                _ => self.apply_recorder_adjustment(1),
+                            }
+                        }
+                    }
+                    Keysym::BackSpace => {
+                        if let Some(buffer) = self.recorder_path_edit.as_mut() {
+                            buffer.pop();
+                        }
+                    }
+                    Keysym::space => {}
+                    _ => {
+                        if let (Some(buffer), Some(text)) =
+                            (self.recorder_path_edit.as_mut(), event.utf8.as_ref())
+                        {
+                            buffer.push_str(text);
+                        }
+                    }
+                }
+                self.redraw_all(qh);
+                return;
+            }
             match event.keysym {
+                Keysym::Tab => {
+                    self.recorder_view = RecorderView::Settings;
+                    self.recorder_settings_row = self
+                        .recorder_settings_row
+                        .min(self.recorder_settings_row_count().saturating_sub(1));
+                }
                 Keysym::Return => {
                     if self.snapshot.recorder.state != RecorderState::Idle
                         && self.snapshot.recorder.state != RecorderState::Error
@@ -6082,6 +9202,10 @@ impl KeyboardHandler for App {
                 _ => {}
             }
             self.redraw_all(qh);
+            return;
+        }
+        if event.keysym == Keysym::Escape {
+            self.exit = true;
             return;
         }
         if self.mode != Mode::Launcher {
@@ -6178,26 +9302,15 @@ impl PointerHandler for App {
                         self.click_controls(event.position.0, event.position.1, button, qh);
                     }
                     Some(SurfaceKind::Recorder) if button == 0x110 => {
-                        let y = event.position.1;
-                        let command = if y >= 370.0 && y < 420.0 {
-                            if self.snapshot.recorder.state == RecorderState::Idle
-                                || self.snapshot.recorder.state == RecorderState::Error
-                            {
-                                self.recorder_can_start()
-                                    .then(|| self.recorder_start_command())
-                                    .flatten()
-                            } else {
-                                Some("recorder stop".into())
-                            }
-                        } else if y >= 420.0 {
-                            None
-                        } else {
-                            None
-                        };
-                        if let Some(command) = command {
-                            Self::run_command(command);
-                            self.exit = true;
+                        let hit = self.recorder_hit_at(event.position.0, event.position.1);
+                        if !self.activate_recorder_hit(hit) {
+                            self.redraw_all(qh);
                         }
+                    }
+                    Some(SurfaceKind::Launcher)
+                        if self.mode == Mode::Launcher && button == 0x110 =>
+                    {
+                        self.click_launcher(event.position.0, event.position.1, qh);
                     }
                     _ => {}
                 }
@@ -6260,6 +9373,293 @@ impl ProvidesRegistryState for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_font_draws_visible_ascii_glyphs() {
+        for ch in b'!'..=b'~' {
+            let mut canvas = vec![0; 5 * 7 * 4];
+            glyph(&mut canvas, 5, 0, 0, ch, 0xffff_ffff);
+            assert!(
+                canvas.chunks_exact(4).any(|pixel| pixel[3] != 0),
+                "fallback glyph {:?} should contain pixels",
+                ch as char
+            );
+        }
+    }
+
+    #[test]
+    fn recorder_settings_rows_cover_every_editable_field_per_tab() {
+        let settings = wm_core::Recorder::default();
+        let output = recorder_settings_rows(&settings, RecorderSettingsTab::Output);
+        assert_eq!(output.len(), 6);
+        assert_eq!(output[5].kind, RecorderRowKind::Path);
+        assert_eq!(recorder_settings_rows(&settings, RecorderSettingsTab::Capture).len(), 4);
+        assert_eq!(recorder_settings_rows(&settings, RecorderSettingsTab::Video).len(), 5);
+        assert_eq!(recorder_settings_rows(&settings, RecorderSettingsTab::Audio).len(), 3);
+        assert_eq!(recorder_settings_rows(&settings, RecorderSettingsTab::Replay).len(), 3);
+
+        // The Capture tab remembers text identity, never session-local IDs.
+        let mut remembered = wm_core::Recorder::default();
+        remembered.capture_mode = "xwayland".into();
+        remembered.window_app_id = "Minecraft".into();
+        let capture = recorder_settings_rows(&remembered, RecorderSettingsTab::Capture);
+        assert_eq!(capture[0].value, "Xwayland window");
+        assert_eq!(capture[1].value, "Minecraft");
+        assert_eq!(capture[1].kind, RecorderRowKind::Identity);
+        assert_eq!(capture[2].kind, RecorderRowKind::Action);
+        assert_eq!(capture[3].kind, RecorderRowKind::Info);
+
+        let window = wm_core::WindowInfo {
+            id: 7,
+            x11_window: None,
+            title: "Minecraft 1.21".into(),
+            app_id: "minecraft-launcher".into(),
+            workspace: 1,
+            output: "DP-1".into(),
+            floating: false,
+            fullscreen: false,
+            scratchpad: false,
+            geometry: None,
+            opacity: 1.0,
+            surface_size: None,
+        };
+        assert!(window_matches_settings(&window, &remembered));
+        let mut other = remembered.clone();
+        other.window_app_id = "firefox".into();
+        assert!(!window_matches_settings(&window, &other));
+    }
+
+    #[test]
+    fn recorder_setting_adjustments_stay_inside_compositor_limits() {
+        let mut settings = wm_core::Recorder::default();
+        assert_eq!(settings.quality, 20);
+
+        let commands = adjust_recorder_setting(
+            &settings,
+            RecorderSettingsTab::Output,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(commands, vec![("quality".to_string(), "21".to_string())]);
+
+        // The stepper clamps instead of wrapping past the compositor limits.
+        settings.quality = 51;
+        let commands = adjust_recorder_setting(
+            &settings,
+            RecorderSettingsTab::Output,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(commands, vec![("quality".to_string(), "51".to_string())]);
+
+        // Informational rows and the path row do not adjust with Left/Right.
+        assert!(
+            adjust_recorder_setting(&settings, RecorderSettingsTab::Output, 4, 1)
+                .unwrap_err()
+                .contains("container")
+        );
+        assert!(
+            adjust_recorder_setting(&settings, RecorderSettingsTab::Output, 5, 1)
+                .unwrap_err()
+                .contains("Enter")
+        );
+
+        // HDR on forces HEVC; switching back to H.264 drops HDR first.
+        settings.codec = "hevc".into();
+        settings.hdr = true;
+        let commands = adjust_recorder_setting(
+            &settings,
+            RecorderSettingsTab::Output,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            commands,
+            vec![
+                ("hdr".to_string(), "false".to_string()),
+                ("codec".to_string(), "h264".to_string())
+            ]
+        );
+
+        // FPS stepping clamps at the engine range.
+        settings.screen_fps = 480;
+        let commands = adjust_recorder_setting(
+            &settings,
+            RecorderSettingsTab::Video,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            commands,
+            vec![("screen_fps".to_string(), "480".to_string())]
+        );
+        let commands = adjust_recorder_setting(
+            &settings,
+            RecorderSettingsTab::Video,
+            0,
+            -1,
+        )
+        .unwrap();
+        assert_eq!(
+            commands,
+            vec![("screen_fps".to_string(), "450".to_string())]
+        );
+
+        // Audio sources cycle between disabled and the default device.
+        let commands = adjust_recorder_setting(
+            &settings,
+            RecorderSettingsTab::Audio,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            commands,
+            vec![("desktop_audio".to_string(), "disabled".to_string())]
+        );
+
+        // The recording method cycles through the stable mode list.
+        let commands = adjust_recorder_setting(
+            &settings,
+            RecorderSettingsTab::Capture,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            commands,
+            vec![("capture_mode".to_string(), "xwayland".to_string())]
+        );
+        assert!(
+            adjust_recorder_setting(&settings, RecorderSettingsTab::Capture, 1, 1)
+                .unwrap_err()
+                .contains("Enter")
+        );
+    }
+
+    #[test]
+    fn recorder_start_blocker_matches_each_method_and_encoder_limit() {
+        let mut settings = wm_core::Recorder::default();
+        assert_eq!(settings.codec, "h264");
+
+        // Screen capture accepts either encoder.
+        assert_eq!(
+            recorder_start_blocker_for(RecorderCaptureMode::Screen, &settings, false, false, 0, false),
+            None
+        );
+
+        // Regression: Xwayland capture is not H.264-only, so the shipped HEVC
+        // default must not block it (it previously reported a bogus
+        // "no matching API profile configured").
+        settings.codec = "hevc".into();
+        assert_eq!(
+            recorder_start_blocker_for(
+                RecorderCaptureMode::XwaylandDirect,
+                &settings,
+                true,
+                false,
+                0,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            recorder_start_blocker_for(
+                RecorderCaptureMode::XwaylandDirect,
+                &settings,
+                false,
+                false,
+                0,
+                false
+            ),
+            Some("NO XWAYLAND WINDOW OPEN")
+        );
+
+        // Direct graphics-API paths always encode their own H.264 SDR stream,
+        // so an HDR/HEVC screen configuration cannot block their launch.
+        assert_eq!(
+            recorder_start_blocker_for(
+                RecorderCaptureMode::OpenGlInject,
+                &settings,
+                false,
+                true,
+                0,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            recorder_start_blocker_for(
+                RecorderCaptureMode::OpenGlGame,
+                &settings,
+                false,
+                false,
+                1,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            recorder_start_blocker_for(
+                RecorderCaptureMode::VulkanGame,
+                &settings,
+                false,
+                false,
+                0,
+                false
+            ),
+            Some("NO MATCHING API PROFILE CONFIGURED")
+        );
+
+        // A real selection makes every direct method startable.
+        for (mode, has_target, profiles, has_profile) in [
+            (RecorderCaptureMode::OpenGlInject, true, 0, false),
+            (RecorderCaptureMode::OpenGlGame, false, 1, true),
+            (RecorderCaptureMode::VulkanGame, false, 2, true),
+        ] {
+            assert_eq!(
+                recorder_start_blocker_for(mode, &settings, true, has_target, profiles, has_profile),
+                None,
+                "{mode:?}"
+            );
+        }
+
+        // A disabled recorder is called out before any method detail.
+        settings.enabled = false;
+        assert_eq!(
+            recorder_start_blocker_for(
+                RecorderCaptureMode::Screen,
+                &settings,
+                true,
+                true,
+                1,
+                true
+            ),
+            Some("RECORDER DISABLED IN SETTINGS")
+        );
+    }
+
+    #[test]
+    fn recorder_panel_and_hit_geometry_stay_panel_sized() {
+        let (x, y, panel_w, panel_h) = recorder_panel(1920, 1080);
+        assert_eq!((x, y, panel_w, panel_h), (600, 290, 720, 500));
+        let buttons = recorder_control_button_rects(panel_w);
+        assert_eq!(buttons.len(), 4);
+        for (rect, _) in &buttons {
+            assert!(rect[0] + rect[2] <= panel_w - 24, "button escapes panel");
+        }
+        // The last Output row (6 rows) still clears the footer strip.
+        let last_row = recorder_settings_row_rect(5, panel_w);
+        assert!(last_row[1] + last_row[3] <= 448 - 4);
+        // Five category tabs stay stacked above the reset button.
+        let last_tab = recorder_settings_tab_rect(RecorderSettingsTab::ALL.len() - 1);
+        let reset = recorder_settings_reset_rect();
+        assert!(last_tab[1] + last_tab[3] <= reset[1]);
+    }
 
     #[test]
     fn recorder_capture_modes_cycle_without_treating_game_capture_as_screen_capture() {
@@ -6498,6 +9898,9 @@ mod tests {
             wallpaper_visible: true,
             active: true,
         });
+        assert_eq!(visible_bar_title(&previous, 1, Some("TEST-1")), "Terminal");
+        assert_eq!(visible_bar_title(&previous, 2, Some("TEST-1")), "Luma");
+        assert_eq!(visible_bar_title(&previous, 1, Some("OTHER")), "Luma");
         let mut animated = previous.clone();
         animated.windows[0].geometry.as_mut().unwrap().x = 64;
         animated.windows[0].opacity = 0.5;
@@ -6521,13 +9924,286 @@ mod tests {
         ];
         // The renderer reverses this list: clock is nearest the right group edge,
         // then media, then audio. Keep hit-testing aligned with those pixels.
-        assert_eq!(
-            right_module_at(200, None, 12, &values, 140.0),
-            Some("clock")
+        let rects = bar_module_layout(200, 24, None, 12, 0, 0, &values);
+        let module_at = |x: f64| {
+            rects
+                .iter()
+                .find(|(_, left, right)| x >= f64::from(*left) && x <= f64::from(*right))
+                .map(|(module, _, _)| *module)
+        };
+        assert_eq!(module_at(150.0), Some("clock"));
+        assert_eq!(module_at(100.0), Some("media"));
+        assert_eq!(module_at(45.0), Some("audio"));
+        assert_eq!(module_at(139.0), None);
+    }
+
+    #[test]
+    fn network_bar_keeps_connection_names_in_the_control_panel() {
+        assert_eq!(compact_network_bar_label("NET docker0"), "NET");
+        assert_eq!(compact_network_bar_label("WIFI Home"), "WIFI");
+        assert_eq!(compact_network_bar_label("NET OFF"), "NET OFF");
+    }
+
+    #[test]
+    fn bar_module_layout_sizes_the_tray_by_icon_space() {
+        let values = vec![("tray", "TRAY 3".to_string())];
+        // With no font the text estimate is 6 chars * 6 = 36, but three 24 px
+        // icons need 3 * (12 + 2) + 8 = 50 px, which must win over the text.
+        let rects = bar_module_layout(200, 24, None, 12, 3, 0, &values);
+        assert_eq!(rects, vec![("tray", 122, 192)]);
+    }
+
+    #[test]
+    fn narrow_bar_keeps_status_chips_out_of_the_workspace_island() {
+        let values = vec![
+            ("media", "MEDIA —".to_string()),
+            ("audio", "VOL 100%".to_string()),
+            ("clock", "Wed 17:45".to_string()),
+            ("power", "POWER".to_string()),
+        ];
+        let left_guard = BAR_WORKSPACE_START + BAR_WORKSPACE_STEP * 9 + 16;
+        let rects = bar_module_layout(480, 42, None, 14, 0, left_guard, &values);
+        assert!(rects.iter().all(|(_, left, _)| *left >= left_guard));
+        assert!(rects.iter().any(|(module, _, _)| *module == "power"));
+    }
+
+    #[test]
+    fn panels_draw_a_muted_border_inside_the_background_fill() {
+        let mut canvas = vec![0; 100 * 60 * 4];
+        let colors = Colors {
+            background: 0xff11_2233,
+            foreground: 0xffee_eeee,
+            accent: 0xff88_aaff,
+            muted: 0xff88_8899,
+            radius: 8,
+        };
+        panel(&mut canvas, 100, 2, 2, 96, 56, 8, colors);
+        let pixel = |x: usize, y: usize| {
+            u32::from_le_bytes(canvas[(y * 100 + x) * 4..(y * 100 + x + 1) * 4].try_into().unwrap())
+        };
+        // The interior keeps the exact background fill.
+        assert_eq!(pixel(50, 30), 0xff11_2233);
+        // The border ring carries a quiet muted tint on the panel edge pixels.
+        assert_ne!(pixel(2, 30), 0xff11_2233);
+        assert_ne!(pixel(97, 30), 0xff11_2233);
+        assert_eq!(pixel(2, 30) >> 24, 0xff);
+    }
+
+    #[test]
+    fn launcher_shows_search_categories_and_highlights_the_selected_row() {
+        let mut canvas = vec![0; 680 * 420 * 4];
+        let colors = Colors {
+            background: 0xff11_2233,
+            foreground: 0xffee_eeee,
+            accent: 0xff88_aaff,
+            muted: 0xff88_8899,
+            radius: 12,
+        };
+        draw_launcher(
+            &mut canvas,
+            680,
+            420,
+            colors,
+            12,
+            None,
+            13,
+            "",
+            &["Files".into(), "Editor".into()],
+            1,
+            true,
         );
-        assert_eq!(right_module_at(200, None, 12, &values, 90.0), Some("media"));
-        assert_eq!(right_module_at(200, None, 12, &values, 45.0), Some("audio"));
-        assert_eq!(right_module_at(200, None, 12, &values, 20.0), None);
+        let pixel = |x: usize, y: usize| {
+            u32::from_le_bytes(
+                canvas[(y * 680 + x) * 4..(y * 680 + x + 1) * 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        // The rounded inset field is visibly layered over the panel fill.
+        assert_ne!(pixel(640, 90), 0xff11_2233);
+        // The first row stays quiet; selection adds a distinct accent surface.
+        let unselected = pixel(580, 200);
+        let selected = pixel(580, 235);
+        assert!(unselected.abs_diff(0xff11_2233) <= 1);
+        assert_ne!(selected, 0xff11_2233);
+        // The category chips stay inside the fixed panel's top content region.
+        assert_ne!(pixel(108, 147), 0xff11_2233);
+    }
+
+    #[test]
+    fn launcher_pointer_targets_match_drawn_categories_and_visible_result_rows() {
+        assert_eq!(launcher_panel_rect(680, 420), [0, 0, 680, 420]);
+        for (category, _, rect) in launcher_category_regions(680, 420) {
+            let center_x = (rect[0] + rect[2] / 2) as f64;
+            let center_y = (rect[1] + rect[3] / 2) as f64;
+            assert_eq!(
+                launcher_pointer_hit(680, 420, center_x, center_y, 2),
+                Some(LauncherHit::Category(category))
+            );
+        }
+
+        let first_row = launcher_result_row_rect(680, 420, 0).unwrap();
+        assert_eq!(first_row, [20, 185, 640, 30]);
+        assert_eq!(launcher_result_row_rect(680, 420, 5), None);
+        assert_eq!(
+            launcher_pointer_hit(
+                680,
+                420,
+                (first_row[0] + first_row[2] / 2) as f64,
+                (first_row[1] + first_row[3] / 2) as f64,
+                2,
+            ),
+            Some(LauncherHit::Result(0))
+        );
+
+        // The gap between chips and space below the final visible result are
+        // intentionally inert, so a click cannot select a neighboring mode.
+        assert_eq!(launcher_pointer_hit(680, 420, 142.0, 150.0, 2), None);
+        assert_eq!(launcher_pointer_hit(680, 420, 340.0, 270.0, 2), None);
+        assert_eq!(launcher_pointer_hit(680, 420, f64::NAN, 200.0, 2), None);
+    }
+
+    #[test]
+    fn launcher_category_clicks_switch_modes_and_preserve_the_search_term() {
+        assert_eq!(launcher_category_for_query("mail"), LauncherCategory::Apps);
+        assert_eq!(
+            launcher_category_for_query(" @mail"),
+            LauncherCategory::Windows
+        );
+        assert_eq!(
+            launcher_category_for_query("> ls"),
+            LauncherCategory::Commands
+        );
+        assert_eq!(
+            launcher_category_for_query(":lock"),
+            LauncherCategory::Power
+        );
+        assert_eq!(
+            launcher_query_for_category(LauncherCategory::Windows, "mail"),
+            "@mail"
+        );
+        assert_eq!(
+            launcher_query_for_category(LauncherCategory::Commands, "@mail"),
+            "> mail"
+        );
+        assert_eq!(
+            launcher_query_for_category(LauncherCategory::Power, "> mail"),
+            ":mail"
+        );
+        assert_eq!(
+            launcher_query_for_category(LauncherCategory::Apps, ":mail"),
+            "mail"
+        );
+        assert_eq!(
+            launcher_query_for_category(LauncherCategory::Commands, ""),
+            "> "
+        );
+    }
+
+    #[test]
+    fn control_buttons_tint_active_rows_with_the_accent() {
+        let colors = Colors {
+            background: 0xff11_2233,
+            foreground: 0xffee_eeee,
+            accent: 0xff88_aaff,
+            muted: 0xff88_8899,
+            radius: 10,
+        };
+        let audio = AudioState {
+            label: "VOL 50%".into(),
+        };
+        let network = NetworkState {
+            label: "WIFI Luma".into(),
+            networking_enabled: true,
+            wireless_enabled: true,
+        };
+        let media = MediaState {
+            label: "MEDIA Track".into(),
+        };
+        let bluetooth = BluetoothState {
+            label: "BT 1".into(),
+            powered: Some(true),
+        };
+        let mut canvas = vec![0; 380 * 300 * 4];
+        draw_controls(
+            &mut canvas,
+            380,
+            300,
+            colors,
+            None,
+            13,
+            Some(ControlPanel::Power),
+            Some(PowerAction::LogOut),
+            &audio,
+            &network,
+            &media,
+            &bluetooth,
+            false,
+            2,
+        );
+        let pixel = |x: usize, y: usize| {
+            u32::from_le_bytes(canvas[(y * 380 + x) * 4..(y * 380 + x + 1) * 4].try_into().unwrap())
+        };
+        // The active confirm button (76..=110) is accent tinted, while the
+        // inactive cancel button (120..=154) keeps a muted chip.
+        let active = pixel(190, 93);
+        let inactive = pixel(190, 137);
+        assert_ne!(active, 0xff11_2233);
+        assert_ne!(inactive, 0xff11_2233);
+        assert_ne!(active, inactive);
+    }
+
+    #[test]
+    fn control_slider_paints_a_trough_highlight_and_knob() {
+        let colors = Colors {
+            background: 0xff11_2233,
+            foreground: 0xffee_eeee,
+            accent: 0xff88_aaff,
+            muted: 0xff88_8899,
+            radius: 10,
+        };
+        let audio = AudioState {
+            label: "VOL 50%".into(),
+        };
+        let network = NetworkState {
+            label: "WIFI Luma".into(),
+            networking_enabled: true,
+            wireless_enabled: true,
+        };
+        let media = MediaState {
+            label: "MEDIA Track".into(),
+        };
+        let bluetooth = BluetoothState {
+            label: "BT 1".into(),
+            powered: Some(true),
+        };
+        let mut canvas = vec![0; 380 * 300 * 4];
+        draw_controls(
+            &mut canvas,
+            380,
+            300,
+            colors,
+            None,
+            13,
+            Some(ControlPanel::Audio),
+            None,
+            &audio,
+            &network,
+            &media,
+            &bluetooth,
+            false,
+            2,
+        );
+        let pixel = |x: usize, y: usize| {
+            u32::from_le_bytes(canvas[(y * 380 + x) * 4..(y * 380 + x + 1) * 4].try_into().unwrap())
+        };
+        // At 50% volume the trough is accent from 24..214 and muted from
+        // 214..332; the knob sits near the middle of the trough.
+        let highlighted = pixel(100, 74);
+        let remaining = pixel(300, 74);
+        assert_ne!(highlighted, 0xff11_2233);
+        assert_ne!(remaining, 0xff11_2233);
+        assert_ne!(highlighted, remaining);
     }
 
     #[test]
@@ -6646,19 +10322,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_digits_use_the_standard_seven_segment_layout() {
-        assert_eq!(
-            DIGIT_SEGMENTS,
-            [
-                0b0111111, 0b0000110, 0b1011011, 0b1001111, 0b1100110, 0b1101101, 0b1111101,
-                0b0000111, 0b1111111, 0b1101111,
-            ]
-        );
-        assert_eq!(digit_segments(1), 0b0000110);
-        assert_eq!(digit_segments(9), 0b1101111);
-    }
-
-    #[test]
     fn icon_pixels_are_composited_as_premultiplied_alpha() {
         let mut canvas = 0xff00_00ff_u32.to_le_bytes().to_vec();
         blend_rgba_pixel(&mut canvas, 0, 255, 0, 0, 128);
@@ -6730,7 +10393,7 @@ mod tests {
     }
 
     #[test]
-    fn bar_uses_transparent_margins_and_a_rounded_panel() {
+    fn bar_paints_a_launcher_island_with_transparent_space_between_groups() {
         let mut canvas = vec![0; 200 * 40 * 4];
         let colors = Colors {
             background: 0xff11_2233,
@@ -6770,7 +10433,8 @@ mod tests {
             )
         };
         assert_eq!(pixel(0, 0), 0);
-        assert_ne!(pixel(100, 20), 0);
+        assert_ne!(pixel(20, 20), 0);
+        assert_eq!(pixel(100, 20), 0);
     }
 
     #[test]

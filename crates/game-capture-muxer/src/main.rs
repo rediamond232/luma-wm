@@ -40,6 +40,9 @@ struct Options {
     /// private runtime directory avoids placing a process identifier in the
     /// environment inherited by arbitrary helper processes.
     expected_pid_file: PathBuf,
+    /// Optional exact Linux task name for a game spawned by a launcher. The
+    /// peer must still descend from the PID in `expected_pid_file`.
+    expected_process_name: Option<String>,
 }
 
 impl Options {
@@ -50,6 +53,7 @@ impl Options {
         let mut output = None;
         let mut fps = None;
         let mut expected_pid_file = None;
+        let mut expected_process_name = None;
         while let Some(flag) = args.next() {
             let value = args
                 .next()
@@ -60,6 +64,7 @@ impl Options {
                 "--output" => output = Some(value.into()),
                 "--fps" => fps = Some(value.parse().map_err(|_| "invalid --fps")?),
                 "--expected-pid-file" => expected_pid_file = Some(value.into()),
+                "--expected-process-name" => expected_process_name = Some(value),
                 _ => return Err(format!("unknown option {flag}")),
             }
         }
@@ -69,6 +74,7 @@ impl Options {
             output: output.ok_or("--output is required")?,
             fps: fps.ok_or("--fps is required")?,
             expected_pid_file: expected_pid_file.ok_or("--expected-pid-file is required")?,
+            expected_process_name,
         };
         if options.socket.as_os_str().is_empty()
             || options.output.as_os_str().is_empty()
@@ -76,6 +82,15 @@ impl Options {
             || !(1..=480).contains(&options.fps)
         {
             return Err("--socket, --output, and an fps from 1 through 480 are required".into());
+        }
+        if let Some(name) = &options.expected_process_name
+            && (name.is_empty()
+                || name.len() > 15
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+        {
+            return Err("--expected-process-name must be 1 through 15 letters, digits, _, -, or .".into());
         }
         Ok(options)
     }
@@ -151,6 +166,34 @@ fn expected_pid(path: &PathBuf) -> Result<u32, String> {
             }
         }
     }
+}
+
+fn process_name(pid: u32) -> Result<String, String> {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|name| name.trim_end().to_owned())
+        .map_err(|error| format!("could not read game-capture peer process name: {error}"))
+}
+
+fn descends_from(mut pid: u32, ancestor: u32) -> bool {
+    for _ in 0..128 {
+        if pid == ancestor {
+            return true;
+        }
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, fields)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let Some(parent) = fields.split_whitespace().nth(1).and_then(|value| value.parse().ok()) else {
+            return false;
+        };
+        if parent == 0 || parent == pid {
+            return false;
+        }
+        pid = parent;
+    }
+    false
 }
 
 fn parse_token(hex: &str) -> Result<SessionToken, String> {
@@ -254,8 +297,15 @@ fn spawn_ffmpeg(output: &PathBuf) -> Result<(Child, ChildStdin), String> {
             "-hide_banner",
             "-loglevel",
             "warning",
+            // Generous probe limits: the transport is paced by live presents,
+            // so a slow-starting game must not make the demuxer decide on a
+            // partial program map.
+            "-probesize",
+            "100M",
+            "-analyzeduration",
+            "100M",
             "-f",
-            "mp4",
+            "mpegts",
             "-i",
             "pipe:0",
             "-map",
@@ -301,10 +351,17 @@ fn muxer_writer(
     config: VideoConfig,
 ) -> Result<u64, String> {
     gst::init().map_err(|error| format!("failed to initialize GStreamer: {error}"))?;
+    // The intermediate stream to FFmpeg is MPEG-TS, not fragmented MP4.
+    // fMP4 over a live pipe leaves codec setup to probe timing (empty initial
+    // moov, in-band SPS only), which starves ffmpeg's mov demuxer into an
+    // uninitialized track and crashes its trailer. TS repeats PAT/PMT and
+    // SPS/PPS in-band by design, so the demuxer always initializes no matter
+    // when it starts reading. FFmpeg still finalizes the artifact as an
+    // indexed hybrid MP4.
     let pipeline = gst::parse::launch(
         "appsrc name=video is-live=true format=time do-timestamp=false block=true max-buffers=4 \
-         ! h264parse config-interval=-1 ! video/x-h264,stream-format=avc,alignment=au \
-         ! mp4mux name=mux fragment-duration=1000 streamable=true movie-timescale=1000000000 trak-timescale=1000000000 \
+         ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
+         ! mpegtsmux name=mux alignment=7 \
          ! fdsink name=transport_sink sync=false",
     )
     .map_err(|error| format!("failed to construct timestamped H.264 muxer: {error}"))?
@@ -458,7 +515,22 @@ fn accept_expected_peer(listener: &UnixListener, options: &Options) -> Result<Un
             continue;
         }
         let expected = expected_pid(&options.expected_pid_file)?;
-        if credentials.pid != expected {
+        if let Some(name) = &options.expected_process_name {
+            if !descends_from(credentials.pid, expected) {
+                eprintln!(
+                    "warning: rejected game-capture peer PID {} (not descended from launcher PID {})",
+                    credentials.pid, expected
+                );
+                continue;
+            }
+            if process_name(credentials.pid).as_deref() != Ok(name.as_str()) {
+                eprintln!(
+                    "warning: rejected game-capture peer PID {} (expected process name {})",
+                    credentials.pid, name
+                );
+                continue;
+            }
+        } else if credentials.pid != expected {
             eprintln!(
                 "warning: rejected game-capture peer PID {} (expected launcher game PID {})",
                 credentials.pid, expected
@@ -661,6 +733,37 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(parsed.fps, 480);
+        let parsed = Options::parse_from([
+            "--socket".into(),
+            "/tmp/luma.sock".into(),
+            "--token".into(),
+            "00".repeat(TOKEN_LEN),
+            "--output".into(),
+            "/tmp/luma.mp4".into(),
+            "--fps".into(),
+            "480".into(),
+            "--expected-pid-file".into(),
+            "/tmp/luma-game.pid".into(),
+            "--expected-process-name".into(),
+            "java".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.expected_process_name.as_deref(), Some("java"));
+        assert!(Options::parse_from([
+            "--socket".into(),
+            "/tmp/luma.sock".into(),
+            "--token".into(),
+            "00".repeat(TOKEN_LEN),
+            "--output".into(),
+            "/tmp/luma.mp4".into(),
+            "--fps".into(),
+            "480".into(),
+            "--expected-pid-file".into(),
+            "/tmp/luma-game.pid".into(),
+            "--expected-process-name".into(),
+            "not valid".into(),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -854,7 +957,12 @@ mod tests {
             .parse::<f64>()
             .unwrap();
         assert!(
-            seconds > 0.14,
+            // MPEG-TS carries PTS but no per-sample durations, so the MP4 is
+            // timed purely by presentation timestamps: 0, 1/60, then the
+            // 100 ms VFR gap, with the trailing frame defaulting to one
+            // frame interval. The packet-PTS assertions below are the true
+            // VFR proof; this only guards against CFR collapse.
+            seconds > 0.12,
             "irregular 150 ms source timeline must not become 3/60 s: {seconds}"
         );
         let packets = Command::new("ffprobe")

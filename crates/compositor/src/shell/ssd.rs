@@ -34,11 +34,24 @@ pub struct HeaderBar {
     pub maximize_button: SolidColorBuffer,
 }
 
-const BG_COLOR: [f32; 4] = [0.75f32, 0.9f32, 0.78f32, 1f32];
-const MAX_COLOR: [f32; 4] = [1f32, 0.965f32, 0.71f32, 1f32];
-const CLOSE_COLOR: [f32; 4] = [1f32, 0.66f32, 0.612f32, 1f32];
-const MAX_COLOR_HOVER: [f32; 4] = [0.71f32, 0.624f32, 0f32, 1f32];
-const CLOSE_COLOR_HOVER: [f32; 4] = [0.75f32, 0.11f32, 0.016f32, 1f32];
+const BG_COLOR: [f32; 4] = [27.0 / 255.0, 27.0 / 255.0, 20.0 / 255.0, 1.0];
+const MUTED_COLOR: [f32; 4] = [174.0 / 255.0, 178.0 / 255.0, 134.0 / 255.0, 1.0];
+const ACCENT_COLOR: [f32; 4] = [231.0 / 255.0, 189.0 / 255.0, 88.0 / 255.0, 1.0];
+
+const fn blend_color(base: [f32; 4], tint: [f32; 4], amount: f32) -> [f32; 4] {
+    let mut color = [0.0; 4];
+    let mut channel = 0;
+    while channel < 4 {
+        color[channel] = base[channel] * (1.0 - amount) + tint[channel] * amount;
+        channel += 1;
+    }
+    color
+}
+
+const MAX_COLOR: [f32; 4] = blend_color(BG_COLOR, MUTED_COLOR, 0.52);
+const CLOSE_COLOR: [f32; 4] = blend_color(BG_COLOR, ACCENT_COLOR, 0.5);
+const MAX_COLOR_HOVER: [f32; 4] = ACCENT_COLOR;
+const CLOSE_COLOR_HOVER: [f32; 4] = blend_color(BG_COLOR, ACCENT_COLOR, 0.82);
 
 pub const HEADER_BAR_HEIGHT: i32 = 32;
 const BUTTON_HEIGHT: u32 = HEADER_BAR_HEIGHT as u32;

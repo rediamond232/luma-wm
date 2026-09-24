@@ -21,7 +21,7 @@ use smithay::{
     },
     xwayland::{
         X11Surface, X11Wm, XwmHandler,
-        xwm::{Reorder, ResizeEdge as X11ResizeEdge, XwmId},
+        xwm::{Reorder, ResizeEdge as X11ResizeEdge, WmWindowType, XwmId},
     },
 };
 use tracing::{error, trace};
@@ -43,6 +43,26 @@ impl OldGeometry {
     pub fn restore(&self) -> Option<Rectangle<i32, Logical>> {
         self.0.borrow_mut().take()
     }
+}
+
+pub(crate) fn is_auxiliary_window(window: &X11Surface) -> bool {
+    window.is_modal()
+        || window.is_transient_for().is_some()
+        || matches!(
+            window.window_type(),
+            Some(
+                WmWindowType::Combo
+                    | WmWindowType::Dialog
+                    | WmWindowType::DropdownMenu
+                    | WmWindowType::Menu
+                    | WmWindowType::Notification
+                    | WmWindowType::PopupMenu
+                    | WmWindowType::Splash
+                    | WmWindowType::Toolbar
+                    | WmWindowType::Tooltip
+                    | WmWindowType::Utility
+            )
+        )
 }
 
 impl<BackendData: Backend> XWaylandShellHandler for AnvilState<BackendData> {
@@ -104,14 +124,25 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         &mut self,
         _xwm: XwmId,
         window: X11Surface,
-        _x: Option<i32>,
-        _y: Option<i32>,
+        x: Option<i32>,
+        y: Option<i32>,
         w: Option<u32>,
         h: Option<u32>,
         _reorder: Option<Reorder>,
     ) {
-        // we just set the new size, but don't let windows move themselves around freely
+        // Auxiliary X11 windows (confirmation dialogs, menus and notifications)
+        // are client-positioned.  Ignoring their move requests leaves the
+        // visual surface and the X11 client's input coordinates out of sync.
+        let auxiliary = is_auxiliary_window(&window);
         let mut geo = window.last_configure();
+        if auxiliary {
+            if let Some(x) = x {
+                geo.loc.x = x;
+            }
+            if let Some(y) = y {
+                geo.loc.y = y;
+            }
+        }
         if let Some(w) = w {
             geo.size.w = w as i32;
         }
@@ -119,6 +150,38 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
             geo.size.h = h as i32;
         }
         let _ = window.configure(geo);
+
+        if !auxiliary {
+            return;
+        }
+
+        let Some(element) = self
+            .space
+            .elements()
+            .find(|e| matches!(e.0.x11_surface(), Some(surface) if surface == &window))
+            .cloned()
+        else {
+            return;
+        };
+        self.space.map_element(element.clone(), geo.loc, true);
+        if let Some(managed) = self
+            .desktop
+            .windows
+            .iter_mut()
+            .find(|managed| managed.window == element)
+        {
+            let rect = wm_core::Rect {
+                x: geo.loc.x,
+                y: geo.loc.y,
+                w: geo.size.w,
+                h: geo.size.h,
+            };
+            managed.floating = true;
+            managed.floating_rect = Some(rect);
+            managed.rect = Some(rect);
+            managed.requested_size = (Some(rect.w), Some(rect.h));
+        }
+        self.desktop.redraw = true;
     }
 
     fn configure_notify(

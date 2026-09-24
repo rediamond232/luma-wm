@@ -34,13 +34,15 @@ grep -Eq '/lib(GL|OpenGL|EGL)[^/[:space:]]*\.so' "$proc/maps" || {
 }
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+receiver=${LUMA_GAME_CAPTURE_RECEIVER:-$script_dir/build/luma-opengl-capture-receiver}
+[[ -x $script_dir/luma-opengl-capture-receiver && -z ${LUMA_GAME_CAPTURE_RECEIVER:-} ]] && receiver=$script_dir/luma-opengl-capture-receiver
 muxer=${LUMA_GAME_CAPTURE_MUXER:-$script_dir/../../target/release/luma-game-capture-muxer}
 [[ -x $script_dir/luma-game-capture-muxer && -z ${LUMA_GAME_CAPTURE_MUXER:-} ]] && muxer=$script_dir/luma-game-capture-muxer
 library=${LUMA_GAME_CAPTURE_GL_HOOK:-$script_dir/build/libluma-game-capture-gl.so}
 [[ -r $script_dir/libluma-game-capture-gl.so && -z ${LUMA_GAME_CAPTURE_GL_HOOK:-} ]] && library=$script_dir/libluma-game-capture-gl.so
 injector=${LUMA_GAME_CAPTURE_INJECTOR:-$script_dir/../game-capture-inject/build/luma-game-inject}
 [[ -x $script_dir/luma-game-inject && -z ${LUMA_GAME_CAPTURE_INJECTOR:-} ]] && injector=$script_dir/luma-game-inject
-[[ -x $muxer && -r $library && -x $injector ]] || {
+[[ -x $muxer && -r $library && -x $injector && -x $receiver ]] || {
     echo "Luma generic capture requires its muxer, hook library, and luma-game-inject helper" >&2
     exit 66
 }
@@ -51,18 +53,54 @@ runtime=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
     echo "generic injection currently requires XDG_RUNTIME_DIR=/run/user/$(id -u)" >&2
     exit 78
 }
+exec 9>"$runtime/luma-game-inject-$pid.lock"
+flock -n 9 || { echo "capture is already active for PID $pid" >&2; exit 73; }
 session=$(mktemp -d -- "$runtime/luma-game-inject-session.XXXXXX")
 socket=$session/video.sock
+export_socket=$session/export.sock
+ready_file=$session/ready
 expected=$session/game.pid
 config=$runtime/luma-game-inject-$pid.conf
 control=$runtime/luma-game-inject-$pid.ctl
 debug=$runtime/luma-game-capture-inject-$pid.log
 token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 muxer_pid= stopping=0 control_owned= config_owned=
+receiver_pid=
 
 [[ ! -e $config && ! -L $config && ! -e $control && ! -L $control ]] || {
-    echo "capture state already exists for PID $pid; another attach may be active" >&2
-    exit 73
+    # A successful hook unlinks its handoff config before it starts accepting
+    # frames. Therefore a leftover config can only be an attach attempt that
+    # died before activation (for example, its parent terminal disappeared),
+    # not a live capture. Recover it here so a game does not need to be
+    # restarted merely to retry a failed attach.
+    if [[ -L $config || -L $control ||
+          ( -e $config && ! -f $config ) ||
+          ( -e $control && ! -f $control ) ]]; then
+        echo "unsafe stale capture state for PID $pid; remove it manually" >&2
+        exit 73
+    fi
+    if [[ -e $config ]] && [[ $(stat -c '%u:%a' -- "$config") != "$(id -u):600" ]]; then
+        echo "unsafe stale capture config for PID $pid; remove it manually" >&2
+        exit 73
+    fi
+    if [[ -e $control ]] && [[ $(stat -c '%u:%a' -- "$control") != "$(id -u):600" ]]; then
+        echo "unsafe stale capture control for PID $pid; remove it manually" >&2
+        exit 73
+    fi
+    old_socket=
+    if [[ -f $config ]]; then
+        old_socket=$(awk -F= '$1 == "stream_socket" { print $2; exit }' "$config")
+        [[ -z $old_socket || $old_socket == "$runtime"/luma-game-inject-session.*/video.sock || $old_socket == "$runtime"/luma-game-inject-session.*/export.sock ]] || {
+            echo "unsafe stale capture socket for PID $pid; remove it manually" >&2
+            exit 73
+        }
+    fi
+    rm -f -- "$config" "$control"
+    if [[ -n $old_socket && -S $old_socket ]]; then
+        rm -f -- "$old_socket"
+        rmdir -- "$(dirname -- "$old_socket")" 2>/dev/null || true
+    fi
+    echo "recovered abandoned capture handoff for PID $pid" >&2
 }
 
 alive() {
@@ -72,11 +110,16 @@ alive() {
     [[ -n $state && $state != Z && $state != X ]]
 }
 cleanup() {
+    if [[ -n ${control_owned:-} && -f $control ]]; then
+        printf '\1\0\0\0' | dd of="$control" bs=4 count=1 conv=notrunc status=none || true
+    fi
+    [[ -n ${receiver_pid:-} ]] && kill -TERM "$receiver_pid" 2>/dev/null || true
+    [[ -n ${receiver_pid:-} ]] && wait "$receiver_pid" 2>/dev/null || true
     [[ -n ${muxer_pid:-} ]] && kill -TERM "$muxer_pid" 2>/dev/null || true
     [[ -n ${muxer_pid:-} ]] && wait "$muxer_pid" 2>/dev/null || true
     [[ -n ${config_owned:-} ]] && rm -f -- "$config"
     [[ -n ${control_owned:-} ]] && rm -f -- "$control"
-    rm -f -- "$socket" "$expected"
+    rm -f -- "$socket" "$expected" "$export_socket" "$ready_file"
     rmdir -- "$session" 2>/dev/null || true
 }
 stop_capture() {
@@ -84,7 +127,14 @@ stop_capture() {
     # Shared, read-only in the target. One atomic word is checked at present;
     # no signal is delivered to and no control thread is added to the game.
     printf '\1\0\0\0' | dd of="$control" bs=4 count=1 conv=notrunc status=none
-    for _ in $(seq 1 500); do
+    [[ -n ${receiver_pid:-} ]] && kill -TERM "$receiver_pid" 2>/dev/null || true
+    [[ -n ${receiver_pid:-} ]] && wait "$receiver_pid" 2>/dev/null || true
+    receiver_pid=
+    # A 1440p NVENC session can need more than five seconds to drain queued
+    # access units and let FFmpeg write MP4 indexes. Match the launch-time
+    # recorder's 15-second graceful-finalization window before cleanup sends
+    # a terminating signal to the muxer.
+    for _ in $(seq 1 1500); do
         kill -0 "$muxer_pid" 2>/dev/null || break
         sleep 0.01
     done
@@ -93,36 +143,70 @@ stop_capture() {
 trap cleanup EXIT
 trap stop_capture INT TERM
 
-printf '%s\n' "$pid" >"$expected"
+"$receiver" --export-socket "$export_socket" --stream-socket "$socket" --token "$token" \
+    --expected-pid "$pid" --fps "$fps" --quality "$quality" --ready-file "$ready_file" &
+receiver_pid=$!
+printf '%s\n' "$receiver_pid" >"$expected"
 chmod 600 "$expected"
 # noclobber makes both predictable constructor handoff files exclusive. This
 # prevents a concurrent attach or a pre-created symlink from being overwritten.
-set -o noclobber
-printf '\0\0\0\0' >"$control"
-control_owned=1
-chmod 600 "$control"
-{
-    printf 'version=1\npid=%s\nstream_socket=%s\ntoken=%s\nfps=%s\nquality=%s\ndebug_log=%s\n' \
-        "$pid" "$socket" "$token" "$fps" "$quality" "$debug"
-} >"$config"
-config_owned=1
-set +o noclobber
-chmod 600 "$config"
+# No chmod follows: umask 077 above already creates both files mode 600, and
+# a chmod here would race the hook's activation unlink on re-record sessions.
 
 "$muxer" --socket "$socket" --token "$token" --output "$output" --fps "$fps" \
     --expected-pid-file "$expected" &
 muxer_pid=$!
 for _ in $(seq 1 200); do
-    [[ -S $socket ]] && break
+    [[ -S $socket && -S $export_socket ]] && break
     kill -0 "$muxer_pid" 2>/dev/null || break
     sleep 0.01
 done
-[[ -S $socket ]] || { echo "capture muxer did not open its socket" >&2; exit 70; }
+[[ -S $socket && -S $export_socket ]] || { echo "capture sidecars did not open their sockets" >&2; exit 70; }
 
-"$injector" "$pid" "$library" || {
-    echo "generic injection failed; ptrace policy or anti-cheat may forbid it" >&2
-    exit 71
-}
+# Repeat recordings on one process skip ptrace entirely: the swap slot already
+# points at our resident hook, whose presenting thread notices the fresh
+# config above and re-arms itself. Only the exact same hook build may be
+# reused; anything else means version skew and needs a game restart.
+resident=0
+if grep -q 'libluma-game-capture-gl\.so' "$proc/maps" 2>/dev/null; then
+    mapped_line=$(awk '/libluma-game-capture-gl\.so/ { print; exit }' "$proc/maps")
+    read -r _ _ _ mapped_device mapped_inode mapped_lib <<<"$mapped_line"
+    # The pathname may now name a replacement file while /proc/maps still
+    # holds the old, deleted inode. Compare the mapping's recorded device and
+    # inode, not stat(path), or a rebuilt hook could be mistaken for resident.
+    mapped_major=$((16#${mapped_device%:*}))
+    mapped_minor=$((16#${mapped_device#*:}))
+    mapped_device_value=$(( ((mapped_major & 0xfff) << 8) | ((mapped_major & ~0xfff) << 32) | (mapped_minor & 0xff) | ((mapped_minor & ~0xff) << 12) ))
+    printf -v mapped_device_hex '%x' "$mapped_device_value"
+    mapped_identity=$mapped_device_hex:$mapped_inode
+    disk_identity=$(stat -c '%D:%i' -- "$library" 2>/dev/null || true)
+    if [[ -n $mapped_lib && $disk_identity == "$mapped_identity" ]]; then
+        resident=1
+    else
+        echo "PID $pid holds a different game-capture hook build ($mapped_lib, mapping $mapped_identity, disk $disk_identity); restart the game to re-record" >&2
+        exit 74
+    fi
+fi
+set -o noclobber
+printf '\0\0\0\0' >"$control"
+control_owned=1
+{
+    printf 'version=1\npid=%s\nstream_socket=%s\ntoken=%s\nfps=%s\nquality=%s\ndebug_log=%s\n' \
+        "$pid" "$export_socket" "$token" "$fps" "$quality" "$debug"
+} >"$config"
+config_owned=1
+set +o noclobber
+if (( resident )); then
+    # A successfully installed hook re-arms from its present path when it sees
+    # the new config. Calling its one-shot initializer again is rejected and
+    # would break repeat recordings on the same game process.
+    echo "capture hook already resident in PID $pid; activating in place without ptrace" >&2
+else
+    "$injector" "$pid" "$library" || {
+        echo "generic injection failed; ptrace policy or anti-cheat may forbid it" >&2
+        exit 71
+    }
+fi
 for _ in $(seq 1 300); do
     [[ ! -e $config ]] && break
     alive || break
@@ -132,9 +216,24 @@ done
     echo "capture library loaded but found no supported resolved GLX/EGL call site" >&2
     exit 72
 }
-echo "Luma injected OpenGL capture into PID $pid" >&2
+for _ in $(seq 1 500); do
+    [[ -s $ready_file ]] && break
+    alive && kill -0 "$receiver_pid" 2>/dev/null && kill -0 "$muxer_pid" 2>/dev/null || break
+    sleep 0.01
+done
+[[ -s $ready_file ]] || {
+    echo "hook loaded, but shared GPU capture produced no encoded frame; see $debug" >&2
+    exit 72
+}
+echo "Luma injected OpenGL capture into PID $pid (external encoder ready)" >&2
 
-while alive; do sleep 0.25; done
+while alive; do
+    kill -0 "$receiver_pid" 2>/dev/null && kill -0 "$muxer_pid" 2>/dev/null || exit 70
+    sleep 0.25
+done
+kill -TERM "$receiver_pid" 2>/dev/null || true
+wait "$receiver_pid" || true
+receiver_pid=
 for _ in $(seq 1 1500); do
     kill -0 "$muxer_pid" 2>/dev/null || break
     sleep 0.01

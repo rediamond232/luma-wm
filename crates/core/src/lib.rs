@@ -19,6 +19,7 @@ pub struct Config {
     pub rules: Vec<WindowRule>,
     pub shell: Shell,
     pub recorder: Recorder,
+    pub performance: Performance,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -71,14 +72,35 @@ impl Default for Config {
             rules: vec![],
             shell: Shell::default(),
             recorder: Recorder::default(),
+            performance: Performance::default(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Runtime performance policy. `auto` keeps the configured desktop appearance
+/// and enters the low-latency path only for a visible fullscreen application.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Performance {
+    pub profile: String,
+    pub fullscreen_vrr: bool,
+}
+
+impl Default for Performance {
+    fn default() -> Self {
+        Self {
+            profile: "auto".into(),
+            fullscreen_vrr: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Recorder {
     pub enabled: bool,
+    /// Encode a 10-bit BT.2100 PQ HDR10 stream. HDR recording requires HEVC.
+    pub hdr: bool,
     /// Ceiling for composition/screen capture. Direct launch profiles have
     /// their own rate; runtime attach uses `fps` below.
     pub screen_fps: u32,
@@ -94,15 +116,38 @@ pub struct Recorder {
     pub microphone: String,
     pub replay_seconds: u32,
     pub replay_max_mib: u32,
+    /// Remembered recording method ("screen", "xwayland", "inject", "opengl",
+    /// "vulkan") and remembered source targets. The Settings UI writes these
+    /// through `recorder set` like every other setting; the Controls page
+    /// restores the UI selection from them on every snapshot.
+    #[serde(default = "default_capture_mode")]
+    pub capture_mode: String,
+    /// Stable source identity: app_id, then title, for screen/window capture.
+    /// Empty means no specific window is remembered.
+    #[serde(default)]
+    pub window_app_id: String,
+    #[serde(default)]
+    pub window_title: String,
+    /// Remembered OpenGL process command name (`comm`).
+    #[serde(default)]
+    pub inject_process: String,
+    /// Remembered game-launch profile name.
+    #[serde(default)]
+    pub game_profile: String,
     /// Explicit commands launched with a graphics-API capture backend.
     /// Generic runtime OpenGL injection is selected separately by PID.
     pub game_profiles: Vec<GameCaptureProfile>,
+}
+
+fn default_capture_mode() -> String {
+    "screen".into()
 }
 
 impl Default for Recorder {
     fn default() -> Self {
         Self {
             enabled: true,
+            hdr: false,
             screen_fps: 240,
             fps: 480,
             codec: "h264".into(),
@@ -116,21 +161,295 @@ impl Default for Recorder {
             microphone: "default_input".into(),
             replay_seconds: 30,
             replay_max_mib: 1024,
+            capture_mode: "screen".into(),
+            window_app_id: String::new(),
+            window_title: String::new(),
+            inject_process: String::new(),
+            game_profile: String::new(),
             game_profiles: vec![],
         }
+    }
+}
+
+/// OBS-style runtime recorder settings. The UI (and `wmctl recorder set`)
+/// edits these through the compositor instead of the TOML config; every
+/// change is persisted to a settings overlay file and survives restarts.
+impl Recorder {
+    /// Apply one `key = value` setting at runtime. The whole `Recorder` is
+    /// re-validated after the edit, so a rejected value leaves the settings
+    /// untouched. Returns the canonical value that was stored.
+    pub fn apply(&mut self, key: &str, value: &str) -> Result<String, String> {
+        let mut candidate = self.clone();
+        let canonical = candidate.assign(key, value)?;
+        if let Err(error) = candidate.validate_recorder() {
+            return Err(format!("recorder {key}='{value}' rejected: {error}"));
+        }
+        *self = candidate;
+        Ok(canonical)
+    }
+
+    fn assign(&mut self, key: &str, value: &str) -> Result<String, String> {
+        let parse = |name: &str, range: std::ops::RangeInclusive<u64>| -> Result<u64, String> {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|_| format!("recorder {name} must be a number"))?;
+            if !range.contains(&parsed) {
+                return Err(format!(
+                    "recorder {name} must be {}..={}",
+                    range.start(),
+                    range.end()
+                ));
+            }
+            Ok(parsed)
+        };
+        match key {
+            "enabled" => self.enabled = parse_bool(value)?,
+            "hdr" => self.hdr = parse_bool(value)?,
+            "cursor" => self.cursor = parse_bool(value)?,
+            "screen_fps" => self.screen_fps = parse("screen_fps", 30..=480)? as u32,
+            "fps" => self.fps = parse("fps", 30..=480)? as u32,
+            "codec" => {
+                if !["hevc", "h264"].contains(&value) {
+                    return Err("recorder codec must be h264 or hevc".into());
+                }
+                self.codec = value.into();
+            }
+            "quality" => self.quality = parse("quality", 1..=51)? as u8,
+            "output_width" => self.output_width = parse("output_width", 2..=16_384)? as u32,
+            "output_height" => self.output_height = parse("output_height", 2..=16_384)? as u32,
+            "output_directory" => {
+                if value.trim().is_empty() {
+                    return Err("recorder output_directory must not be empty".into());
+                }
+                self.output_directory = value.trim().into();
+            }
+            "container" => {
+                if value != "mp4" {
+                    return Err("recorder container must be mp4".into());
+                }
+                self.container = value.into();
+            }
+            "desktop_audio" | "microphone" => {
+                let source = value.trim();
+                let target = match key {
+                    "desktop_audio" => &mut self.desktop_audio,
+                    _ => &mut self.microphone,
+                };
+                if source == "disabled" || source.is_empty() {
+                    *target = "disabled".into();
+                    return Ok("disabled".into());
+                }
+                *target = source.into();
+            }
+            "replay_seconds" => self.replay_seconds = parse("replay_seconds", 2..=3600)? as u32,
+            "replay_max_mib" => self.replay_max_mib = parse("replay_max_mib", 64..=8192)? as u32,
+            "capture_mode" => {
+                if ![
+                    "screen",
+                    "xwayland",
+                    "inject",
+                    "opengl",
+                    "vulkan",
+                ]
+                .contains(&value)
+                {
+                    return Err(
+                        "recorder capture_mode must be screen, xwayland, inject, opengl, or vulkan"
+                            .into(),
+                    );
+                }
+                self.capture_mode = value.into();
+            }
+            // Source identities match by substring and are case-insensitive;
+            // empty (or "none") clears the remembered source. Identity text is
+            // the app_id/title or process name, never a session-local ID.
+            "window_match" | "window_app_id" => {
+                let identity = value.trim();
+                if identity == "none" || identity.is_empty() {
+                    self.window_app_id.clear();
+                    self.window_title.clear();
+                    return Ok("none".into());
+                }
+                self.window_app_id = identity.into();
+            }
+            "window_title" => {
+                let identity = value.trim();
+                if identity == "none" || identity.is_empty() {
+                    self.window_title.clear();
+                    return Ok("none".into());
+                }
+                self.window_title = identity.into();
+            }
+            "inject_process" => {
+                let process = value.trim();
+                if process == "none" || process.is_empty() {
+                    self.inject_process.clear();
+                    return Ok("none".into());
+                }
+                if process.len() > 128 {
+                    return Err("recorder inject_process must be at most 128 characters".into());
+                }
+                self.inject_process = process.into();
+            }
+            "game_profile" => {
+                let profile = value.trim();
+                if profile == "none" || profile.is_empty() {
+                    self.game_profile.clear();
+                    return Ok("none".into());
+                }
+                if !self
+                    .game_profiles
+                    .iter()
+                    .any(|candidate| candidate.name == profile)
+                {
+                    return Err(format!("recorder game profile '{profile}' does not exist"));
+                }
+                self.game_profile = profile.into();
+            }
+            _ => return Err(format!("unknown recorder setting '{key}'")),
+        }
+        Ok(value.trim().into())
+    }
+
+    fn validate_recorder(&self) -> Result<(), String> {
+        if !(30..=480).contains(&self.fps)
+            || !(30..=480).contains(&self.screen_fps)
+            || !["hevc", "h264"].contains(&self.codec.as_str())
+            || !(1..=51).contains(&self.quality)
+            || self.output_width == 0
+            || self.output_height == 0
+            || self.output_width > 16_384
+            || self.output_height > 16_384
+            || !self.output_width.is_multiple_of(2)
+            || !self.output_height.is_multiple_of(2)
+            || self.output_directory.is_empty()
+            || self.container != "mp4"
+            || (self.hdr && self.codec != "hevc")
+            || ![
+                "screen",
+                "xwayland",
+                "inject",
+                "opengl",
+                "vulkan",
+            ]
+            .contains(&self.capture_mode.as_str())
+            || self.window_app_id.len() > 256
+            || self.window_title.len() > 256
+            || self.inject_process.len() > 128
+            || (!self.game_profile.is_empty()
+                && !self
+                    .game_profiles
+                    .iter()
+                    .any(|profile| profile.name == self.game_profile))
+            || !(2..=3600).contains(&self.replay_seconds)
+            || !(64..=8192).contains(&self.replay_max_mib)
+        {
+            return Err(
+                "invalid fps, codec, quality, dimensions, HDR codec, capture \
+                 mode, remembered source, output, or replay limits"
+                    .into(),
+            );
+        }
+        let mut game_profile_names = BTreeSet::new();
+        for profile in &self.game_profiles {
+            if profile.name.trim().is_empty()
+                || !game_profile_names.insert(profile.name.clone())
+                || !["opengl", "vulkan"].contains(&profile.api.as_str())
+                || profile.command.is_empty()
+                || profile.command.iter().any(|argument| argument.is_empty())
+                || !(30..=480).contains(&profile.fps)
+                || (!profile.target_process_name.is_empty()
+                    && (profile.api != "opengl"
+                        || profile.target_process_name.len() > 15
+                        || !profile.target_process_name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                        })))
+            {
+                return Err(
+                    "invalid game profile name, API, command, fps limit, or target process name"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_bool(value: &str) -> Result<bool, String> {
+    value
+        .parse::<bool>()
+        .map_err(|_| format!("recorder boolean must be true or false, got '{value}'"))
+}
+
+/// `~/.config/wm/recorder-settings.toml` (or `$XDG_CONFIG_HOME`). A serialized
+/// `Recorder` at the top level; loaded after the base config and
+/// re-validated, so it behaves like an override layer over `config.toml`.
+pub fn recorder_settings_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("wm").join("recorder-settings.toml");
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home)
+                .join(".config")
+                .join("wm")
+                .join("recorder-settings.toml");
+        }
+    }
+    PathBuf::from("recorder-settings.toml")
+}
+
+/// Persist runtime recorder settings atomically. The compositor calls this on
+/// every successful `recorder set` so settings survive a restart.
+pub fn write_recorder_settings(recorder: &Recorder) -> Result<(), String> {
+    use std::io::Write;
+    let path = recorder_settings_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    }
+    let body = toml::to_string_pretty(recorder)
+        .map_err(|error| format!("failed to serialize recorder settings: {error}"))?;
+    let temporary = path.with_extension("toml.tmp");
+    {
+        let mut file = std::fs::File::create(&temporary)
+            .map_err(|error| format!("failed to write {}: {error}", temporary.display()))?;
+        file.write_all(body.as_bytes())
+            .and_then(|_| file.flush())
+            .map_err(|error| format!("failed to write {}: {error}", temporary.display()))?;
+    }
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| format!("failed to persist recorder settings: {error}"))?;
+    Ok(())
+}
+
+/// Drop the settings overlay; the next `Config::load` uses the base config
+/// again. Returns false when there was nothing to remove.
+pub fn clear_recorder_settings() -> Result<bool, String> {
+    let path = recorder_settings_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to remove {}: {error}", path.display())),
     }
 }
 
 /// A deliberately explicit game-launch profile.  `api` selects the graphics
 /// interception surface, not a fallback: `opengl` uses the preload hook and
 /// `vulkan` uses the opt-in Vulkan layer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct GameCaptureProfile {
     pub name: String,
     pub api: String,
     pub command: Vec<String>,
     pub fps: u32,
+    /// Optional exact Linux task name (`comm`) of an OpenGL renderer spawned
+    /// by `command`. This supports client launchers that fork Java instead of
+    /// execing the renderer, without permitting runtime ptrace injection.
+    pub target_process_name: String,
 }
 
 impl Default for GameCaptureProfile {
@@ -140,6 +459,7 @@ impl Default for GameCaptureProfile {
             api: "opengl".into(),
             command: vec![],
             fps: 480,
+            target_process_name: String::new(),
         }
     }
 }
@@ -166,20 +486,20 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            background: "#161a22".into(),
-            foreground: "#e2e8f0".into(),
-            accent: "#89b4fa".into(),
-            muted: "#8892a5".into(),
-            font: "sans-serif".into(),
-            font_size: 13,
+            background: "#1b1b14".into(),
+            foreground: "#fff3d1".into(),
+            accent: "#e7bd58".into(),
+            muted: "#aeb286".into(),
+            font: "Noto Sans".into(),
+            font_size: 14,
             gap: 8,
-            border: 2,
-            shadow_size: 14,
-            shadow_opacity: 0.22,
-            radius: 10.,
+            border: 1,
+            shadow_size: 10,
+            shadow_opacity: 0.3,
+            radius: 14.,
             opacity: 0.94,
-            blur: true,
-            blur_passes: 3,
+            blur: false,
+            blur_passes: 2,
             animation_ms: 140,
             reduced_motion: false,
         }
@@ -248,9 +568,9 @@ impl Default for Shell {
     fn default() -> Self {
         Self {
             enabled: true,
-            backend: "gtk".into(),
+            backend: "sctk".into(),
             position: "top".into(),
-            height: 36,
+            height: 42,
             do_not_disturb: false,
             modules: vec![
                 "workspaces",
@@ -307,6 +627,8 @@ pub struct OutputConfig {
     /// Legacy refresh-rate setting in millihertz.
     pub refresh: i32,
     pub vrr: bool,
+    /// Enable 10-bit BT.2020/PQ output and HDR10 static metadata.
+    pub hdr: bool,
 }
 impl Default for OutputConfig {
     fn default() -> Self {
@@ -320,6 +642,7 @@ impl Default for OutputConfig {
             hz: 0.,
             refresh: 0,
             vrr: false,
+            hdr: false,
         }
     }
 }
@@ -404,18 +727,38 @@ pub fn socket_path() -> Result<PathBuf, String> {
 impl Config {
     pub fn load() -> Result<Self, String> {
         let p = config_path();
-        match std::fs::read_to_string(&p) {
-            Ok(s) => Self::parse(&s),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(format!("{}: {e}", p.display())),
+        let base = match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        };
+        let settings = std::fs::read_to_string(recorder_settings_path()).ok();
+        Self::parse_with_settings(&base, settings.as_deref())
+    }
+    /// Parse the base config, then overlay the persisted recorder settings on
+    /// top of it. An unreadable/invalid overlay is an error, exactly like a
+    /// broken `config.toml`.
+    pub fn parse_with_settings(base: &str, settings: Option<&str>) -> Result<Self, String> {
+        let base = base.trim();
+        let mut config: Self = if base.is_empty() {
+            Self::default()
+        } else {
+            toml::from_str(base).map_err(|e| e.to_string())?
+        };
+        if let Some(settings) = settings {
+            config.recorder =
+                toml::from_str(settings).map_err(|error| format!("recorder settings: {error}"))?;
         }
+        config.validate()?;
+        Ok(config)
     }
     pub fn parse(s: &str) -> Result<Self, String> {
-        let c: Self = toml::from_str(s).map_err(|e| e.to_string())?;
-        c.validate()?;
-        Ok(c)
+        Self::parse_with_settings(s, None)
     }
     pub fn validate(&self) -> Result<(), String> {
+        if !["auto", "desktop", "gaming"].contains(&self.performance.profile.as_str()) {
+            return Err("performance profile must be auto, desktop, or gaming".into());
+        }
         if !(0.1..=0.9).contains(&self.layout.master_ratio)
             || !(1..=9).contains(&self.layout.workspaces)
         {
@@ -461,25 +804,11 @@ impl Config {
         {
             return Err("invalid shell backend, bar position, or height".into());
         }
-        if !(30..=480).contains(&self.recorder.fps)
-            || !(30..=480).contains(&self.recorder.screen_fps)
-            || !["hevc", "h264"].contains(&self.recorder.codec.as_str())
-            || !(1..=51).contains(&self.recorder.quality)
-            || self.recorder.output_width == 0
-            || self.recorder.output_height == 0
-            || self.recorder.output_width > 16_384
-            || self.recorder.output_height > 16_384
-            || !self.recorder.output_width.is_multiple_of(2)
-            || !self.recorder.output_height.is_multiple_of(2)
-            || self.recorder.output_directory.is_empty()
-            || self.recorder.container != "mp4"
-            || !(2..=3600).contains(&self.recorder.replay_seconds)
-            || !(64..=8192).contains(&self.recorder.replay_max_mib)
-        {
-            return Err(
-                "invalid recorder fps, codec, quality, dimensions, output, or replay limits".into(),
-            );
-        }
+        self.recorder.validate_recorder().map_err(|_| {
+            "invalid recorder fps, codec, quality, dimensions, HDR codec, capture \
+             mode, remembered source, output, or replay limits"
+                .to_string()
+        })?;
         let mut game_profile_names = BTreeSet::new();
         for profile in &self.recorder.game_profiles {
             if profile.name.trim().is_empty()
@@ -488,9 +817,16 @@ impl Config {
                 || profile.command.is_empty()
                 || profile.command.iter().any(|argument| argument.is_empty())
                 || !(30..=480).contains(&profile.fps)
+                || (!profile.target_process_name.is_empty()
+                    && (profile.api != "opengl"
+                        || profile.target_process_name.len() > 15
+                        || !profile.target_process_name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                        })))
             {
                 return Err(
-                    "invalid recorder game profile name, API, command, or fps limit".into(),
+                    "invalid recorder game profile name, API, command, fps limit, or target process name"
+                        .into(),
                 );
             }
         }
@@ -669,6 +1005,36 @@ pub struct Snapshot {
     pub layers: Vec<LayerInfo>,
     #[serde(default)]
     pub recorder: RecorderStatus,
+    /// Effective runtime recorder settings, so the UI edits exactly what the
+    /// compositor will use on the next recording instead of its local config.
+    #[serde(default)]
+    pub recorder_settings: Recorder,
+    #[serde(default)]
+    pub performance: PerformanceStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct PerformanceStatus {
+    pub configured_profile: String,
+    pub active_profile: String,
+    pub outputs: Vec<OutputPerformanceStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct OutputPerformanceStatus {
+    pub name: String,
+    pub refresh_millihz: i32,
+    pub vrr_active: bool,
+    pub direct_scanout_frames: u64,
+    pub composed_frames: u64,
+    pub empty_frames: u64,
+    pub missed_deadlines: u64,
+    pub render_us_p50: u32,
+    pub render_us_p95: u32,
+    pub render_us_p99: u32,
+    pub input_to_submit_us_p50: u32,
+    pub input_to_submit_us_p95: u32,
+    pub input_to_submit_us_p99: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -869,8 +1235,12 @@ mod tests {
             "[shell]\nbackend='other'",
             "[recorder]\nfps=481",
             "[recorder]\ncodec='vp9'",
+            "[recorder]\nhdr=true\ncodec='h264'",
             "[recorder]\noutput_width=2559",
             "[recorder]\nreplay_max_mib=32",
+            "[recorder]\n[[recorder.game_profiles]]\nname='bad-child'\napi='opengl'\ncommand=['/bin/true']\nfps=480\ntarget_process_name='not valid'",
+            "[recorder]\n[[recorder.game_profiles]]\nname='bad-vulkan-child'\napi='vulkan'\ncommand=['/bin/true']\nfps=480\ntarget_process_name='java'",
+            "[performance]\nprofile='fastest'",
             "[bindings]\n'Supers+space'='launcher'",
             "typo=1",
         ] {
@@ -999,5 +1369,91 @@ mod tests {
         assert!(rounded_contains(rect, -19.5, 30.5, 0.));
         assert!(!rounded_contains(rect, 80., 50., 0.));
         assert!(rounded_contains(rect, 30., 60., 1000.));
+    }
+
+    #[test]
+    fn recorder_apply_edits_and_reverts_invalid_values() {
+        let mut recorder = Recorder::default();
+        assert_eq!(recorder.apply("codec", "hevc").unwrap(), "hevc");
+        assert_eq!(recorder.codec, "hevc");
+        assert_eq!(recorder.apply("quality", "18").unwrap(), "18");
+        assert_eq!(recorder.quality, 18);
+
+        // Rejected values leave the settings untouched.
+        let before = recorder.clone();
+        for (key, value) in [
+            ("codec", "vp9"),
+            ("quality", "52"),
+            ("fps", "0"),
+            ("output_width", "2559"),
+            ("output_directory", "   "),
+            ("hdr", "yes"),
+            ("nonsense", "1"),
+            ("container", "mkv"),
+        ] {
+            assert!(recorder.apply(key, value).is_err(), "{key}={value}");
+            assert_eq!(recorder, before, "{key}={value}");
+        }
+
+        // HDR demands HEVC, and dropping HEVC drops HDR.
+        assert!(recorder.apply("hdr", "true").is_ok());
+        assert!(recorder.apply("codec", "h264").is_err());
+        assert!(recorder.apply("hdr", "false").is_ok());
+        assert!(recorder.apply("codec", "h264").is_ok());
+
+        // Audio sources accept the disabled sentinel or a device selector.
+        assert!(recorder.apply("desktop_audio", "disabled").is_ok());
+        assert_eq!(recorder.desktop_audio, "disabled");
+        assert!(recorder.apply("microphone", "alsa_input.usb-mic").is_ok());
+        assert_eq!(recorder.microphone, "alsa_input.usb-mic");
+
+        // Recording method and remembered sources persist as text identity.
+        assert!(recorder.apply("capture_mode", "xwayland").is_ok());
+        assert_eq!(recorder.capture_mode, "xwayland");
+        assert!(recorder.apply("capture_mode", "portal").is_err());
+        assert_eq!(recorder.capture_mode, "xwayland");
+        assert!(recorder.apply("window_match", "Minecraft").is_ok());
+        assert_eq!(recorder.window_app_id, "Minecraft");
+        assert_eq!(recorder.apply("window_match", "none").unwrap(), "none");
+        assert!(recorder.window_app_id.is_empty());
+        assert!(recorder.apply("inject_process", "cs2").is_ok());
+        assert!(recorder.apply("game_profile", "none").is_ok());
+        assert!(recorder.game_profile.is_empty());
+    }
+
+    #[test]
+    fn recorder_settings_overlay_merges_over_base_config() {
+        let settings = toml::to_string_pretty(&Recorder {
+            quality: 14,
+            ..Recorder::default()
+        })
+        .unwrap();
+        let config = Config::parse_with_settings("", Some(&settings)).unwrap();
+        assert_eq!(config.recorder.quality, 14);
+        assert_eq!(config.recorder.output_directory, Recorder::default().output_directory);
+
+        // The persisted file round-trips through the same parse used at load.
+        let mut changed = Recorder::default();
+        changed.apply("replay_seconds", "120").unwrap();
+        let text = toml::to_string_pretty(&changed).unwrap();
+        let config = Config::parse_with_settings("", Some(&text)).unwrap();
+        assert_eq!(config.recorder.replay_seconds, 120);
+
+        // A corrupt overlay is a hard error, like a broken config.
+        assert!(Config::parse_with_settings("", Some("quality = 'x'")).is_err());
+        // An out-of-range overlay fails validation.
+        assert!(Config::parse_with_settings("", Some("quality = 99")).is_err());
+    }
+
+    #[test]
+    fn performance_policy_defaults_to_automatic_vrr() {
+        let config = Config::parse("").unwrap();
+        assert_eq!(config.performance.profile, "auto");
+        assert!(config.performance.fullscreen_vrr);
+
+        let config =
+            Config::parse("[performance]\nprofile='gaming'\nfullscreen_vrr=false").unwrap();
+        assert_eq!(config.performance.profile, "gaming");
+        assert!(!config.performance.fullscreen_vrr);
     }
 }

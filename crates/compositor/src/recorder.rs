@@ -79,6 +79,7 @@ impl RecorderController {
             .args(["--output", output_path.to_string_lossy().as_ref()])
             .args(["--fps", &config.screen_fps.to_string()])
             .args(["--codec", config.codec.as_str()])
+            .args(["--hdr", if config.hdr { "true" } else { "false" }])
             .args(["--quality", &config.quality.to_string()])
             .args(["--width", &config.output_width.to_string()])
             .args(["--height", &config.output_height.to_string()])
@@ -156,13 +157,6 @@ impl RecorderController {
                 profile.name, profile.api
             ));
         }
-        if config.codec != "h264" {
-            return Err(
-                "direct graphics-API capture currently supports H.264 only; set recorder.codec = \"h264\""
-                    .into(),
-            );
-        }
-
         let output_directory = expand_home(&config.output_directory)?;
         std::fs::create_dir_all(&output_directory).map_err(|error| {
             format!(
@@ -196,7 +190,14 @@ impl RecorderController {
         command
             .args(["--output", output_path.to_string_lossy().as_ref()])
             .args(["--fps", &profile.fps.to_string()])
-            .args(["--quality", &config.quality.to_string()])
+            .args(["--quality", &config.quality.to_string()]);
+        if !profile.target_process_name.is_empty() {
+            if profile.api != "opengl" {
+                return Err("only OpenGL game profiles may target a launcher child process".into());
+            }
+            command.args(["--target-process-name", &profile.target_process_name]);
+        }
+        command
             .arg("--")
             .args(&profile.command)
             .stdin(Stdio::null())
@@ -239,12 +240,6 @@ impl RecorderController {
         }
         if !config.enabled {
             return Err("recorder is disabled in configuration".into());
-        }
-        if config.codec != "h264" {
-            return Err(
-                "OpenGL runtime attach currently supports H.264 only; set recorder.codec = \"h264\""
-                    .into(),
-            );
         }
         validate_attach_target(pid)?;
 

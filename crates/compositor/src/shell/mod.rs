@@ -46,7 +46,7 @@ mod element;
 mod grabs;
 pub(crate) mod ssd;
 #[cfg(feature = "xwayland")]
-mod x11;
+pub(crate) mod x11;
 mod xdg;
 
 pub use self::element::*;

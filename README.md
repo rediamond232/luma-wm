@@ -143,6 +143,7 @@ width = 2560
 height = 1440
 hz = 144.0
 vrr = false # opt in with true on a compatible DRM output
+hdr = false # opt in to 10-bit BT.2020/PQ HDR10 output
 scale = 1.0
 x = 0
 y = 0
@@ -169,6 +170,39 @@ VRR requests apply at DRM setup and config reload. Unsupported displays or faile
 requests appear in logs and the status error field. Removing the output's VRR
 setting requests disabling it. Display activation and frame pacing still require
 hardware verification; a successful request is not proof of physical VRR operation.
+
+Luma also has a session performance policy:
+
+```toml
+[performance]
+profile = "auto" # auto, desktop, or gaming
+fullscreen_vrr = true
+```
+
+`auto` preserves the configured theme on the desktop, then removes compositor
+effects and enables VRR only on outputs showing a fullscreen application.
+`desktop` prevents the automatic switch; `gaming` forces the low-overhead theme
+and VRR policy on every output. These can be overridden for the current session
+without editing the configuration:
+
+```sh
+wmctl performance status
+wmctl performance reset
+wmctl performance profile gaming
+wmctl performance profile auto
+```
+
+Performance status reports direct-scanout/composed/empty frames, missed repaint
+deadlines, render percentiles, and input-event-to-submit percentiles per output.
+The latter is compositor software latency, not a claim about panel input-to-photon
+latency. Fullscreen rendering still falls back to composition when a buffer,
+overlay, transform, cursor, or active capture path is not scanout-compatible.
+HDR requests also apply at DRM setup and config reload. Luma requires a connector
+with `Colorspace`/`HDR_OUTPUT_METADATA`, a 10-bit scanout format, and 1024-entry
+degamma/gamma LUTs. It decodes the compositor's sRGB working space, converts
+BT.709 primaries to BT.2020, maps SDR white to 203 nits with the PQ transfer,
+and sends HDR10 metadata (1000-nit mastering peak). Unsupported DRM hardware
+keeps the existing output state and reports the exact missing property.
 
 Rules match app IDs exactly and titles by substring. Later matching rules override
 earlier values. Width and height control the initial floating size; oversized
@@ -470,17 +504,34 @@ The Vulkan path uses the more OBS-like cross-process GPU-sharing architecture:
 the renderer exports images and synchronization while the recorder process
 owns EGL import and NVENC. Neither path transfers frame pixels through CPU RAM.
 
-`recorder.quality` is the H.264 constant-QP value used by both recorder paths:
+`recorder.quality` is the H.264/HEVC constant-QP value used by the recorder paths:
 valid values are 1 through 51, lower is higher quality, and the default is 20.
 At 2560x1440 and 480 FPS, QP 20 can create very large files and requires a very
 fast local disk for sustained recording. Raise the QP or lower the capture rate
 when storage cannot sustain the recording; do not expect the game-present path
 to hide disk or encoder overload.
 
+The Screen recorder supports HDR10 with a 10-bit compositor DMA-BUF and NVIDIA
+HEVC Main10 encoding:
+
+```toml
+[recorder]
+hdr = true
+codec = "hevc"
+```
+
+HDR recording is intentionally rejected with H.264 or when the compositor does
+not offer a 10-bit ARGB/XRGB capture format. The output carries P010 video and
+BT.2020/PQ signaling in the Hybrid MP4. The direct OpenGL/Vulkan capture modes
+remain H.264 SDR, so choose **Screen (low-lag)** in the recorder panel for HDR.
+
 For an application which can be started directly, configure an API launch profile.
-It must `exec` the renderer; a launcher that forks a child is rejected by the
-exact-PID guard. For a running renderer, open Luma Recorder, choose **OpenGL API
-Inject**, select a detected GLX/EGL process, and press Enter. The picker reads
+It may `exec` the renderer directly, or, for a launcher that forks its renderer,
+set `target_process_name` to the renderer's exact Linux task name (`comm`) such
+as `java`. The preload hook remains passive in all other launcher children and
+the muxer accepts only that named descendant of the launched command. For a
+running renderer, open Luma Recorder, choose **OpenGL API Inject**, select a
+detected GLX/EGL process, and press Enter. The picker reads
 only PID, ownership, mapped graphics-library names, and `comm`; it never reads
 the command line because application arguments can contain secrets. Runtime
 injection has no JDK or JVM Attach dependency; it always loads the native `.so`.
@@ -495,10 +546,10 @@ native recorder worker, never the selected application.
 [[recorder.game_profiles]]
 name = "minecraft-opengl"
 api = "opengl"
-# This must be the executable that owns the OpenGL presents, not a launcher
-# which later forks the game process.
+# Direct renderer, or a launcher command plus the child renderer name below.
 command = ["/absolute/path/to/game-binary", "--game"]
 fps = 480
+# target_process_name = "java"
 ```
 
 For Vulkan, use the same shape with `api = "vulkan"`. Vulkan must be selected
@@ -521,16 +572,21 @@ wmctl recorder game-attach PID
 
 Select **OpenGL Launch Profile** in the native recorder panel to use a matching
 profile there, or **Vulkan API Layer** for a Vulkan profile.
-The direct path currently requires `recorder.codec = "h264"`; HEVC remains
-available for the Screen recorder path.
+The direct graphics-API path always produces SDR H.264 independently of
+`recorder.codec`; the Screen and **Xwayland Zero-Copy** paths may remain HEVC
+HDR. The panel's Start button reports the specific blocker for the selected
+method (missing window, missing process, or missing profile) instead of a
+generic profile message.
 
 Direct graphics-API capture is currently **video-only**. It does not add desktop audio
 or microphone tracks; those tracks belong to the Screen recorder path.
 
 Stopping a direct recording with the panel's **Stop** control or `wmctl recorder
 stop` releases the injected GL/NVENC state on the next present, finalizes the
-MP4, and leaves the application running. Re-injection into the same process is
-currently unsupported; restart it before a second injected recording.
+MP4, and leaves the application running. Attaching again to the same process
+starts a new recording without re-injection: the resident hook notices the
+fresh session on its own present thread and re-arms itself, so no ptrace
+run is needed (the game must still be presenting frames).
 
 The **Screen** and **Xwayland Zero-Copy** profiles put an OBS-style desktop plus
 microphone mix in one audio track, so normal players and editors hear both
@@ -567,6 +623,26 @@ the first 30 decoded frames all distinct, an upright image, and a finalized Hybr
 support external DMA-BUF memory, DRM format modifiers, and native fence export;
 unsupported formats fail without replacing the API path with screen capture.
 
+### Remembered recording method and source
+
+The Settings page's **Capture** category stores the recording method
+(`screen`, `xwayland`, `inject`, `opengl`, `vulkan`) and a stable source
+identity alongside the encoder settings: for windows the app_id and title,
+for injection the process command name, for launch profiles the profile name.
+**Remember current** stores the Controls page's current selection; reopening
+the panel (or restarting the session) restores the method and snaps the
+selection cursor back to the remembered source when it is open. Starting a
+recording re-resolves the stored identity against the live windows
+(`wmctl recorder start remembered` does the same), so a changed window ID or
+PID never breaks the recall. Set the same keys directly if needed:
+
+```sh
+wmctl recorder set capture_mode xwayland
+wmctl recorder set window_match firefox
+wmctl recorder set inject_process cs2
+wmctl recorder set game_profile mine-opengl
+```
+
 The same controls are available over IPC:
 
 ```sh
@@ -576,6 +652,30 @@ wmctl recorder start region 100 80 1920 1080
 wmctl recorder pause
 wmctl recorder stop
 ```
+
+### Runtime recorder settings (OBS-style panel)
+
+The native recorder panel (`Super+Alt+R` or the **Luma Recorder** desktop entry)
+has an OBS-Studio-style interface: a controls page with capture-source
+selection and Start/Stop, Pause, and Save Replay transport buttons, plus a
+**Settings** page (open it with the Settings button or `Tab`) with Output,
+Video, Audio, and Replay categories. Encoder, quality, HDR, cursor, capture
+FPS, injection FPS, output size, audio sources, replay limits, and the
+recording path are all editable there with `Left`/`Right` (or mouse);
+`Enter` starts an inline edit of the recording path.
+
+Every change is applied at runtime through the compositor (`wmctl recorder set
+KEY VALUE`) and persisted atomically to
+`~/.config/wm/recorder-settings.toml`, an override layer that is merged over
+`[recorder]` in `config.toml` on every load and validated like any other
+configuration. You do not need to edit `config.toml` to change recorder
+behavior. Changes made while a recording is active apply to the next
+recording, because the engine consumes its options at spawn. **Reset
+defaults** (or `wmctl recorder settings-reset`) removes the overlay and
+restores the `config.toml` values. Key list: `enabled`, `hdr`, `screen_fps`,
+`fps`, `codec`, `quality`, `output_width`, `output_height`,
+`output_directory`, `container`, `cursor`, `desktop_audio`, `microphone`,
+`replay_seconds`, `replay_max_mib`.
 
 The packaged build also installs **Luma Recorder** in application menus. For a
 local checkout, install the development desktop entry once with:
@@ -610,6 +710,27 @@ seconds in an empty nested compositor, with shell services disabled. Avoid
 interacting with its window during the sample. It reports measurements rather
 than imposing a machine-dependent threshold; it does not measure GPU use,
 frame latency, DRM behavior or the complete desktop's power consumption.
+
+For the physical TTY session, collect a longer non-invasive sample with:
+
+```sh
+tools/check-performance.py --duration 60 --label desktop
+tools/check-performance.py --duration 60 --label idle --assert-idle
+```
+
+The report separates anonymous/private process memory from NVIDIA mappings,
+counts open DMA-BUF descriptors, averages available NVIDIA utilization data,
+and includes deltas from the compositor's per-output counters. Run the same
+command in desktop, fullscreen-game, and recording scenarios rather than
+comparing unlike workloads.
+
+The normal release remains portable. A separate machine-local build enables
+native CPU instructions and fat LTO without replacing `target/release`:
+
+```sh
+tools/build-performance.sh
+# binaries: target/performance/performance/
+```
 
 The nested check creates its own temporary config/socket, launches a compositor,
 opens test terminals, checks window policy and repeated bar reloads, then exits.
@@ -656,6 +777,10 @@ GStreamer's GL upload path, verifies two damage-paced PipeWire frames, and downl
 PNG test sink; ordinary consumers can retain the buffers on the GPU.
 Legacy clients can use version 3 of `zwlr_screencopy_v1`, including region, cursor and
 `copy_with_damage` support.
+The session publishes its Wayland display to D-Bus and the systemd user manager so
+desktop-portal requests can launch applications in Luma. Packaged sessions use the GTK
+portal for opening links, file/app choosers and other desktop requests, while screenshot
+and ScreenCast requests continue to use the wlr backend.
 Capture is rejected while locked/inactive,
 and locking stops existing sessions. DRM capture and lock isolation still need
 hardware/protocol validation. `check-capture.py` builds a Wayland C client using
@@ -673,7 +798,10 @@ layouts and repeat settings remain available.
 
 `python3 tools/check-lock-boundaries.py` verifies that a dedicated nested session
 withholds unsupported lock and virtual-input globals and preserves desktop focus
-when an unmapped Wayland client connects. This does not validate DRM locking.
+when an unmapped Wayland client connects. Lock requests are rejected on these
+nested backends; this does not validate DRM locking.
+`Super+Escape` prefers Hyprlock with Luma's standalone theme; systems without
+Hyprlock fall back to Swaylock. Install either locker for session lock support.
 
 Wayland and XWayland windows retain a GPU image for a closing fade on the X11
 development and DRM backends. The fade follows `animation_ms`, is bypassed by

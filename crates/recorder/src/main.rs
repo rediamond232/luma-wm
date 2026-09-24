@@ -27,7 +27,10 @@ use gbm::{BufferObject, BufferObjectFlags, Device, Format, Modifier};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_allocators::{DmaBufAllocator, prelude::DmaBufAllocatorExtManual};
-use gstreamer_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMeta};
+use gstreamer_video::{
+    VideoContentLightLevel, VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMasteringDisplayInfo,
+    VideoMasteringDisplayInfoCoordinate, VideoMeta, dma_drm_fourcc_to_format,
+};
 
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
@@ -52,6 +55,7 @@ struct Options {
     output: PathBuf,
     fps: u32,
     codec: String,
+    hdr: bool,
     quality: u8,
     desktop_audio: String,
     microphone: String,
@@ -69,6 +73,7 @@ impl Options {
             output: PathBuf::new(),
             fps: 480,
             codec: "h264".into(),
+            hdr: false,
             quality: 20,
             desktop_audio: "disabled".into(),
             microphone: "disabled".into(),
@@ -86,6 +91,7 @@ impl Options {
                 "--output" => options.output = value.into(),
                 "--fps" => options.fps = value.parse().map_err(|_| "invalid fps")?,
                 "--codec" => options.codec = value,
+                "--hdr" => options.hdr = value.parse().map_err(|_| "hdr must be true or false")?,
                 "--quality" => options.quality = value.parse().map_err(|_| "invalid quality")?,
                 "--desktop-audio" => options.desktop_audio = value,
                 "--microphone" => options.microphone = value,
@@ -116,6 +122,9 @@ impl Options {
         }
         if options.replay_seconds.is_some() {
             return Err("native replay buffering is not implemented yet".into());
+        }
+        if options.hdr && options.codec != "hevc" {
+            return Err("HDR recording requires --codec hevc".into());
         }
         Ok(options)
     }
@@ -381,7 +390,6 @@ struct Encoder {
     fps: u32,
     last_frame_index: Option<u64>,
     commit_paced: bool,
-    commit_rebasing: bool,
 }
 
 impl Encoder {
@@ -403,26 +411,57 @@ impl Encoder {
         } else {
             "h265parse"
         };
+        let output_width = options_width(options, width);
+        let output_height = options_height(options, height);
+        let video_chain = if options.hdr {
+            let primaries = [
+                VideoMasteringDisplayInfoCoordinate {
+                    x: 35_400,
+                    y: 14_600,
+                },
+                VideoMasteringDisplayInfoCoordinate {
+                    x: 8_500,
+                    y: 39_850,
+                },
+                VideoMasteringDisplayInfoCoordinate { x: 6_550, y: 2_300 },
+            ];
+            let mastering = VideoMasteringDisplayInfo::new(
+                primaries,
+                VideoMasteringDisplayInfoCoordinate {
+                    x: 15_635,
+                    y: 16_450,
+                },
+                10_000_000,
+                1,
+            );
+            let content_light = VideoContentLightLevel::new(1000, 400);
+            // Keep the capture/scaling path on the GPU. CUDA performs the final
+            // RGB -> P010 conversion so NVENC receives real 10-bit input; the
+            // caps make it emit BT.2020/PQ VUI in a Main10 HEVC stream.
+            format!(
+                "glupload ! glcolorscale \
+                 ! video/x-raw(memory:GLMemory),width={output_width},height={output_height},framerate={}/1 \
+                 ! cudaupload ! cudaconvert \
+                 ! video/x-raw(memory:CUDAMemory),format=P010_10LE,colorimetry=bt2100-pq,mastering-display-info=(string)\"{mastering}\",content-light-level=(string)\"{content_light}\",width={output_width},height={output_height},framerate={}/1 \
+                 ! {encoder} preset=p1 tune=ultra-low-latency rc-mode=constqp qp-const-i={} qp-const-p={} qp-const-b={} bframes=0 rc-lookahead=0 zerolatency=true \
+                 ! video/x-h265,profile=main-10 ! {parser}",
+                options.fps, options.fps, options.quality, options.quality, options.quality,
+            )
+        } else {
+            format!(
+                "glupload ! glcolorscale \
+                 ! video/x-raw(memory:GLMemory),format=RGBA,width={output_width},height={output_height},framerate={}/1 \
+                 ! glcolorconvert \
+                 ! video/x-raw(memory:GLMemory),format=NV12,width={output_width},height={output_height},framerate={}/1 \
+                 ! {encoder} preset=p1 tune=ultra-low-latency rc-mode=constqp qp-const-i={} qp-const-p={} qp-const-b={} bframes=0 rc-lookahead=0 zerolatency=true \
+                 ! {parser}",
+                options.fps, options.fps, options.quality, options.quality, options.quality,
+            )
+        };
         let mut pipeline = format!(
             "appsrc name=video is-live=true format=time do-timestamp=false block=true max-buffers=4 \
-             ! glupload ! glcolorscale \
-             ! video/x-raw(memory:GLMemory),format=RGBA,width={},height={},framerate={}/1 \
-             ! glcolorconvert \
-             ! video/x-raw(memory:GLMemory),format=NV12,width={},height={},framerate={}/1 \
-             ! {} preset=p1 tune=ultra-low-latency rc-mode=constqp qp-const-i={} qp-const-p={} qp-const-b={} bframes=0 rc-lookahead=0 zerolatency=true \
-             ! {} ! queue ! mux.video_0 mp4mux name=mux fragment-duration=1000 streamable=true movie-timescale=48000 trak-timescale=48000 \
-             ! fdsink name=transport_sink sync=false",
-            options_width(options, width),
-            options_height(options, height),
-            options.fps,
-            options_width(options, width),
-            options_height(options, height),
-            options.fps,
-            encoder,
-            options.quality,
-            options.quality,
-            options.quality,
-            parser,
+             ! {video_chain} ! queue ! mux.video_0 mp4mux name=mux fragment-duration=1000 streamable=true movie-timescale=48000 trak-timescale=48000 \
+             ! fdsink name=transport_sink sync=false"
         );
         let enabled_audio = [&options.desktop_audio, &options.microphone]
             .into_iter()
@@ -517,10 +556,17 @@ impl Encoder {
             "Hybrid MP4 muxer input is missing".to_string()
         })?;
         transport_sink.set_property("fd", muxer_stdin.as_raw_fd());
-        let info = VideoInfo::builder(VideoFormat::Bgra, width, height)
-            .fps(gst::Fraction::new(options.fps as i32, 1))
-            .build()
-            .map_err(|error| error.to_string())?;
+        let video_format = dma_drm_fourcc_to_format(fourcc)
+            .map_err(|_| format!("unsupported DMA-BUF DRM format 0x{fourcc:08x}"))?;
+        let mut info_builder = VideoInfo::builder(video_format, width, height)
+            .fps(gst::Fraction::new(options.fps as i32, 1));
+        if options.hdr {
+            let colorimetry = "sRGB"
+                .parse()
+                .map_err(|error| format!("invalid HDR input colorimetry: {error}"))?;
+            info_builder = info_builder.colorimetry(&colorimetry);
+        }
+        let info = info_builder.build().map_err(|error| error.to_string())?;
         let caps = VideoInfoDmaDrm::new(info, fourcc, modifier)
             .to_caps()
             .map_err(|error| error.to_string())?;
@@ -546,7 +592,6 @@ impl Encoder {
             fps: options.fps,
             last_frame_index: None,
             commit_paced: options.commit_paced,
-            commit_rebasing: options.commit_paced,
         })
     }
 
@@ -556,33 +601,11 @@ impl Encoder {
         release_sender: &mpsc::Sender<usize>,
     ) -> Result<PushOutcome, String> {
         let presentation_ns = input.presentation_ns;
-        let frame_index = if self.commit_paced && self.commit_rebasing {
-            // NVENC and its downstream transport can take tens of milliseconds
-            // to accept their first buffers. Do not interpret that one-time
-            // initialization as missing game frames: keep the first small run
-            // consecutive and continuously align the wall-clock origin to it.
-            let next = self
-                .last_frame_index
-                .map(|previous| previous.saturating_add(1))
-                .unwrap_or(0);
-            let (pts, _) = frame_times(next, self.fps);
-            self.presentation_origin_ns = Some(
-                presentation_ns
-                    .saturating_sub(self.paused_ns)
-                    .saturating_sub(pts),
-            );
-            next
-        } else {
-            let origin_ns = *self.presentation_origin_ns.get_or_insert(presentation_ns);
-            let elapsed_ns = presentation_ns
-                .saturating_sub(origin_ns)
-                .saturating_sub(self.paused_ns);
-            paced_frame_index(
-                frame_index_at(u128::from(elapsed_ns), self.fps),
-                self.last_frame_index,
-                self.commit_paced,
-            )
-        };
+        let origin_ns = *self.presentation_origin_ns.get_or_insert(presentation_ns);
+        let elapsed_ns = presentation_ns
+            .saturating_sub(origin_ns)
+            .saturating_sub(self.paused_ns);
+        let frame_index = frame_index_at(u128::from(elapsed_ns), self.fps);
         if self
             .last_frame_index
             .is_some_and(|previous| frame_index <= previous)
@@ -616,6 +639,39 @@ impl Encoder {
             unfilled,
             maximum_gap: duplicates.saturating_add(unfilled),
             skipped: false,
+        })
+    }
+
+    fn push_committed(
+        &mut self,
+        input: &EncodeFrame,
+        release_sender: &mpsc::Sender<usize>,
+    ) -> Result<PushOutcome, String> {
+        let origin_ns = *self
+            .presentation_origin_ns
+            .get_or_insert(input.presentation_ns);
+        let elapsed_ns = input
+            .presentation_ns
+            .saturating_sub(origin_ns)
+            .saturating_sub(self.paused_ns);
+        let frame_index = paced_frame_index(
+            frame_index_at(u128::from(elapsed_ns), self.fps),
+            self.last_frame_index,
+            true,
+        );
+        let gap = self
+            .last_frame_index
+            .map(|previous| frame_index.saturating_sub(previous).saturating_sub(1))
+            .unwrap_or(0);
+        let release = BufferRelease::new(release_sender.clone(), input.slot);
+        self.push_one(input, frame_index, &release)?;
+        release.retire();
+        self.last_frame_index = Some(frame_index);
+        Ok(PushOutcome {
+            written: 1,
+            unfilled: gap,
+            maximum_gap: gap,
+            ..PushOutcome::default()
         })
     }
 
@@ -682,9 +738,6 @@ impl Encoder {
             self.pipeline
                 .set_state(gst::State::Playing)
                 .map_err(|error| format!("failed to resume encoder: {error:?}"))?;
-            if self.commit_paced {
-                self.commit_rebasing = true;
-            }
         }
         Ok(())
     }
@@ -833,21 +886,30 @@ fn open_render_node(device: u64) -> Result<File, String> {
     Err("capture render node was not found".into())
 }
 
-fn select_format(formats: &[(u32, Vec<u64>)]) -> Result<(Format, Modifier), String> {
-    for preferred in [Format::Argb8888, Format::Xrgb8888] {
+fn select_format(formats: &[(u32, Vec<u64>)], hdr: bool) -> Result<(Format, Modifier), String> {
+    let preferred_formats: &[Format] = if hdr {
+        &[Format::Argb2101010, Format::Xrgb2101010]
+    } else {
+        &[Format::Argb8888, Format::Xrgb8888]
+    };
+    for preferred in preferred_formats {
         if let Some((_, modifiers)) = formats
             .iter()
-            .find(|(format, _)| *format == preferred as u32)
+            .find(|(format, _)| *format == *preferred as u32)
             && let Some(modifier) = modifiers
                 .iter()
                 .copied()
                 .find(|modifier| *modifier == u64::from(Modifier::Linear))
                 .or_else(|| modifiers.first().copied())
         {
-            return Ok((preferred, Modifier::from(modifier)));
+            return Ok((*preferred, Modifier::from(modifier)));
         }
     }
-    Err("compositor did not offer ARGB/XRGB DMA-BUF capture".into())
+    Err(if hdr {
+        "compositor did not offer 10-bit ARGB/XRGB DMA-BUF capture required for HDR".into()
+    } else {
+        "compositor did not offer 8-bit ARGB/XRGB DMA-BUF capture".into()
+    })
 }
 
 fn create_capture_buffer(
@@ -1002,7 +1064,7 @@ fn run() -> Result<(), String> {
     )?;
     let gbm =
         Device::new(render_node).map_err(|error| format!("failed to open GBM device: {error}"))?;
-    let (format, modifier) = select_format(&state.formats)?;
+    let (format, modifier) = select_format(&state.formats, options.hdr)?;
     let (command_tx, command_rx) = mpsc::channel();
     thread::spawn(move || {
         for line in std::io::stdin().lock().lines().map_while(Result::ok) {
@@ -1148,7 +1210,11 @@ fn run() -> Result<(), String> {
         state.height,
         options.fps,
         options.output.display(),
-        options.codec
+        if options.hdr {
+            "HEVC Main10 HDR10"
+        } else {
+            options.codec.as_str()
+        }
     );
     Ok(())
 }
@@ -1159,7 +1225,7 @@ fn run_encoder_worker(
     release_sender: mpsc::Sender<usize>,
 ) -> Result<EncoderStats, String> {
     if encoder.commit_paced {
-        return run_commit_clock_worker(encoder, commands, release_sender);
+        return run_commit_worker(encoder, commands, release_sender);
     }
     let mut stats = EncoderStats::default();
     while let Ok(command) = commands.recv() {
@@ -1187,179 +1253,26 @@ fn run_encoder_worker(
     Ok(stats)
 }
 
-fn run_commit_clock_worker(
+fn run_commit_worker(
     mut encoder: Encoder,
     commands: mpsc::Receiver<EncoderCommand>,
     release_sender: mpsc::Sender<usize>,
 ) -> Result<EncoderStats, String> {
-    let interval = Duration::from_secs_f64(1.0 / f64::from(encoder.fps));
     let mut stats = EncoderStats::default();
-    let mut latest: Option<(EncodeFrame, Arc<BufferRelease>)> = None;
-    let mut fresh = false;
-    let mut paused = false;
-    let clock_origin = Instant::now();
-    let mut paused_total = Duration::ZERO;
-    let mut pause_started = None;
-    let mut next_tick = Some(clock_origin);
-    let mut frame_index = 0u64;
-    let mut duplicate_run = 0u64;
-    let mut finishing = false;
-    let mut finish_target = None;
-
-    loop {
-        // Always consume completed captures before servicing an overdue clock
-        // tick. At 480 Hz even a tiny encoder delay can leave the clock late;
-        // prioritising that late tick indefinitely would retain every DMA-BUF,
-        // repeat one stale image and stop the capture producer completely.
-        loop {
-            match commands.try_recv() {
-                Ok(EncoderCommand::Frame(input)) if !finishing => {
-                    let release = BufferRelease::new(release_sender.clone(), input.slot);
-                    if let Some((_, old_release)) = latest.replace((input, release)) {
-                        old_release.retire();
-                    }
-                    fresh = true;
-                }
-                Ok(EncoderCommand::Frame(input)) => {
-                    let _ = release_sender.send(input.slot);
-                }
-                Ok(EncoderCommand::Pause(value)) if !finishing => {
-                    if let Err(error) = encoder.set_paused(value) {
-                        if let Some((_, release)) = latest.take() {
-                            release.retire();
-                        }
-                        return Err(error);
-                    }
-                    let now = Instant::now();
-                    if value && !paused {
-                        pause_started = Some(now);
-                    } else if !value && paused {
-                        if let Some(started) = pause_started.take() {
-                            paused_total = paused_total.saturating_add(now.duration_since(started));
-                        }
-                    }
-                    paused = value;
-                    if !paused {
-                        next_tick = Some(now);
-                    }
-                }
-                Ok(EncoderCommand::Pause(_)) => {}
-                Ok(EncoderCommand::Finish) | Err(mpsc::TryRecvError::Disconnected) => {
-                    finishing = true;
-                    let now = Instant::now();
-                    let current_pause = pause_started
-                        .map(|started| now.duration_since(started))
-                        .unwrap_or_default();
-                    let active = now
-                        .duration_since(clock_origin)
-                        .saturating_sub(paused_total)
-                        .saturating_sub(current_pause);
-                    finish_target = Some(frames_for_elapsed(active, encoder.fps));
-                    if let Err(error) = encoder.begin_audio_eos() {
-                        if let Some((_, release)) = latest.take() {
-                            release.retire();
-                        }
-                        return Err(error);
-                    }
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
+    // Capture is already paced at the requested rate. A second timer races
+    // each completed frame and discards it when the wakeup lands just early;
+    // use the capture timestamp for its CFR slot instead.
+    while let Ok(command) = commands.recv() {
+        match command {
+            EncoderCommand::Frame(input) => {
+                let outcome = encoder.push_committed(&input, &release_sender)?;
+                stats.encoded_frames = stats.encoded_frames.saturating_add(outcome.written);
+                stats.unfilled_frames = stats.unfilled_frames.saturating_add(outcome.unfilled);
+                stats.maximum_gap = stats.maximum_gap.max(outcome.maximum_gap);
             }
+            EncoderCommand::Pause(paused) => encoder.set_paused(paused)?,
+            EncoderCommand::Finish => break,
         }
-
-        if finishing
-            && (latest.is_none() || finish_target.is_some_and(|target| frame_index >= target))
-        {
-            break;
-        }
-
-        if (finishing
-            || (!paused
-                && latest.is_some()
-                && next_tick.is_some_and(|deadline| Instant::now() >= deadline)))
-            && latest.is_some()
-        {
-            let (input, release) = latest.as_ref().expect("checked above");
-            if let Err(error) = encoder.push_one(input, frame_index, release) {
-                if let Some((_, release)) = latest.take() {
-                    release.retire();
-                }
-                return Err(error);
-            }
-            stats.encoded_frames = stats.encoded_frames.saturating_add(1);
-            if fresh {
-                fresh = false;
-                duplicate_run = 0;
-            } else {
-                stats.duplicated_frames = stats.duplicated_frames.saturating_add(1);
-                duplicate_run = duplicate_run.saturating_add(1);
-                stats.maximum_gap = stats.maximum_gap.max(duplicate_run);
-            }
-            frame_index = frame_index.saturating_add(1);
-            if !finishing {
-                next_tick = next_tick.map(|deadline| deadline + interval);
-            }
-            continue;
-        }
-
-        let timeout = if paused || latest.is_none() {
-            Duration::from_millis(100)
-        } else {
-            next_tick
-                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or_default()
-        };
-        match commands.recv_timeout(timeout) {
-            Ok(EncoderCommand::Frame(input)) => {
-                let release = BufferRelease::new(release_sender.clone(), input.slot);
-                if let Some((_, old_release)) = latest.replace((input, release)) {
-                    old_release.retire();
-                }
-                fresh = true;
-            }
-            Ok(EncoderCommand::Pause(value)) => {
-                if let Err(error) = encoder.set_paused(value) {
-                    if let Some((_, release)) = latest.take() {
-                        release.retire();
-                    }
-                    return Err(error);
-                }
-                let now = Instant::now();
-                if value && !paused {
-                    pause_started = Some(now);
-                } else if !value && paused {
-                    if let Some(started) = pause_started.take() {
-                        paused_total = paused_total.saturating_add(now.duration_since(started));
-                    }
-                }
-                paused = value;
-                if !paused {
-                    next_tick = Some(now);
-                }
-            }
-            Ok(EncoderCommand::Finish) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                finishing = true;
-                let now = Instant::now();
-                let current_pause = pause_started
-                    .map(|started| now.duration_since(started))
-                    .unwrap_or_default();
-                let active = now
-                    .duration_since(clock_origin)
-                    .saturating_sub(paused_total)
-                    .saturating_sub(current_pause);
-                finish_target = Some(frames_for_elapsed(active, encoder.fps));
-                if let Err(error) = encoder.begin_audio_eos() {
-                    if let Some((_, release)) = latest.take() {
-                        release.retire();
-                    }
-                    return Err(error);
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    }
-    if let Some((_, release)) = latest {
-        release.retire();
     }
     encoder.stop()?;
     Ok(stats)
@@ -1386,6 +1299,7 @@ fn frame_times(frame: u64, fps: u32) -> (u64, u64) {
     (pts, next)
 }
 
+#[cfg(test)]
 fn frames_for_elapsed(elapsed: Duration, fps: u32) -> u64 {
     let numerator = elapsed.as_nanos().saturating_mul(u128::from(fps));
     let frames = numerator.saturating_add(999_999_999) / 1_000_000_000;
@@ -1473,5 +1387,22 @@ mod tests {
         assert_eq!(cfr_span(Some(9), 10, 480), (10, 0, 0));
         assert_eq!(cfr_span(Some(9), 13, 480), (10, 3, 0));
         assert_eq!(cfr_span(Some(9), 600, 480), (120, 480, 110));
+    }
+
+    #[test]
+    fn hdr_capture_requires_and_selects_a_ten_bit_format() {
+        let formats = vec![
+            (Format::Argb8888 as u32, vec![u64::from(Modifier::Linear)]),
+            (
+                Format::Argb2101010 as u32,
+                vec![u64::from(Modifier::Linear)],
+            ),
+        ];
+        assert_eq!(select_format(&formats, false).unwrap().0, Format::Argb8888);
+        assert_eq!(
+            select_format(&formats, true).unwrap().0,
+            Format::Argb2101010
+        );
+        assert!(select_format(&formats[..1], true).is_err());
     }
 }

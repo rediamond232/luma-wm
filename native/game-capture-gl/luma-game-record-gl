@@ -7,12 +7,13 @@ set -euo pipefail
 umask 077
 
 usage() {
-    echo "Usage: $0 --output FILE.mp4 --fps 30..480 [--quality 1..51] -- command [args...]" >&2
+    echo "Usage: $0 --output FILE.mp4 --fps 30..480 [--quality 1..51] [--target-process-name NAME] -- command [args...]" >&2
 }
 
 output=
 fps=
 quality=20
+target_process_name=
 while (($#)); do
     case "$1" in
         --output)
@@ -28,6 +29,11 @@ while (($#)); do
         --quality)
             (($# >= 2)) || { usage; exit 64; }
             quality=$2
+            shift 2
+            ;;
+        --target-process-name)
+            (($# >= 2)) || { usage; exit 64; }
+            target_process_name=$2
             shift 2
             ;;
         --)
@@ -49,8 +55,12 @@ done
     usage
     exit 64
 }
+[[ -z $target_process_name || $target_process_name =~ ^[[:alnum:]_.-]{1,15}$ ]] || { usage; exit 64; }
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+receiver=${LUMA_GAME_CAPTURE_RECEIVER:-$script_dir/build/luma-opengl-capture-receiver}
+[[ -x $script_dir/luma-opengl-capture-receiver && -z ${LUMA_GAME_CAPTURE_RECEIVER:-} ]] && receiver=$script_dir/luma-opengl-capture-receiver
+[[ -x $receiver ]] || { echo "Missing GPU capture receiver: $receiver" >&2; exit 66; }
 if [[ -n ${LUMA_GAME_CAPTURE_MUXER:-} ]]; then
     muxer=$LUMA_GAME_CAPTURE_MUXER
 elif [[ -x $script_dir/luma-game-capture-muxer ]]; then
@@ -69,12 +79,28 @@ runtime_base=${XDG_RUNTIME_DIR:-/tmp}
 session_dir=$(mktemp -d -- "$runtime_base/luma-game-capture.XXXXXX")
 socket_path="$session_dir/video.sock"
 expected_pid_file="$session_dir/game.pid"
+receiver_pid_file="$session_dir/receiver.pid"
+export_socket="$session_dir/export.sock"
+receiver_pid=
 token=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 muxer_pid=
 game_wait_pid=
 stopping=0
 
 stop_muxer() {
+    if [[ -n ${receiver_pid:-} ]]; then
+        kill -TERM "$receiver_pid" 2>/dev/null || true
+        wait "$receiver_pid" 2>/dev/null || true
+        receiver_pid=
+        # Receiver EOF lets the muxer finalize normally before a fallback
+        # signal. Never propagate these signals to the game session.
+        if [[ -n ${muxer_pid:-} ]]; then
+            for _ in $(seq 1 200); do
+                kill -0 "$muxer_pid" 2>/dev/null || break
+                sleep 0.01
+            done
+        fi
+    fi
     # Deliberately address only the sidecar's PID. In particular, never use a
     # negative PID/process-group signal here: the game runs in its own session
     # and must keep running when a user stops recording from Luma.
@@ -87,6 +113,7 @@ stop_muxer() {
 
 cleanup() {
     stop_muxer
+    rm -f -- "$export_socket" "$receiver_pid_file"
     [[ -e $socket_path ]] && rm -f -- "$socket_path"
     [[ -e $expected_pid_file ]] && rm -f -- "$expected_pid_file"
     rmdir -- "$session_dir" 2>/dev/null || true
@@ -103,17 +130,25 @@ on_stop_signal() {
 trap cleanup EXIT
 trap on_stop_signal INT TERM
 
-"$muxer" --socket "$socket_path" --token "$token" --output "$output" --fps "$fps" --expected-pid-file "$expected_pid_file" &
+muxer_args=(--socket "$socket_path" --token "$token" --output "$output" --fps "$fps" --expected-pid-file "$receiver_pid_file")
+receiver_args=(--export-socket "$export_socket" --stream-socket "$socket_path" --token "$token" --fps "$fps" --quality "$quality" --expected-pid-file "$expected_pid_file")
+if [[ -n $target_process_name ]]; then
+    receiver_args+=(--expected-process-name "$target_process_name")
+fi
+"$receiver" "${receiver_args[@]}" &
+receiver_pid=$!
+printf '%s\n' "$receiver_pid" >"$receiver_pid_file"
+"$muxer" "${muxer_args[@]}" &
 muxer_pid=$!
 
 # The hook never retries a failed connection because retrying from every
 # present could perturb a game.  Wait for the private listener before launch.
 for _ in $(seq 1 200); do
-    [[ -S $socket_path ]] && break
+    [[ -S $socket_path && -S $export_socket ]] && break
     kill -0 "$muxer_pid" 2>/dev/null || break
     sleep 0.01
 done
-[[ -S $socket_path ]] || {
+[[ -S $socket_path && -S $export_socket ]] || {
     wait "$muxer_pid" || true
     echo "Luma direct-game muxer did not open its private socket" >&2
     exit 70
@@ -123,10 +158,13 @@ done
 # accidental process-group signal aimed at the recorder wrapper and also makes
 # the ownership boundary explicit: Luma owns the muxer, the user owns the
 # game. `--wait` preserves normal finalization when the game exits naturally.
+launcher_args=(--stream-socket "$export_socket" --token "$token" --fps "$fps" \
+    --quality "$quality" --expected-pid-file "$expected_pid_file")
+if [[ -n $target_process_name ]]; then
+    launcher_args+=(--target-process-name "$target_process_name")
+fi
 set +e
-setsid --wait "$script_dir/luma-game-capture-gl" \
-    --stream-socket "$socket_path" --token "$token" --fps "$fps" \
-    --quality "$quality" --expected-pid-file "$expected_pid_file" -- "$@" &
+setsid --wait "$script_dir/luma-game-capture-gl" "${launcher_args[@]}" -- "$@" &
 game_wait_pid=$!
 # The hook launcher atomically publishes its own exec-preserved PID before it
 # starts the target. That removes the first-swap race and prevents inherited
@@ -134,6 +172,9 @@ game_wait_pid=$!
 wait "$game_wait_pid"
 game_status=$?
 set -e
+kill -TERM "$receiver_pid" 2>/dev/null || true
+wait "$receiver_pid" || true
+receiver_pid=
 
 # A connected hook reaches EOF as the game exits, which asks the muxer to
 # drain every already-received AU and write MP4 indexes. Give that graceful

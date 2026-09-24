@@ -28,14 +28,17 @@ depends=(
   'seatd'
   'systemd-libs'
   'util-linux'
+  'vulkan-icd-loader'
   'wayland'
   'xorg-xwayland'
 )
 optdepends=(
   'grim: screenshots'
   'kitty: default terminal command'
-  'swaylock: session locking'
+  'hyprlock: preferred Luma-themed session locker'
+  'swaylock: fallback session locker when hyprlock is unavailable'
   'wl-clipboard: copying screenshots to the clipboard'
+  'xdg-desktop-portal-gtk: opening links and standard desktop dialogs'
   'xdg-desktop-portal-wlr: screen sharing and capture portals'
   'nvidia-utils: NVIDIA NVENC support for direct OpenGL and Vulkan game capture'
 )
@@ -71,12 +74,17 @@ package() {
     "$pkgdir/usr/bin/libluma_vk_dmabuf_capture.so"
   install -Dm755 "$srcdir/libluma-game-capture-gl.so" \
     "$pkgdir/usr/bin/libluma-game-capture-gl.so"
+  install -Dm755 "$srcdir/luma-opengl-capture-receiver" \
+    "$pkgdir/usr/bin/luma-opengl-capture-receiver"
   install -Dm755 "$srcdir/luma-session" "$pkgdir/usr/bin/luma-session"
   install -Dm644 "$srcdir/default.toml" "$pkgdir/usr/share/luma-wm/default.toml"
+  install -Dm644 "$srcdir/hyprlock.conf" "$pkgdir/usr/share/luma-wm/hyprlock.conf"
   install -Dm644 "$srcdir/luma-wm.desktop" \
     "$pkgdir/usr/share/wayland-sessions/luma-wm.desktop"
   install -Dm644 "$srcdir/luma-recorder.desktop" \
     "$pkgdir/usr/share/applications/luma-recorder.desktop"
+  install -Dm644 "$srcdir/wm-portals.conf" \
+    "$pkgdir/usr/share/xdg-desktop-portal/wm-portals.conf"
   install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 "$srcdir/README.md" "$pkgdir/usr/share/doc/luma-wm/README.md"
   install -Dm644 "$srcdir/THIRD_PARTY.md" "$pkgdir/usr/share/doc/luma-wm/THIRD_PARTY.md"

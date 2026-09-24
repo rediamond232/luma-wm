@@ -2,21 +2,27 @@ terminal = ["kitty"]
 startup = []
 rules = []
 
+[performance]
+# Keep desktop visuals, then automatically use the lowest-overhead fullscreen
+# path and VRR on compatible outputs. Runtime override: wmctl performance profile.
+profile = "auto"
+fullscreen_vrr = true
+
 [theme]
 background = "#1b1b14"
 foreground = "#fff3d1"
 accent = "#e7bd58"
 muted = "#aeb286"
-font = "sans-serif"
-font_size = 13
+font = "Noto Sans"
+font_size = 14
 gap = 8
 border = 1
-shadow_size = 16
+shadow_size = 10
 shadow_opacity = 0.3
-radius = 12.0
-opacity = 0.6
-blur = true
-blur_passes = 3
+radius = 14.0
+opacity = 0.94
+blur = false
+blur_passes = 2
 animation_ms = 140
 reduced_motion = false
 
@@ -95,13 +101,15 @@ pause_on_battery = true
 [wallpaper.outputs]
 
 [recorder]
+# HDR uses a 10-bit BT.2100 PQ HEVC Main10 stream; set codec = "hevc" too.
+hdr = true
 # Screen capture composites the desktop, so keep its ceiling conservative.
 # Direct graphics-API profiles and runtime OpenGL injection intercept presents
 # before the compositor. Runtime injection uses `fps`; profiles use their own.
 screen_fps = 240
 fps = 480
-codec = "h264"
-quality = 20
+codec = "hevc"
+quality = 16
 output_width = 2560
 output_height = 1440
 output_directory = "~/Videos/Luma"
@@ -110,14 +118,26 @@ cursor = true
 desktop_audio = "default_output"
 microphone = "default_input"
 
-# Add an explicit final renderer command to use the launch-profile choice. It
-# must exec the process that owns the GL presents;
-# a launcher that forks the renderer is rejected by the PID ownership guard.
+# Add an explicit renderer command to use the launch-profile choice. It can
+# exec the OpenGL renderer directly, or launch a child renderer selected by
+# its exact Linux process name (`comm`), such as Java for Minecraft clients.
 # [[recorder.game_profiles]]
 # name = "game-opengl"
 # api = "opengl"
 # command = ["/absolute/path/to/game-binary"]
 # fps = 480
+# # Optional: allows the launcher above to fork this renderer. The preload hook
+# # remains inert in every other launcher child.
+# target_process_name = "java"
+
+# Lunar starts its Minecraft JVM as a child of the Electron launcher. After
+# restarting into the build that supports `target_process_name`, uncomment:
+# [[recorder.game_profiles]]
+# name = "lunar-opengl"
+# api = "opengl"
+# command = ["/usr/bin/env", "DESKTOPINTEGRATION=false", "/usr/bin/lunarclient", "--no-sandbox"]
+# fps = 480
+# target_process_name = "java"
 
 # Vulkan profiles launch the renderer through Luma's explicit Vulkan layer.
 # Runtime injection is OpenGL-only because Vulkan dispatch chains are fixed
@@ -137,13 +157,15 @@ microphone = "default_input"
  scale = 1.0
  x = 0
  y = 0
+# HDR enables 10-bit scanout and BT.2020/PQ connector signaling.
+hdr = false
 
 [shell]
 enabled = true
 backend = "sctk"
 do_not_disturb = false
 position = "top"
-height = 36
+height = 42
 modules = [
     "workspaces",
     "title",

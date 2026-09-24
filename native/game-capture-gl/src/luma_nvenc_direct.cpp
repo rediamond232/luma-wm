@@ -10,14 +10,18 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <new>
 #include <string>
@@ -25,19 +29,24 @@
 #include <vector>
 
 namespace {
+extern "C" void luma_game_capture_debug_message(const char *message) __attribute__((weak));
+
 constexpr uint32_t kMagic = 0x4c474350; // LGCP, integer fields use network/big endian.
 constexpr uint16_t kVersion = 1;
 constexpr uint16_t kHello = 1, kServerHello = 2, kStart = 3, kAccessUnit = 4;
 constexpr size_t kMaxAu = 64U * 1024U * 1024U;
-constexpr size_t kQueueMax = 8;
+constexpr size_t kQueueMax = 16;
 constexpr size_t kAccessUnitHeaderBytes = 28;
-// The producer is the game's present thread.  Reserve a small, fixed amount
-// of RAM for its compressed-AU handoff instead of growing a container there.
+// Reserve a fixed amount of RAM for compressed-AU handoff instead of growing a
+// container on either the game hook or receiver collector path.
 // An AU larger than this deliberately drops: allowing it to allocate or wait
 // would turn a transient IDR spike into a game-frame hitch.  The wire protocol
 // still accepts up to kMaxAu; that remains the receiver's validation limit.
 constexpr size_t kPacketSlotBytes = 8U * 1024U * 1024U;
-constexpr size_t kSlots = 4;
+constexpr size_t kSlots = 12;
+constexpr size_t kCollectorLead = kSlots - 1;
+constexpr uint64_t kSlowSubmitNs = UINT64_C(750000);
+constexpr uint64_t kMaxBackoffNs = UINT64_C(1000000000) / 30;
 
 bool debug_enabled() {
     static const bool enabled = [] {
@@ -48,13 +57,78 @@ bool debug_enabled() {
 }
 
 void debug_log(const char *format, ...) {
-    if (!debug_enabled()) return;
+    if (!debug_enabled() && luma_game_capture_debug_message == nullptr) return;
+    char message[512];
     va_list args;
     va_start(args, format);
-    fputs("luma game capture: ", stderr);
-    vfprintf(stderr, format, args);
-    fputc('\n', stderr);
+    const int prefix = snprintf(message, sizeof(message), "luma game capture: ");
+    if (prefix > 0 && static_cast<size_t>(prefix) < sizeof(message)) {
+        (void)vsnprintf(message + prefix, sizeof(message) - static_cast<size_t>(prefix),
+                        format, args);
+    }
     va_end(args);
+    const size_t length = strnlen(message, sizeof(message));
+    if (length + 1 < sizeof(message)) {
+        message[length] = '\n';
+        message[length + 1] = '\0';
+    }
+    if (luma_game_capture_debug_message != nullptr) {
+        luma_game_capture_debug_message(message);
+    } else {
+        fputs(message, stderr);
+    }
+}
+
+bool bench_enabled() {
+    static const bool enabled = [] {
+        const char *value = getenv("LUMA_GAME_CAPTURE_BENCH");
+        return value && value[0] != '\0' && strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+uint64_t bench_ns() {
+    timespec value{};
+    clock_gettime(CLOCK_MONOTONIC, &value);
+    return static_cast<uint64_t>(value.tv_sec) * UINT64_C(1000000000) +
+           static_cast<uint64_t>(value.tv_nsec);
+}
+
+// Present-thread stage costs, accumulated only when LUMA_GAME_CAPTURE_BENCH
+// is set. Dumped to the debug log every 512 submitted frames.
+struct BenchTotals {
+    std::atomic<uint64_t> pace{0};
+    std::atomic<uint64_t> poll{0};
+    std::atomic<uint64_t> copy{0};
+    std::atomic<uint64_t> map_encode{0};
+    std::atomic<uint64_t> enqueue{0};
+    std::atomic<uint64_t> frames{0};
+};
+
+BenchTotals &bench() {
+    static BenchTotals totals;
+    return totals;
+}
+
+void bench_dump() {
+    BenchTotals &totals = bench();
+    const uint64_t frames =
+        totals.frames.exchange(0, std::memory_order_acq_rel);
+    if (frames == 0) return;
+    const uint64_t pace = totals.pace.exchange(0, std::memory_order_acq_rel);
+    const uint64_t poll = totals.poll.exchange(0, std::memory_order_acq_rel);
+    const uint64_t copy = totals.copy.exchange(0, std::memory_order_acq_rel);
+    const uint64_t map_encode =
+        totals.map_encode.exchange(0, std::memory_order_acq_rel);
+    const uint64_t enqueue =
+        totals.enqueue.exchange(0, std::memory_order_acq_rel);
+    // Direct stderr write: bench output must not depend on debug logging.
+    fprintf(stderr,
+            "luma game capture: bench submit avg us over %llu frames: "
+            "pace=%.1f poll=%.1f copy=%.1f map_encode=%.1f enqueue=%.1f\n",
+            (unsigned long long)frames, pace / 1000.0 / frames,
+            poll / 1000.0 / frames, copy / 1000.0 / frames,
+            map_encode / 1000.0 / frames, enqueue / 1000.0 / frames);
 }
 
 uint32_t capture_qp(uint32_t requested) {
@@ -67,8 +141,12 @@ uint32_t be32(uint32_t n) { return __builtin_bswap32(n); }
 uint64_t be64(uint64_t n) { return __builtin_bswap64(n); }
 
 bool write_all(int fd, const uint8_t *data, size_t length) {
+    // MSG_NOSIGNAL: a dead muxer/ffmpeg must fail these writes with EPIPE,
+    // never SIGPIPE the game. The callers already treat a short write as a
+    // graceful transport failure that disables capture and leaves the game
+    // running.
     while (length) {
-        const ssize_t wrote = write(fd, data, length);
+        const ssize_t wrote = send(fd, data, length, MSG_NOSIGNAL);
         if (wrote <= 0) return false;
         data += wrote;
         length -= static_cast<size_t>(wrote);
@@ -212,6 +290,11 @@ int connect_stream(const std::string &path) {
 }
 void transport_main(Transport *transport) {
     (void)pthread_setname_np(pthread_self(), "luma-cap-tx");
+    // A dead muxer or ffmpeg must never take the game down with it. Every
+    // socket write here uses MSG_NOSIGNAL, and ignoring SIGPIPE process-wide
+    // covers any other library write in this process the same way robust
+    // applications (OBS included) already do.
+    signal(SIGPIPE, SIG_IGN);
     const int fd = connect_stream(transport->path);
     if (fd < 0) { transport->failed.store(true, std::memory_order_release); return; }
     uint32_t sequence = 0;
@@ -263,13 +346,27 @@ void transport_main(Transport *transport) {
 }
 
 using CreateInstance = NVENCSTATUS(NVENCAPI *)(NV_ENCODE_API_FUNCTION_LIST *);
+
 struct Slot {
     GLuint texture{};
     GLuint framebuffer{};
     NV_ENC_REGISTERED_PTR registered{};
     NV_ENC_INPUT_PTR mapped{};
     NV_ENC_OUTPUT_PTR bitstream{};
-    bool busy{};
+    // Claimed by the present thread for copy+encode, released by the harvest
+    // thread after the access unit is queued. Plain acquire/release pairing.
+    std::atomic<bool> busy{false};
+    // Set by the harvest thread once the access unit is safely queued. The
+    // present thread unmaps the slot on reclaim (only it holds a GL
+    // context); NvEncUnmapInputResource fails without one, so the harvest
+    // thread must never unmap.
+    std::atomic<bool> harvested{true};
+    // Present-thread-only copy stage. The framebuffer blit is queued first;
+    // NVENC mapping waits until a later present observes this fence signaled,
+    // avoiding an implicit GPU wait immediately after every game frame.
+    GLsync copy_fence{};
+    uint64_t copy_pts_ns{};
+    bool copy_pending{};
 };
 
 // Do not rely on libGL exporting modern entry points.  With GLVND, and in
@@ -286,6 +383,9 @@ using CheckFramebufferStatus = GLenum (*)(GLenum target);
 using BlitFramebuffer = void (*)(GLint src_x0, GLint src_y0, GLint src_x1, GLint src_y1,
                                  GLint dst_x0, GLint dst_y0, GLint dst_x1, GLint dst_y1,
                                  GLbitfield mask, GLenum filter);
+using FenceSync = GLsync (*)(GLenum condition, GLbitfield flags);
+using ClientWaitSync = GLenum (*)(GLsync sync, GLbitfield flags, GLuint64 timeout);
+using DeleteSync = void (*)(GLsync sync);
 
 template <typename Function>
 Function resolve_gl_function(const char *name) {
@@ -311,6 +411,9 @@ struct GlCopyFunctions {
     FramebufferTexture2D framebuffer_texture_2d{};
     CheckFramebufferStatus check_framebuffer_status{};
     BlitFramebuffer blit_framebuffer{};
+    FenceSync fence_sync{};
+    ClientWaitSync client_wait_sync{};
+    DeleteSync delete_sync{};
 };
 
 GlCopyFunctions resolve_gl_copy_functions() {
@@ -321,8 +424,12 @@ GlCopyFunctions resolve_gl_copy_functions() {
         resolve_gl_function<FramebufferTexture2D>("glFramebufferTexture2D"),
         resolve_gl_function<CheckFramebufferStatus>("glCheckFramebufferStatus"),
         resolve_gl_function<BlitFramebuffer>("glBlitFramebuffer"),
+        resolve_gl_function<FenceSync>("glFenceSync"),
+        resolve_gl_function<ClientWaitSync>("glClientWaitSync"),
+        resolve_gl_function<DeleteSync>("glDeleteSync"),
     };
 }
+
 
 bool is_gl_3_or_newer() {
     const GLubyte *version_text = glGetString(GL_VERSION);
@@ -381,20 +488,55 @@ struct luma_nvenc_direct {
     void *encoder{};
     NV_ENCODE_API_FUNCTION_LIST api{};
     std::array<Slot, kSlots> slots{};
+    // Submission order ring, owned by the harvest thread. The present thread
+    // only appends (counted) and claims FREE slots through busy.
     std::array<size_t, kSlots> submitted{};
     size_t submitted_head{};
-    size_t submitted_count{};
+    size_t submitted_tail{};
+    // Produced by the present thread, consumed by the harvest thread.
+    std::atomic<size_t> submitted_count{};
     size_t next{};
+    size_t copy_next{};
+    size_t encode_next{};
     bool initialized{};
     bool first_frame{true};
     std::atomic<bool> disabled{false};
     std::atomic<bool> stop_requested{false};
     std::atomic<bool> cleanup_started{false};
     std::atomic<bool> logged_failure{false};
+    // Set by the unload notifier: hurry the harvest thread to teardown.
+    // Exit-time driver cleanup cannot wait on encoder locks.
+    std::atomic<bool> shutdown_now{false};
+    // Set by the harvest thread as its last act before exiting. The
+    // presenting thread collects the shell (destroy + NULL) once it observes
+    // this; the harvest thread itself is already gone, so no join is needed.
+    std::atomic<bool> torn_down{false};
     uint64_t next_due_ns{};
     uint64_t frame_interval_ns{};
+    // Present-thread adaptive admission. Synchronous Linux NVENC may block
+    // EncodePicture when its hardware queue saturates; back off capture work
+    // until submissions are cheap again instead of pacing the game to NVENC.
+    uint64_t adaptive_interval_ns{};
+    uint64_t next_encode_ns{};
+    unsigned fast_encode_streak{};
+    unsigned admission_attempts{};
+    unsigned admission_drops{};
     uint32_t width{}, height{}, fps{};
     GlCopyFunctions gl{};
+    // Harvest thread: drains submitted access units with blocking driver
+    // waits. It makes no GL or window-system calls, so it can never stall
+    // the game or wedge its teardown; only the present thread touches GL.
+    std::thread harvest_worker;
+    // Receiver-only output collector. Unlike the legacy hook worker it never
+    // destroys the encoder: GL resource teardown stays on the receiver thread.
+    std::thread output_worker;
+    // Receiver submissions may wait for collector/transport capacity without
+    // blocking the game/import thread. The application-present path never waits
+    // on these condition variables.
+    std::mutex scheduler_mutex;
+    std::condition_variable scheduler_wake;
+    std::mutex output_mutex;
+    std::condition_variable output_wake;
     Transport transport{};
 };
 namespace {
@@ -411,18 +553,20 @@ bool poll(luma_nvenc_direct *state) {
     // Linux NVENC is synchronous. Bitstreams must be locked in the order their
     // successful EncodePicture calls were submitted. The texture ring wraps,
     // so its array order is not necessarily submission order.
-    while (state->submitted_count != 0) {
+    //
+    // Blocking locks are correct here: poll runs on the harvest thread (or a
+    // synchronous caller's own encoding thread), never on a latency-critical
+    // presenting thread. doNotWait is an asynchronous-mode contract that
+    // Linux drivers may ignore; in synchronous mode the lock waits for the
+    // oldest submitted output to complete.
+    while (state->submitted_count.load(std::memory_order_acquire) != 0) {
         const size_t slot_index = state->submitted[state->submitted_head];
         Slot &slot = state->slots[slot_index];
-        if (!slot.busy) {
+        if (!slot.busy.load(std::memory_order_acquire)) {
             disable(state, "internal output ordering", NV_ENC_ERR_INVALID_CALL);
             return false;
         }
         NV_ENC_LOCK_BITSTREAM lock{}; lock.version = NV_ENC_LOCK_BITSTREAM_VER; lock.outputBitstream = slot.bitstream;
-        /* Linux uses synchronous NVENC output in this path. doNotWait is an
-         * asynchronous-mode contract and can expose an incompletely finalized
-         * access unit on some driver versions when used with enableEncodeAsync
-         * disabled. Let the driver complete the oldest submitted output. */
         lock.doNotWait = 0;
         const NVENCSTATUS result = state->api.nvEncLockBitstream(state->encoder, &lock);
         if (result == NV_ENC_ERR_LOCK_BUSY) return true;
@@ -437,17 +581,21 @@ bool poll(luma_nvenc_direct *state) {
             disable(state, "NvEncLockBitstream", result);
             return false;
         }
-        // The only CPU copy is compressed H.264 into a small bounded handoff;
-        // no frame pixels are copied/read back on the presenting thread.
-        const bool queued = state->transport.enqueue(
-            static_cast<const uint8_t *>(lock.bitstreamBufferPtr),
-            lock.bitstreamSizeInBytes, lock.outputTimeStamp,
-            lock.pictureType == NV_ENC_PIC_TYPE_IDR);
-        const NVENCSTATUS unlock = state->api.nvEncUnlockBitstream(state->encoder, slot.bitstream);
+    const uint64_t enqueue_start = bench_enabled() ? bench_ns() : 0;
+    const bool enqueued = state->transport.enqueue(
+        static_cast<const uint8_t *>(lock.bitstreamBufferPtr),
+        lock.bitstreamSizeInBytes, lock.outputTimeStamp,
+        lock.pictureType == NV_ENC_PIC_TYPE_IDR);
+    if (bench_enabled()) {
+        bench().enqueue.fetch_add(bench_ns() - enqueue_start,
+                                  std::memory_order_relaxed);
+    }
+    const NVENCSTATUS unlock = state->api.nvEncUnlockBitstream(state->encoder, slot.bitstream);
         const NVENCSTATUS unmap = state->api.nvEncUnmapInputResource(state->encoder, slot.mapped);
-        slot.mapped = nullptr; slot.busy = false;
+        slot.mapped = nullptr;
+        slot.busy.store(false, std::memory_order_release);
         state->submitted_head = (state->submitted_head + 1) % kSlots;
-        --state->submitted_count;
+        state->submitted_count.fetch_sub(1, std::memory_order_acq_rel);
         if (!ok(unlock)) {
             disable(state, "NvEncUnlockBitstream", unlock);
             return false;
@@ -456,7 +604,7 @@ bool poll(luma_nvenc_direct *state) {
             disable(state, "NvEncUnmapInputResource", unmap);
             return false;
         }
-        if (!queued) {
+        if (!enqueued) {
             /* Continuing after losing an encoded reference frame produces a
              * syntactically valid but undecodable H.264 stream. Stop the codec
              * chain here; the already-delivered prefix remains independently
@@ -467,7 +615,72 @@ bool poll(luma_nvenc_direct *state) {
     }
     return true;
 }
+
+// Harvest-thread harvest: lock, enqueue and unlock submitted access units,
+// then hand each slot back. The legacy worker leaves unmapping to its GL
+// owner; the receiver collector has a shared GL context and releases inputs
+// itself, without making the submission context wait for resource recycling.
+bool poll_harvest(luma_nvenc_direct *state, size_t limit = kSlots, bool release_inputs = false) {
+    while (limit-- != 0 && state->submitted_count.load(std::memory_order_acquire) != 0) {
+        const size_t slot_index = state->submitted[state->submitted_head];
+        Slot &slot = state->slots[slot_index];
+        if (!slot.busy.load(std::memory_order_acquire)) {
+            disable(state, "internal output ordering", NV_ENC_ERR_INVALID_CALL);
+            return false;
+        }
+        NV_ENC_LOCK_BITSTREAM lock{};
+        lock.version = NV_ENC_LOCK_BITSTREAM_VER;
+        lock.outputBitstream = slot.bitstream;
+        lock.doNotWait = 0;
+        const NVENCSTATUS result = state->api.nvEncLockBitstream(state->encoder, &lock);
+        if (result == NV_ENC_ERR_LOCK_BUSY) return true;
+        if (result == NV_ENC_ERR_NEED_MORE_INPUT) {
+            disable(state, "NvEncLockBitstream returned NEED_MORE_INPUT", result);
+            return false;
+        }
+        if (!ok(result)) {
+            disable(state, "NvEncLockBitstream", result);
+            return false;
+        }
+        const bool enqueued = state->transport.enqueue(
+            static_cast<const uint8_t *>(lock.bitstreamBufferPtr),
+            lock.bitstreamSizeInBytes, lock.outputTimeStamp,
+            lock.pictureType == NV_ENC_PIC_TYPE_IDR);
+        const NVENCSTATUS unlock = state->api.nvEncUnlockBitstream(state->encoder, slot.bitstream);
+        if (!ok(unlock)) {
+            disable(state, "NvEncUnlockBitstream", unlock);
+            return false;
+        }
+        if (!enqueued) {
+            disable(state, "compressed access-unit transport", NV_ENC_ERR_OUT_OF_MEMORY);
+            return false;
+        }
+        if (release_inputs) {
+            const NVENCSTATUS unmapped = state->api.nvEncUnmapInputResource(state->encoder, slot.mapped);
+            if (!ok(unmapped)) {
+                disable(state, "output input reclaim", unmapped);
+                return false;
+            }
+            slot.mapped = nullptr;
+        }
+        slot.harvested.store(true, std::memory_order_release);
+        state->submitted_head = (state->submitted_head + 1) % kSlots;
+        state->submitted_count.fetch_sub(1, std::memory_order_acq_rel);
+        if (release_inputs) slot.busy.store(false, std::memory_order_release);
+        state->scheduler_wake.notify_one();
+    }
+    return true;
 }
+
+}
+
+// Release the encoder, its registered resources and the shared GL objects.
+// The synchronous API calls this with a current context in the game's share
+// group. The harvest thread calls it without one: driver-handle release is
+// best effort there (errors are ignored, teardown always completes), while
+// the FBO/texture deletes are repeated on the presenting thread through
+// luma_nvenc_direct_release_gl().
+void release_encoder_resources(luma_nvenc_direct *state, bool release_gl);
 
 extern "C" struct luma_nvenc_direct *luma_nvenc_direct_create(uint32_t width, uint32_t height, uint32_t fps, uint32_t quality, const char *socket_path, const char *token_hex) {
     if (!width || !height || width > 16'384 || height > 16'384 || (width & 1U) != 0 ||
@@ -483,7 +696,8 @@ extern "C" struct luma_nvenc_direct *luma_nvenc_direct_create(uint32_t width, ui
     if (gl.bind_framebuffer == nullptr || gl.gen_framebuffers == nullptr ||
         gl.delete_framebuffers == nullptr ||
         gl.framebuffer_texture_2d == nullptr || gl.check_framebuffer_status == nullptr ||
-        gl.blit_framebuffer == nullptr) {
+        gl.blit_framebuffer == nullptr || gl.fence_sync == nullptr ||
+        gl.client_wait_sync == nullptr || gl.delete_sync == nullptr) {
         debug_log("direct NVENC could not resolve the OpenGL framebuffer copy functions");
         return nullptr;
     }
@@ -491,7 +705,7 @@ extern "C" struct luma_nvenc_direct *luma_nvenc_direct_create(uint32_t width, ui
     // happen with the original context current, and no present call may join a
     // socket thread. A failed stream is disabled below and no further frames are
     // copied or encoded.
-    auto *state = new luma_nvenc_direct; state->width = width; state->height = height; state->fps = fps; state->frame_interval_ns = UINT64_C(1000000000) / fps; state->gl = gl; state->transport.width = width; state->transport.height = height; state->transport.fps = fps; state->transport.path = socket_path;
+    auto *state = new luma_nvenc_direct; state->width = width; state->height = height; state->fps = fps; state->frame_interval_ns = UINT64_C(1000000000) / fps; state->adaptive_interval_ns = state->frame_interval_ns; state->gl = gl; state->transport.width = width; state->transport.height = height; state->transport.fps = fps; state->transport.path = socket_path;
     if (!parse_token(token_hex, state->transport.token)) { debug_log("invalid stream token"); delete state; return nullptr; }
     state->library = dlopen("libnvidia-encode.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!state->library) { debug_log("could not load libnvidia-encode.so.1: %s", dlerror()); delete state; return nullptr; }
@@ -609,17 +823,52 @@ int submit_framebuffer(luma_nvenc_direct *state, GLuint source_framebuffer,
         disable(state, "present surface resized (capture resolution is fixed)", NV_ENC_ERR_INVALID_PARAM);
         return 0;
     }
-    if (state->next_due_ns != 0 && pts_ns < state->next_due_ns) return 0;
-    if (state->next_due_ns == 0 || pts_ns - state->next_due_ns >= state->frame_interval_ns) state->next_due_ns = pts_ns + state->frame_interval_ns;
-    else state->next_due_ns += state->frame_interval_ns;
-    if (!poll(state)) return 0;
+    // External exporters have already paced these actual source frames. A
+    // second clock can drift after a dropped frame and reject valid input.
+    if (!state->output_worker.joinable()) {
+        if (state->next_due_ns != 0 && pts_ns < state->next_due_ns) return 0;
+        if (state->next_due_ns == 0 || pts_ns - state->next_due_ns >= state->frame_interval_ns) state->next_due_ns = pts_ns + state->frame_interval_ns;
+        else state->next_due_ns += state->frame_interval_ns;
+    }
+    const bool bench_on = bench_enabled();
+    uint64_t pace_start = bench_on ? bench_ns() : 0;
+    const uint64_t poll_start = bench_on ? bench_ns() : 0;
+    if (!state->output_worker.joinable() && !poll(state)) return 0;
+    if (bench_on) bench().poll.fetch_add(bench_ns() - poll_start, std::memory_order_relaxed);
+    if (bench_on) pace_start = bench_ns();
     /* Reserve transport capacity conceptually before encoding. Every existing
      * NVENC submission will later occupy one queue entry, and the new frame
      * adds one more. This keeps overload drops ahead of the codec reference
      * chain instead of discarding an encoded access unit afterward. */
-    if (!state->transport.can_admit(state->submitted_count)) return 0;
-    Slot &slot = state->slots[state->next];
-    if (slot.busy || state->submitted_count == kSlots) return 0;
+    size_t in_flight = state->submitted_count.load(std::memory_order_acquire);
+    Slot *slot_ptr = &state->slots[state->next];
+    if (state->output_worker.joinable()) {
+        // This runs only on the receiver's private encode worker. Waiting here
+        // preserves a frame already accepted into the bounded staging FIFO;
+        // it cannot stall the game or the receiver's import/ACK context.
+        for (;;) {
+            if (state->disabled.load(std::memory_order_acquire) ||
+                state->stop_requested.load(std::memory_order_acquire) ||
+                state->transport.failed.load(std::memory_order_acquire)) {
+                return 0;
+            }
+            in_flight = state->submitted_count.load(std::memory_order_acquire);
+            slot_ptr = &state->slots[state->next];
+            if (in_flight < kSlots &&
+                !slot_ptr->busy.load(std::memory_order_acquire) &&
+                state->transport.can_admit(in_flight)) {
+                break;
+            }
+            std::unique_lock<std::mutex> lock(state->scheduler_mutex);
+            state->scheduler_wake.wait_for(lock, std::chrono::milliseconds(1));
+        }
+    } else if (!state->transport.can_admit(in_flight) ||
+               slot_ptr->busy.load(std::memory_order_acquire) || in_flight >= kSlots) {
+        return 0;
+    }
+    Slot &slot = *slot_ptr;
+    if (bench_on) bench().pace.fetch_add(bench_ns() - pace_start, std::memory_order_relaxed);
+    const uint64_t copy_start = bench_on ? bench_ns() : 0;
     if (!copy_framebuffer(state->gl, source_framebuffer, source_read_buffer, slot.framebuffer,
                           state->width, state->height, flip_y)) {
         disable(state, "copy from source read framebuffer", NV_ENC_ERR_INVALID_CALL);
@@ -628,12 +877,15 @@ int submit_framebuffer(luma_nvenc_direct *state, GLuint source_framebuffer,
     // NVENC's OpenGL device shares the current context. Flush submits the GPU
     // copy before NvEncMapInputResource without CPU-side glFinish/readback.
     glFlush();
+    if (bench_on) bench().copy.fetch_add(bench_ns() - copy_start, std::memory_order_relaxed);
+    const uint64_t map_start = bench_on ? bench_ns() : 0;
     NV_ENC_MAP_INPUT_RESOURCE map{}; map.version = NV_ENC_MAP_INPUT_RESOURCE_VER; map.registeredResource = slot.registered;
     const NVENCSTATUS mapped = state->api.nvEncMapInputResource(state->encoder, &map);
     if (!ok(mapped)) { disable(state, "NvEncMapInputResource", mapped); return 0; }
     slot.mapped = map.mappedResource;
     NV_ENC_PIC_PARAMS picture{}; picture.version = NV_ENC_PIC_PARAMS_VER; picture.inputWidth = state->width; picture.inputHeight = state->height; picture.inputPitch = state->width; picture.inputBuffer = slot.mapped; picture.bufferFmt = map.mappedBufferFmt; picture.outputBitstream = slot.bitstream; picture.pictureStruct = NV_ENC_PIC_STRUCT_FRAME; picture.inputTimeStamp = pts_ns; picture.inputDuration = 1; if (state->first_frame) picture.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
     const NVENCSTATUS encoded = state->api.nvEncEncodePicture(state->encoder, &picture);
+    if (bench_on) bench().map_encode.fetch_add(bench_ns() - map_start, std::memory_order_relaxed);
     if (encoded == NV_ENC_ERR_NEED_MORE_INPUT) {
         // This would require a later input and a strict in-order lock protocol.
         // We configured IP-only zero-reorder specifically to avoid it; retaining
@@ -648,18 +900,378 @@ int submit_framebuffer(luma_nvenc_direct *state, GLuint source_framebuffer,
         disable(state, "NvEncEncodePicture", encoded);
         return 0;
     }
-    slot.busy = true;
-    state->submitted[(state->submitted_head + state->submitted_count) % kSlots] = state->next;
-    ++state->submitted_count;
+    slot.harvested.store(false, std::memory_order_release);
+    slot.busy.store(true, std::memory_order_release);
+    state->submitted[state->submitted_tail] = state->next;
+    state->submitted_tail = (state->submitted_tail + 1) % kSlots;
+    state->submitted_count.fetch_add(1, std::memory_order_release);
+    state->output_wake.notify_one();
     state->first_frame = false;
     state->next = (state->next + 1) % kSlots;
+    if (bench_on &&
+        bench().frames.fetch_add(1, std::memory_order_relaxed) + 1 >= 512) {
+        bench_dump();
+    }
     return 1;
 }
 }
 
+// Harvest thread: drains submitted access units with blocking driver waits
+// and tears the session down on stop. It makes no GL or window-system calls,
+// so it can neither stall the game nor wedge its teardown; only the present
+// thread creates and probes the copy fences.
+void harvest_worker_main(luma_nvenc_direct *state) {
+    while (!state->stop_requested.load(std::memory_order_acquire) &&
+           !state->disabled.load(std::memory_order_acquire) &&
+           !state->shutdown_now.load(std::memory_order_acquire)) {
+        if (state->submitted_count.load(std::memory_order_acquire) == 0) {
+            usleep(200);
+            continue;
+        }
+        const uint64_t poll_start = bench_enabled() ? bench_ns() : 0;
+        if (!poll_harvest(state)) {
+            break;
+        }
+        if (bench_enabled()) {
+            bench().poll.fetch_add(bench_ns() - poll_start, std::memory_order_relaxed);
+        }
+    }
+    // Drain on stop: harvest everything already submitted (blocking is fine
+    // here). Process unload skips the wait: presents have ended and exit-time
+    // driver cleanup cannot block on encoder locks.
+    if (!state->shutdown_now.load(std::memory_order_acquire)) {
+        poll_harvest(state);
+    }
+    state->transport.stop.store(true, std::memory_order_release);
+    state->transport.wake.notify_all();
+    if (state->transport.worker.joinable() &&
+        state->transport.worker.get_id() != std::this_thread::get_id()) {
+        state->transport.worker.join();
+    }
+    release_encoder_resources(state, false);
+    state->torn_down.store(true, std::memory_order_release);
+}
+
+extern "C" int luma_nvenc_direct_start_harvest_worker(luma_nvenc_direct *state) {
+    if (state == nullptr || !state->initialized) {
+        return -1;
+    }
+    try {
+        state->harvest_worker = std::thread(harvest_worker_main, state);
+    } catch (...) {
+        return -1;
+    }
+    state->harvest_worker.detach();
+    return 0;
+}
+
+extern "C" int luma_nvenc_direct_torn_down(luma_nvenc_direct *state) {
+    return state != nullptr && state->torn_down.load(std::memory_order_acquire);
+}
+
+// One-line state census for stall forensics (LUMA_GAME_CAPTURE_BENCH only).
+// Called from the present thread every 512th due present; all atomics.
+void bench_census(luma_nvenc_direct *state) {
+    size_t transport_in_use = 0;
+    for (const PacketSlot &slot : state->transport.slots) {
+        transport_in_use += slot.in_use ? 1 : 0;
+    }
+    char slots[160];
+    size_t pos = 0;
+    for (size_t i = 0; i < state->slots.size() && pos < sizeof(slots) - 8; ++i) {
+        const Slot &slot = state->slots[i];
+        pos += static_cast<size_t>(snprintf(slots + pos, sizeof(slots) - pos, "%u%u%u%u ",
+                                            slot.busy.load(std::memory_order_acquire) ? 1 : 0,
+                                            slot.harvested.load(std::memory_order_acquire) ? 1 : 0,
+                                            slot.mapped != nullptr ? 1 : 0,
+                                            slot.copy_pending ? 1 : 0));
+    }
+    fprintf(stderr,
+            "luma game capture: census count=%zu copy=%zu encode=%zu "
+            "slots[busy,harvested,mapped,pending]=%s"
+            "transport_in_use=%zu/%zu ready=%d failed=%d disabled=%d stop=%d torn=%d\n",
+            state->submitted_count.load(std::memory_order_acquire), state->copy_next,
+            state->encode_next, slots,
+            transport_in_use, kQueueMax,
+            state->transport.ready.load(std::memory_order_acquire) ? 1 : 0,
+            state->transport.failed.load(std::memory_order_acquire) ? 1 : 0,
+            state->disabled.load(std::memory_order_acquire) ? 1 : 0,
+            state->stop_requested.load(std::memory_order_acquire) ? 1 : 0,
+            state->torn_down.load(std::memory_order_acquire) ? 1 : 0);
+}
+
+namespace {
+// Submit at most one completed copy per present. The zero-timeout fence probe
+// is the important part: NvEncMapInputResource must never be asked to wait for
+// a blit that was only just queued by the game thread. If the oldest copy is
+// still on the GPU, this present simply leaves it queued and returns.
+int encode_ready_copy(luma_nvenc_direct *state, bool bench_on, uint64_t present_ns) {
+    Slot &slot = state->slots[state->encode_next];
+    if (!slot.copy_pending) return 0;
+    if (state->next_encode_ns != 0 && present_ns < state->next_encode_ns) return 0;
+
+    const size_t in_flight = state->submitted_count.load(std::memory_order_acquire);
+    if (in_flight >= kSlots || !state->transport.can_admit(in_flight)) return 0;
+
+    const GLenum wait = state->gl.client_wait_sync(slot.copy_fence, 0, 0);
+    if (wait == GL_TIMEOUT_EXPIRED) return 0;
+    if (wait != GL_ALREADY_SIGNALED && wait != GL_CONDITION_SATISFIED) {
+        disable(state, "OpenGL copy fence wait", NV_ENC_ERR_GENERIC);
+        return 0;
+    }
+    state->gl.delete_sync(slot.copy_fence);
+    slot.copy_fence = nullptr;
+
+    const uint64_t map_start = bench_ns();
+    NV_ENC_MAP_INPUT_RESOURCE map{};
+    map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+    map.registeredResource = slot.registered;
+    const NVENCSTATUS mapped = state->api.nvEncMapInputResource(state->encoder, &map);
+    if (!ok(mapped)) {
+        slot.copy_pending = false;
+        disable(state, "NvEncMapInputResource", mapped);
+        return 0;
+    }
+    slot.mapped = map.mappedResource;
+    NV_ENC_PIC_PARAMS picture{};
+    picture.version = NV_ENC_PIC_PARAMS_VER;
+    picture.inputWidth = state->width;
+    picture.inputHeight = state->height;
+    picture.inputPitch = state->width;
+    picture.inputBuffer = slot.mapped;
+    picture.bufferFmt = map.mappedBufferFmt;
+    picture.outputBitstream = slot.bitstream;
+    picture.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+    picture.inputTimeStamp = slot.copy_pts_ns;
+    picture.inputDuration = 1;
+    if (state->first_frame) picture.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+    const NVENCSTATUS encoded = state->api.nvEncEncodePicture(state->encoder, &picture);
+    const uint64_t map_encode_ns = bench_ns() - map_start;
+    if (bench_on) {
+        bench().map_encode.fetch_add(map_encode_ns, std::memory_order_relaxed);
+    }
+    if (encoded == NV_ENC_ERR_NEED_MORE_INPUT) {
+        slot.copy_pending = false;
+        disable(state, "NvEncEncodePicture returned NEED_MORE_INPUT", encoded);
+        return 0;
+    }
+    if (!ok(encoded)) {
+        const NVENCSTATUS unmapped =
+            state->api.nvEncUnmapInputResource(state->encoder, slot.mapped);
+        slot.mapped = nullptr;
+        slot.copy_pending = false;
+        if (!ok(unmapped)) {
+            debug_log("NvEncUnmapInputResource after encode failure failed (status=%d)",
+                      static_cast<int>(unmapped));
+        }
+        disable(state, "NvEncEncodePicture", encoded);
+        return 0;
+    }
+
+    if (map_encode_ns > kSlowSubmitNs) {
+        const uint64_t safe_interval =
+            std::min(kMaxBackoffNs, std::max(state->frame_interval_ns, map_encode_ns * 2));
+        if (safe_interval > state->adaptive_interval_ns) {
+            state->adaptive_interval_ns = safe_interval;
+            debug_log("NVENC submit took %.2f ms; capture admission backed off to %.1f FPS",
+                      map_encode_ns / 1000000.0,
+                      1000000000.0 / state->adaptive_interval_ns);
+        }
+        state->fast_encode_streak = 0;
+    } else if (state->adaptive_interval_ns > state->frame_interval_ns &&
+               ++state->fast_encode_streak >= 256) {
+        const uint64_t reduced = state->adaptive_interval_ns * 9 / 10;
+        state->adaptive_interval_ns = std::max(state->frame_interval_ns, reduced);
+        state->fast_encode_streak = 0;
+    }
+    state->next_encode_ns = present_ns + state->adaptive_interval_ns;
+
+    slot.copy_pending = false;
+    slot.busy.store(true, std::memory_order_release);
+    slot.harvested.store(false, std::memory_order_release);
+    state->submitted[state->submitted_tail] = state->encode_next;
+    state->submitted_tail = (state->submitted_tail + 1) % kSlots;
+    state->submitted_count.fetch_add(1, std::memory_order_release);
+    state->first_frame = false;
+    state->encode_next = (state->encode_next + 1) % kSlots;
+    if (bench_on && bench().frames.fetch_add(1, std::memory_order_relaxed) + 1 >= 512) {
+        bench_dump();
+    }
+    return 1;
+}
+
+void record_admission(luma_nvenc_direct *state, bool dropped) {
+    ++state->admission_attempts;
+    state->admission_drops += dropped ? 1U : 0U;
+    if (state->admission_attempts < 64) return;
+    if (state->admission_drops >= 8) {
+        const uint64_t increased = state->adaptive_interval_ns +
+                                   std::max(UINT64_C(250000),
+                                            state->adaptive_interval_ns / 4);
+        const uint64_t limited = std::min(kMaxBackoffNs, increased);
+        if (limited > state->adaptive_interval_ns) {
+            state->adaptive_interval_ns = limited;
+            state->fast_encode_streak = 0;
+            debug_log("capture queue was saturated (%u/64 drops); admission backed off to %.1f FPS",
+                      state->admission_drops,
+                      1000000000.0 / state->adaptive_interval_ns);
+        }
+    }
+    state->admission_attempts = 0;
+    state->admission_drops = 0;
+}
+}
+
+// Present-thread half of async capture. A due frame is blitted into a private
+// texture and fenced, then the call returns. Later presents encode only copies
+// whose fence is already signaled. Harvesting, compressed transport and
+// teardown remain on workers; overload drops instead of waiting in the game.
+extern "C" int luma_nvenc_direct_submit_async(luma_nvenc_direct *state, uint32_t source_width,
+                                              uint32_t source_height, uint64_t pts_ns) {
+    if (state == nullptr || !state->initialized || state->disabled.load(std::memory_order_acquire) ||
+        state->transport.failed.load(std::memory_order_acquire) ||
+        !state->transport.ready.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    if (state->stop_requested.load(std::memory_order_acquire) ||
+        state->torn_down.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    if ((source_width & 1U) != 0 || (source_height & 1U) != 0 || source_width != state->width ||
+        source_height != state->height) {
+        disable(state, "present surface resized (capture resolution is fixed)", NV_ENC_ERR_INVALID_PARAM);
+        return 0;
+    }
+    const bool bench_on = bench_enabled();
+    const int encoded = encode_ready_copy(state, bench_on, pts_ns);
+    if (state->disabled.load(std::memory_order_acquire)) return 0;
+
+    if (state->next_due_ns != 0 && pts_ns < state->next_due_ns) return encoded;
+    state->next_due_ns = pts_ns + state->adaptive_interval_ns;
+    if (bench_on) {
+        static std::atomic<uint64_t> due_count{0};
+        if (due_count.fetch_add(1, std::memory_order_relaxed) % 2048 == 0) {
+            bench_census(state);
+        }
+    }
+    const uint64_t pace_start = bench_on ? bench_ns() : 0;
+    Slot &slot = state->slots[state->copy_next];
+    if (slot.copy_pending) {
+        record_admission(state, true);
+        return encoded;
+    }
+    // Reclaim a harvested slot: unmap here, where this thread holds the GL
+    // context. The harvest thread must never unmap (see poll_harvest).
+    if (slot.busy.load(std::memory_order_acquire)) {
+        if (!slot.harvested.load(std::memory_order_acquire)) {
+            record_admission(state, true);
+            return encoded;
+        }
+        if (slot.mapped != nullptr) {
+            const NVENCSTATUS unmapped =
+                state->api.nvEncUnmapInputResource(state->encoder, slot.mapped);
+            slot.mapped = nullptr;
+            if (!ok(unmapped)) {
+                disable(state, "NvEncUnmapInputResource on reclaim", unmapped);
+                return 0;
+            }
+        }
+        slot.busy.store(false, std::memory_order_release);
+    }
+    if (bench_on) bench().pace.fetch_add(bench_ns() - pace_start, std::memory_order_relaxed);
+    const uint64_t copy_start = bench_on ? bench_ns() : 0;
+    if (!copy_framebuffer(state->gl, 0, GL_BACK, slot.framebuffer, state->width, state->height,
+                          true)) {
+        disable(state, "copy from source read framebuffer", NV_ENC_ERR_INVALID_CALL);
+        return 0;
+    }
+    slot.copy_fence = state->gl.fence_sync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (slot.copy_fence == nullptr) {
+        disable(state, "create OpenGL copy fence", NV_ENC_ERR_GENERIC);
+        return 0;
+    }
+    slot.copy_pts_ns = pts_ns;
+    slot.copy_pending = true;
+    state->copy_next = (state->copy_next + 1) % kSlots;
+    // Make the blit and fence visible to the GPU, but never wait for either.
+    glFlush();
+    if (bench_on) bench().copy.fetch_add(bench_ns() - copy_start, std::memory_order_relaxed);
+    record_admission(state, false);
+    return encoded;
+}
+
 extern "C" int luma_nvenc_direct_submit(luma_nvenc_direct *state, uint32_t source_width,
-                                           uint32_t source_height, uint64_t pts_ns) {
+                                        uint32_t source_height, uint64_t pts_ns) {
     return submit_framebuffer(state, 0, GL_BACK, source_width, source_height, true, pts_ns);
+}
+
+extern "C" int luma_nvenc_direct_start_output_worker(luma_nvenc_direct *state) {
+    if (!state || state->output_worker.joinable() || state->harvest_worker.joinable()) return 0;
+    // NVENC's GL unmap requires a current context, but must not run on the
+    // submission context: it can synchronize unrelated, later GPU copies.
+    const EGLDisplay display = eglGetCurrentDisplay();
+    const EGLContext parent = eglGetCurrentContext();
+    EGLint config_id = 0, count = 0;
+    EGLConfig config = nullptr;
+    if (display == EGL_NO_DISPLAY || parent == EGL_NO_CONTEXT ||
+        !eglQueryContext(display, parent, EGL_CONFIG_ID, &config_id)) return 0;
+    const EGLint config_attributes[] = {EGL_CONFIG_ID, config_id, EGL_NONE};
+    if (!eglChooseConfig(display, config_attributes, &config, 1, &count) || count != 1) return 0;
+    const EGLint attributes[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE};
+    const EGLContext context = eglCreateContext(display, config, parent, attributes);
+    const EGLint pbuffer[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+    const EGLSurface surface = eglCreatePbufferSurface(display, config, pbuffer);
+    if (context == EGL_NO_CONTEXT || surface == EGL_NO_SURFACE) {
+        if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
+        if (context != EGL_NO_CONTEXT) eglDestroyContext(display, context);
+        return 0;
+    }
+    try {
+        state->output_worker = std::thread([state, display, context, surface] {
+            if (!eglBindAPI(EGL_OPENGL_API) || !eglMakeCurrent(display, surface, surface, context)) {
+                disable(state, "output GL context", NV_ENC_ERR_INVALID_DEVICE);
+                eglDestroySurface(display, surface);
+                eglDestroyContext(display, context);
+                return;
+            }
+            uint64_t last_output = bench_ns();
+            bool drain = true;
+            while (!state->stop_requested.load(std::memory_order_acquire) &&
+                   !state->disabled.load(std::memory_order_acquire)) {
+                // Keep several frames in flight so NVENC stays fed, but wake on
+                // new work and bound how long low-rate output sits uncollected.
+                // This avoids the old 100 us polling loop entirely.
+                const uint64_t collect_after = std::clamp<uint64_t>(
+                    state->frame_interval_ns * 2, 2000000, 10000000);
+                {
+                    std::unique_lock<std::mutex> lock(state->output_mutex);
+                    state->output_wake.wait_for(
+                        lock, std::chrono::nanoseconds(collect_after), [state] {
+                            return state->stop_requested.load(std::memory_order_acquire) ||
+                                   state->disabled.load(std::memory_order_acquire) ||
+                                   state->submitted_count.load(std::memory_order_acquire) >=
+                                       kCollectorLead;
+                        });
+                }
+                if (state->submitted_count.load(std::memory_order_acquire) >= kCollectorLead ||
+                    (state->submitted_count.load(std::memory_order_acquire) != 0 &&
+                     bench_ns() - last_output >= collect_after)) {
+                    if (!poll_harvest(state, 1, true)) { drain = false; break; }
+                    last_output = bench_ns();
+                }
+            }
+            // Preserve the complete encoded prefix before transport EOF.
+            if (drain) (void)poll_harvest(state, kSlots, true);
+            eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            eglDestroySurface(display, surface);
+            eglDestroyContext(display, context);
+        });
+    } catch (...) {
+        eglDestroySurface(display, surface);
+        eglDestroyContext(display, context);
+        return 0;
+    }
+    return 1;
 }
 
 extern "C" int luma_nvenc_direct_wait_ready(luma_nvenc_direct *state, uint32_t timeout_ms) {
@@ -687,36 +1299,36 @@ extern "C" void luma_nvenc_direct_request_stop(luma_nvenc_direct *state) {
     debug_log("stopping direct capture transport");
     state->disabled.store(true, std::memory_order_release);
     state->stop_requested.store(true, std::memory_order_release);
+    state->scheduler_wake.notify_all();
+    state->output_wake.notify_all();
 }
 
 extern "C" int luma_nvenc_direct_stop_requested(luma_nvenc_direct *state) {
     return state != nullptr && state->stop_requested.load(std::memory_order_acquire);
 }
 
-extern "C" void luma_nvenc_direct_finish_on_gl_thread(luma_nvenc_direct *state) {
-    if (state == nullptr || state->cleanup_started.exchange(true, std::memory_order_acq_rel)) {
+extern "C" void luma_nvenc_direct_notify_unload(luma_nvenc_direct *state) {
+    if (state == nullptr) {
         return;
     }
-    if (state->encoder != nullptr && state->submitted_count != 0) {
-        /* Stop is no longer latency-sensitive. Ensure submitted GPU copies and
-         * NVENC outputs reach the transport before the worker emits EOF. */
-        glFinish();
-        for (unsigned wait_ms = 0; state->submitted_count != 0 && wait_ms < 2000;
-             ++wait_ms) {
-            const size_t before = state->submitted_count;
-            if (!poll(state)) break;
-            if (state->submitted_count == before) usleep(1000);
-        }
-    }
-    luma_nvenc_direct_stop_and_join(state);
+    state->stop_requested.store(true, std::memory_order_release);
+    state->shutdown_now.store(true, std::memory_order_release);
+}
 
+// Release the encoder, its registered resources and the shared GL objects.
+// The synchronous API calls this with a current context in the game's share
+// group. The harvest thread calls it with release_gl=false: driver-handle
+// release is best effort there (no current context), while the FBO/texture
+// deletes are repeated on the presenting thread through
+// luma_nvenc_direct_release_gl().
+void release_encoder_resources(luma_nvenc_direct *state, bool release_gl) {
     if (state->encoder != nullptr) {
         for (Slot &slot : state->slots) {
             if (slot.mapped != nullptr && state->api.nvEncUnmapInputResource != nullptr) {
                 (void)state->api.nvEncUnmapInputResource(state->encoder, slot.mapped);
                 slot.mapped = nullptr;
             }
-            slot.busy = false;
+            slot.busy.store(false, std::memory_order_release);
         }
         for (Slot &slot : state->slots) {
             if (slot.bitstream != nullptr && state->api.nvEncDestroyBitstreamBuffer != nullptr) {
@@ -730,16 +1342,23 @@ extern "C" void luma_nvenc_direct_finish_on_gl_thread(luma_nvenc_direct *state) 
         }
     }
 
-    std::array<GLuint, kSlots> framebuffers{};
-    std::array<GLuint, kSlots> textures{};
-    for (size_t index = 0; index < state->slots.size(); ++index) {
-        framebuffers[index] = state->slots[index].framebuffer;
-        textures[index] = state->slots[index].texture;
-        state->slots[index].framebuffer = 0;
-        state->slots[index].texture = 0;
+    if (release_gl) {
+        std::array<GLuint, kSlots> framebuffers{};
+        std::array<GLuint, kSlots> textures{};
+        for (size_t index = 0; index < state->slots.size(); ++index) {
+            if (state->slots[index].copy_fence != nullptr) {
+                state->gl.delete_sync(state->slots[index].copy_fence);
+                state->slots[index].copy_fence = nullptr;
+            }
+            state->slots[index].copy_pending = false;
+            framebuffers[index] = state->slots[index].framebuffer;
+            textures[index] = state->slots[index].texture;
+            state->slots[index].framebuffer = 0;
+            state->slots[index].texture = 0;
+        }
+        state->gl.delete_framebuffers(static_cast<GLsizei>(framebuffers.size()), framebuffers.data());
+        glDeleteTextures(static_cast<GLsizei>(textures.size()), textures.data());
     }
-    state->gl.delete_framebuffers(static_cast<GLsizei>(framebuffers.size()), framebuffers.data());
-    glDeleteTextures(static_cast<GLsizei>(textures.size()), textures.data());
 
     if (state->encoder != nullptr && state->api.nvEncDestroyEncoder != nullptr) {
         (void)state->api.nvEncDestroyEncoder(state->encoder);
@@ -750,17 +1369,67 @@ extern "C" void luma_nvenc_direct_finish_on_gl_thread(luma_nvenc_direct *state) 
         state->library = nullptr;
     }
     state->initialized = false;
-    state->submitted_count = 0;
+    state->submitted_count.store(0, std::memory_order_release);
+}
+
+extern "C" void luma_nvenc_direct_finish_on_gl_thread(luma_nvenc_direct *state) {
+    if (state == nullptr || state->cleanup_started.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (state->output_worker.joinable()) {
+        luma_nvenc_direct_request_stop(state);
+        state->output_worker.join();
+    } else if (state->encoder != nullptr && state->submitted_count.load(std::memory_order_acquire) != 0) {
+        /* Stop is no longer latency-sensitive. Ensure submitted GPU copies and
+         * NVENC outputs reach the transport before the worker emits EOF. */
+        glFinish();
+        for (unsigned wait_ms = 0; state->submitted_count.load(std::memory_order_acquire) != 0 && wait_ms < 2000;
+             ++wait_ms) {
+            const size_t before = state->submitted_count.load(std::memory_order_acquire);
+            if (!poll(state)) break;
+            if (state->submitted_count.load(std::memory_order_acquire) == before) usleep(1000);
+        }
+    }
+    luma_nvenc_direct_stop_and_join(state);
+    release_encoder_resources(state, true);
     debug_log("direct NVENC resources released on the presenting GL thread");
 }
 
 extern "C" void luma_nvenc_direct_stop_and_join(luma_nvenc_direct *state) {
     if (state == nullptr) return;
     luma_nvenc_direct_request_stop(state);
+    if (state->output_worker.joinable()) state->output_worker.join();
     state->transport.stop.store(true, std::memory_order_release);
     state->transport.wake.notify_one();
     if (state->transport.worker.joinable() &&
         state->transport.worker.get_id() != std::this_thread::get_id()) {
         state->transport.worker.join();
     }
+}
+
+extern "C" void luma_nvenc_direct_release_gl(luma_nvenc_direct *state) {
+    if (state == nullptr) {
+        return;
+    }
+    std::array<GLuint, kSlots> framebuffers{};
+    std::array<GLuint, kSlots> textures{};
+    for (size_t index = 0; index < state->slots.size(); ++index) {
+        if (state->slots[index].copy_fence != nullptr) {
+            state->gl.delete_sync(state->slots[index].copy_fence);
+            state->slots[index].copy_fence = nullptr;
+        }
+        state->slots[index].copy_pending = false;
+        framebuffers[index] = state->slots[index].framebuffer;
+        textures[index] = state->slots[index].texture;
+        state->slots[index].framebuffer = 0;
+        state->slots[index].texture = 0;
+    }
+    state->gl.delete_framebuffers(static_cast<GLsizei>(framebuffers.size()), framebuffers.data());
+    glDeleteTextures(static_cast<GLsizei>(textures.size()), textures.data());
+}
+
+extern "C" void luma_nvenc_direct_destroy(luma_nvenc_direct *state) {
+    if (state == nullptr) return;
+    luma_nvenc_direct_stop_and_join(state);
+    delete state;
 }

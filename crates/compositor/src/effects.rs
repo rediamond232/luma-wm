@@ -793,7 +793,7 @@ pub fn scene(
         .get::<std::sync::Mutex<OutputTheme>>()
         .map(|t| t.lock().unwrap().0.clone())
         .unwrap_or_default();
-    let popup_ids: Vec<_> = space
+    let popup_ids: std::collections::HashSet<_> = space
         .elements_for_output(output)
         .flat_map(popup_surface_ids)
         .collect();
@@ -844,6 +844,19 @@ pub fn scene(
             Some((ids, rect, visual_rect, blur_id, opening, backdrop))
         })
         .collect();
+    // A surface tree can contain many subsurfaces (Chromium/Electron are
+    // common examples). Resolve ownership once per scene instead of scanning
+    // every window tree several times for every render element.
+    let mut window_for_id = std::collections::HashMap::new();
+    let mut blur_for_id = std::collections::HashMap::new();
+    for (index, (ids, _, _, blur_id, _, _)) in windows.iter().enumerate() {
+        for id in ids {
+            window_for_id.insert(id.clone(), index);
+        }
+        if let Some(id) = blur_id {
+            blur_for_id.insert(id.clone(), index);
+        }
+    }
     let mut borders = std::collections::HashMap::new();
     let shadow_size = if theme.shadow_opacity > 0.0 {
         theme.shadow_size
@@ -908,7 +921,7 @@ pub fn scene(
     // alone: they are the scene being blurred, not foreground UI. Luma's own
     // shell has already baked theme opacity into its buffers; external GUI
     // processes receive the compositor theme opacity here instead.
-    let mut blurred = Vec::new();
+    let mut blurred = std::collections::HashSet::new();
     let mut layer_opacity = std::collections::HashMap::new();
     for layer in map.layers().filter(|layer| {
         matches!(
@@ -917,7 +930,12 @@ pub fn scene(
                 | smithay::wayland::shell::wlr_layer::Layer::Overlay
         )
     }) {
-        blurred.push(Id::from_wayland_resource(layer.wl_surface()));
+        // The native bar is always mapped and already draws near-opaque
+        // islands. Blurring its full-width layer would run a backdrop shader
+        // on every output repaint, even through its transparent gaps.
+        if layer.namespace() != "wm-bar" {
+            blurred.insert(Id::from_wayland_resource(layer.wl_surface()));
+        }
         let opacity = if layer.namespace().starts_with("wm-") {
             1.0
         } else {
@@ -927,12 +945,12 @@ pub fn scene(
             layer_opacity.insert(Id::from_wayland_resource(surface), opacity);
         });
     }
-    let launcher_blurred: Vec<_> = map
+    let launcher_blurred: std::collections::HashSet<_> = map
         .layers()
         .filter(|layer| layer.namespace() == "wm-launcher")
         .map(|layer| Id::from_wayland_resource(layer.wl_surface()))
         .collect();
-    let mut background_ids = Vec::new();
+    let mut background_ids = std::collections::HashSet::new();
     for layer in map.layers().filter(|layer| {
         matches!(
             layer.layer(),
@@ -940,16 +958,22 @@ pub fn scene(
                 | smithay::wayland::shell::wlr_layer::Layer::Bottom
         )
     }) {
-        layer.with_surfaces(|surface, _| background_ids.push(Id::from_wayland_resource(surface)));
+        layer.with_surfaces(|surface, _| {
+            background_ids.insert(Id::from_wayland_resource(surface));
+        });
     }
     let effects: Vec<_> = elements
         .into_iter()
         .map(|inner| {
             let geo = inner.geometry(scale.into());
+            let window = window_for_id
+                .get(inner.id())
+                .and_then(|index| windows.get(*index));
+            let blur_window = blur_for_id
+                .get(inner.id())
+                .and_then(|index| windows.get(*index));
             let rect = if matches!(inner, SpaceRenderElements::Element(_)) {
-                windows
-                    .iter()
-                    .find(|(ids, _, _, _, _, _)| ids.contains(inner.id()))
+                window
                     .map(|(_, rect, visual, _, _, _)| visual.unwrap_or(*rect))
                     .unwrap_or(geo)
             } else {
@@ -957,10 +981,7 @@ pub fn scene(
             };
             let blur = (theme.blur
                 && theme.blur_passes > 0
-                && (blurred.contains(inner.id())
-                    || windows
-                        .iter()
-                        .any(|(_, _, _, id, _, _)| id.as_ref() == Some(inner.id())))
+                && (blurred.contains(inner.id()) || blur_window.is_some())
                 && output.current_transform() == Transform::Normal)
                 .then(|| blur_program.clone());
             let radius = if ((matches!(inner, SpaceRenderElements::Element(_))
@@ -972,41 +993,33 @@ pub fn scene(
             } else {
                 0.0
             };
-            let blur_alpha = windows
-                .iter()
-                .find(|(ids, _, _, _, _, _)| ids.contains(inner.id()))
+            let blur_alpha = window
                 .map(|(_, _, _, _, opening, _)| *opening)
                 .unwrap_or(1.0);
             let opacity = layer_opacity.get(inner.id()).copied().unwrap_or(1.0);
-            let backdrop = windows
-                .iter()
-                .find(|(_, _, _, id, _, _)| id.as_ref() == Some(inner.id()))
-                .and_then(|(_, _, _, _, _, backdrop)| backdrop.clone());
-            let geometry_override = windows
-                .iter()
-                .find(|(ids, _, _, _, _, _)| ids.contains(inner.id()))
-                .and_then(|(_, actual, visual, _, _, _)| {
-                    let visual = visual.as_ref()?;
-                    if actual.size.w <= 0 || actual.size.h <= 0 {
-                        return None;
-                    }
-                    let scale_x = f64::from(visual.size.w) / f64::from(actual.size.w);
-                    let scale_y = f64::from(visual.size.h) / f64::from(actual.size.h);
-                    Some(Rectangle::new(
-                        (
-                            visual.loc.x
-                                + (f64::from(geo.loc.x - actual.loc.x) * scale_x).round() as i32,
-                            visual.loc.y
-                                + (f64::from(geo.loc.y - actual.loc.y) * scale_y).round() as i32,
-                        )
-                            .into(),
-                        (
-                            (f64::from(geo.size.w) * scale_x).round().max(1.0) as i32,
-                            (f64::from(geo.size.h) * scale_y).round().max(1.0) as i32,
-                        )
-                            .into(),
-                    ))
-                });
+            let backdrop = blur_window.and_then(|(_, _, _, _, _, backdrop)| backdrop.clone());
+            let geometry_override = window.and_then(|(_, actual, visual, _, _, _)| {
+                let visual = visual.as_ref()?;
+                if actual.size.w <= 0 || actual.size.h <= 0 {
+                    return None;
+                }
+                let scale_x = f64::from(visual.size.w) / f64::from(actual.size.w);
+                let scale_y = f64::from(visual.size.h) / f64::from(actual.size.h);
+                Some(Rectangle::new(
+                    (
+                        visual.loc.x
+                            + (f64::from(geo.loc.x - actual.loc.x) * scale_x).round() as i32,
+                        visual.loc.y
+                            + (f64::from(geo.loc.y - actual.loc.y) * scale_y).round() as i32,
+                    )
+                        .into(),
+                    (
+                        (f64::from(geo.size.w) * scale_x).round().max(1.0) as i32,
+                        (f64::from(geo.size.h) * scale_y).round().max(1.0) as i32,
+                    )
+                        .into(),
+                ))
+            });
             let blur_strength = theme.blur_passes as f32
                 * if launcher_blurred.contains(inner.id()) {
                     2.0

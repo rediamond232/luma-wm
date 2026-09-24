@@ -4,6 +4,7 @@
 #include <X11/Xlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <time.h>
@@ -41,7 +42,19 @@ int main(void) {
     if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0) return 5;
     puts("READY");
     fflush(stdout);
-    const uint64_t deadline = now_ns() + UINT64_C(6000000000);
+    /* Re-record fixtures raise this through the environment; default keeps
+     * every existing test's timing. */
+    unsigned long runtime_s = 6;
+    const char *runtime_text = getenv("LUMA_TEST_RUNTIME_S");
+    if (runtime_text != NULL && runtime_text[0] != '\0') {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(runtime_text, &end, 10);
+        if (end != runtime_text && *end == '\0' && parsed >= 5 && parsed <= 120) {
+            runtime_s = parsed;
+        }
+    }
+    const uint64_t deadline = now_ns() + (uint64_t)runtime_s * UINT64_C(1000000000);
+    const uint64_t loop_start = now_ns();
     uint64_t frame = 0;
     while (now_ns() < deadline) {
         glClearColor((frame & 1U) ? 0.8f : 0.1f, 0.2f, (frame & 1U) ? 0.1f : 0.8f, 1.0f);
@@ -54,5 +67,9 @@ int main(void) {
     XDestroyWindow(display, window);
     XFreeColormap(display, colormap);
     XCloseDisplay(display);
+    const uint64_t elapsed_ns = now_ns() - loop_start;
+    fprintf(stderr, "FRAMES %lu in %llums (%lu fps)\n", (unsigned long)frame,
+            (unsigned long long)(elapsed_ns / UINT64_C(1000000)),
+            (unsigned long)(frame * UINT64_C(1000000000) / (elapsed_ns ? elapsed_ns : 1)));
     return 0;
 }
